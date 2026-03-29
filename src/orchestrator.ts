@@ -208,6 +208,18 @@ export class Orchestrator {
     return this.store.listAgents();
   }
 
+  // --- Badges ---
+
+  /**
+   * Set the iTerm2 badge on a slot's pane.
+   */
+  async setBadge(slotName: string, text: string): Promise<void> {
+    const slot = this.store.getSlot(slotName);
+    if (!slot) throw new Error(`slot '${slotName}' not found`);
+    if (!slot.iterm_id) throw new Error(`slot '${slotName}' has no iTerm2 session`);
+    await iterm.setBadge(slot.iterm_id, text);
+  }
+
   // --- Tabs ---
 
   createTab(name: string): Tab {

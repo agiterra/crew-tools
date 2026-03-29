@@ -102,8 +102,19 @@ export async function readOutput(name: string): Promise<string> {
 }
 
 /**
- * Kill a screen session.
+ * Kill a screen session and all its child processes.
+ * Screen's quit only sends SIGHUP which some processes ignore (e.g. Codex).
  */
 export async function killSession(name: string): Promise<void> {
+  // Find the screen PID and kill the entire process group
+  const pid = await getSessionPid(name);
+  if (pid) {
+    // Kill all children of the screen process first
+    await $`pkill -TERM -P ${pid}`.quiet().nothrow();
+    // Give them a moment to exit gracefully
+    await new Promise((r) => setTimeout(r, 500));
+    // Force-kill any survivors
+    await $`pkill -KILL -P ${pid}`.quiet().nothrow();
+  }
   await $`${SCREEN} -S ${name} -X quit`.quiet().nothrow();
 }
