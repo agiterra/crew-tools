@@ -220,9 +220,41 @@ export class Orchestrator {
   // --- Slots ---
 
   /**
-   * Create a slot by splitting the current iTerm2 pane.
+   * Register an existing iTerm2 session as a named slot.
+   * Use this so agents can register their own pane and split relative to it.
+   */
+  registerSlot(tab: string, name: string, itermSessionId: string): Slot {
+    if (!this.store.getTab(tab)) throw new Error(`tab '${tab}' not found`);
+
+    const existing = this.store.getSlot(name);
+    if (existing) {
+      // Update the iterm_id if slot already exists
+      this.store.setSlotItermId(name, itermSessionId);
+      return { ...existing, iterm_id: itermSessionId };
+    }
+
+    const slot = this.store.createSlot(name, tab, "registered");
+    this.store.setSlotItermId(name, itermSessionId);
+    return { ...slot, iterm_id: itermSessionId };
+  }
+
+  /**
+   * Resolve a relativeTo value to an iTerm2 session UUID.
+   * Accepts a slot name (looked up in DB) or a raw UUID.
+   */
+  private resolveSession(relativeTo: string): string {
+    // Check if it's a known slot name
+    const slot = this.store.getSlot(relativeTo);
+    if (slot?.iterm_id) return slot.iterm_id;
+    // Otherwise treat as raw iTerm2 session UUID
+    return relativeTo;
+  }
+
+  /**
+   * Create a slot by splitting an iTerm2 pane.
    * Direction is inferred from position: "below"/"above" = horizontal,
    * "left"/"right" = vertical. Default: horizontal (below).
+   * relativeTo: slot name or iTerm2 session UUID to split from.
    */
   async createSlot(tab: string, name: string, position: string = "below", relativeTo?: string): Promise<Slot> {
     if (!this.store.getTab(tab)) throw new Error(`tab '${tab}' not found`);
@@ -231,9 +263,9 @@ export class Orchestrator {
       ? "vertical"
       : "horizontal";
 
-    // Split relative to a specific session, or fall back to current
+    // Split relative to a named slot, raw UUID, or fall back to current
     const itermId = relativeTo
-      ? await iterm.splitSession(relativeTo, direction)
+      ? await iterm.splitSession(this.resolveSession(relativeTo), direction)
       : await iterm.splitPane(direction);
 
     const slot = this.store.createSlot(name, tab, position);
