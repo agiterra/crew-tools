@@ -75,6 +75,11 @@ export class Orchestrator {
     // Create screen session
     const session = await screen.createSession(screenName, fullCommand);
 
+    // Auto-confirm the dev channels prompt (sends Enter after a delay)
+    setTimeout(async () => {
+      try { await screen.sendKeys(screenName, "\n"); } catch {}
+    }, 3000);
+
     // Record in DB
     return this.store.createAgent({
       id: opts.id,
