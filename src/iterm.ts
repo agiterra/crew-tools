@@ -22,7 +22,7 @@ async function osascript(script: string): Promise<string> {
 }
 
 /**
- * Get the iTerm2 session ID of the current (active) session.
+ * Get the iTerm2 session ID of the current (active/focused) session.
  */
 export async function currentSessionId(): Promise<string> {
   return osascript(`
@@ -32,6 +32,33 @@ export async function currentSessionId(): Promise<string> {
       end tell
     end tell
   `);
+}
+
+/**
+ * Get the iTerm2 session ID for the session owning a specific TTY.
+ * More reliable than ITERM_SESSION_ID env var which can go stale.
+ */
+export async function sessionIdForTty(ttyName: string): Promise<string | null> {
+  const devTty = ttyName.startsWith("/dev/") ? ttyName : `/dev/${ttyName}`;
+  try {
+    const result = await osascript(`
+      tell application "iTerm2"
+        repeat with w in windows
+          repeat with t in tabs of w
+            repeat with s in sessions of t
+              if tty of s is "${devTty}" then
+                return id of s
+              end if
+            end repeat
+          end repeat
+        end repeat
+        return "NOT_FOUND"
+      end tell
+    `);
+    return result === "NOT_FOUND" ? null : result;
+  } catch {
+    return null;
+  }
 }
 
 /**
