@@ -68,9 +68,9 @@ export class Orchestrator {
       command += ` ${opts.extraFlags}`;
     }
 
-    // Prefix with env vars and cd so the agent has its identity and working dir
-    const envPrefix = `WIRE_AGENT_ID=${shellEscape(opts.id)} WIRE_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}`;
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${envPrefix} ${command}`;
+    // Export agent identity AFTER cd (so it overrides any .env sourced by hooks)
+    const envExports = `export WIRE_AGENT_ID=${shellEscape(opts.id)} WIRE_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}`;
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${command}`;
 
     // Create screen session
     const session = await screen.createSession(screenName, fullCommand);
