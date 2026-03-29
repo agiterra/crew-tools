@@ -67,7 +67,9 @@ export async function splitSession(
         repeat with t in tabs of w
           repeat with s in sessions of t
             if id of s is "${sessionId}" then
-              set newSession to (split ${verb} with default profile of s)
+              tell s
+                set newSession to split ${verb} with default profile
+              end tell
               return id of newSession
             end if
           end repeat
