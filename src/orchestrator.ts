@@ -223,26 +223,24 @@ export class Orchestrator {
   // --- Interrupt ---
 
   /**
-   * Interrupt an agent — sends Escape and monitors screen until agent is idle.
-   * Returns the number of Escapes sent and the final screen state.
+   * Interrupt an agent.
+   * Default: Escape (cancel current tool call).
+   * Background: Ctrl-B Ctrl-B (background current task, preserves work).
+   * Returns screen output so the caller can assess the result.
    */
-  async interruptAgent(agentId: string, maxAttempts = 8): Promise<{ escapes: number; idle: boolean; output: string }> {
+  async interruptAgent(agentId: string, background = false): Promise<{ method: string; output: string }> {
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`agent '${agentId}' not found`);
 
-    for (let i = 0; i < maxAttempts; i++) {
-      await screen.sendKeys(agent.screen_name, "\x1b");
-      await new Promise((r) => setTimeout(r, 500));
-
-      const output = await screen.readOutput(agent.screen_name);
-      // Claude Code shows ">" prompt when idle
-      if (output.includes("\n> ") || output.trimEnd().endsWith(">")) {
-        return { escapes: i + 1, idle: true, output };
-      }
+    if (background) {
+      await screen.sendKeys(agent.screen_name, "\x02\x02"); // Ctrl-B Ctrl-B
+    } else {
+      await screen.sendKeys(agent.screen_name, "\x1b"); // Escape
     }
 
+    await new Promise((r) => setTimeout(r, 500));
     const output = await screen.readOutput(agent.screen_name);
-    return { escapes: maxAttempts, idle: false, output };
+    return { method: background ? "background" : "escape", output };
   }
 
   // --- Tabs ---
