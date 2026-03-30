@@ -69,7 +69,7 @@ export class Orchestrator {
     }
 
     // Set pane-specific identity vars that take priority over .env's WIRE_AGENT_ID
-    const envExports = `export _PANE_AGENT_ID=${shellEscape(opts.id)} _PANE_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}`;
+    const envExports = `export PANE_AGENT_ID=${shellEscape(opts.id)} PANE_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}`;
     const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${command}`;
 
     // Create screen session
@@ -218,6 +218,17 @@ export class Orchestrator {
     if (!slot) throw new Error(`slot '${slotName}' not found`);
     if (!slot.iterm_id) throw new Error(`slot '${slotName}' has no iTerm2 session`);
     await iterm.setBadge(slot.iterm_id, text);
+  }
+
+  // --- Interrupt ---
+
+  /**
+   * Interrupt an agent — cancels their current tool call via Escape.
+   */
+  async interruptAgent(agentId: string): Promise<void> {
+    const agent = this.store.getAgent(agentId);
+    if (!agent) throw new Error(`agent '${agentId}' not found`);
+    await screen.sendKeys(agent.screen_name, "\x1b");
   }
 
   // --- Tabs ---
