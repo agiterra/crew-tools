@@ -223,12 +223,26 @@ export class Orchestrator {
   // --- Interrupt ---
 
   /**
-   * Interrupt an agent — cancels their current tool call via Escape.
+   * Interrupt an agent — sends Escape and monitors screen until agent is idle.
+   * Returns the number of Escapes sent and the final screen state.
    */
-  async interruptAgent(agentId: string): Promise<void> {
+  async interruptAgent(agentId: string, maxAttempts = 8): Promise<{ escapes: number; idle: boolean; output: string }> {
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`agent '${agentId}' not found`);
-    await screen.sendKeys(agent.screen_name, "\x1b");
+
+    for (let i = 0; i < maxAttempts; i++) {
+      await screen.sendKeys(agent.screen_name, "\x1b");
+      await new Promise((r) => setTimeout(r, 500));
+
+      const output = await screen.readOutput(agent.screen_name);
+      // Claude Code shows ">" prompt when idle
+      if (output.includes("\n> ") || output.trimEnd().endsWith(">")) {
+        return { escapes: i + 1, idle: true, output };
+      }
+    }
+
+    const output = await screen.readOutput(agent.screen_name);
+    return { escapes: maxAttempts, idle: false, output };
   }
 
   // --- Tabs ---
