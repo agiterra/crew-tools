@@ -68,8 +68,8 @@ export class Orchestrator {
       command += ` ${opts.extraFlags}`;
     }
 
-    // Export agent identity AFTER cd (so it overrides any .env sourced by hooks)
-    const envExports = `export WIRE_AGENT_ID=${shellEscape(opts.id)} WIRE_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}`;
+    // Set pane-specific identity vars that take priority over .env's WIRE_AGENT_ID
+    const envExports = `export _PANE_AGENT_ID=${shellEscape(opts.id)} _PANE_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}`;
     const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${command}`;
 
     // Create screen session
