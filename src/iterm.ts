@@ -210,7 +210,7 @@ export async function setBadge(sessionId: string, text: string): Promise<void> {
         repeat with t in tabs of w
           repeat with s in sessions of t
             if id of s is "${sessionId}" then
-              set badge of s to "${escaped}"
+              tell s to set variable named "user.badge" to "${escaped}"
               return
             end if
           end repeat
