@@ -204,13 +204,17 @@ export async function isSessionAlive(sessionId: string): Promise<boolean> {
  */
 export async function setBadge(sessionId: string, text: string): Promise<void> {
   const escaped = text.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  // Set custom variable AND badge format so CC can't clobber it
   await osascript(`
     tell application "iTerm2"
       repeat with w in windows
         repeat with t in tabs of w
           repeat with s in sessions of t
             if id of s is "${sessionId}" then
-              tell s to set variable named "user.badge" to "${escaped}"
+              tell s
+                set variable named "user.pane_badge" to "${escaped}"
+                set badge to "\\(user.pane_badge)"
+              end tell
               return
             end if
           end repeat
