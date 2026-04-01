@@ -39,6 +39,7 @@ export class Orchestrator {
     runtime?: string;
     projectDir?: string;
     extraFlags?: string;
+    privateKeyB64?: string;
   }): Promise<Agent> {
     const runtime = opts.runtime ?? "claude-code";
     const screenName = `${SCREEN_PREFIX}${opts.id}`;
@@ -68,8 +69,9 @@ export class Orchestrator {
       command += ` ${opts.extraFlags}`;
     }
 
-    // Set pane-specific identity vars that take priority over .env's WIRE_AGENT_ID
-    const envExports = `export PANE_AGENT_ID=${shellEscape(opts.id)} PANE_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}`;
+    // Set pane-specific identity + key vars
+    const keyExport = opts.privateKeyB64 ? ` WIRE_PRIVATE_KEY=${shellEscape(opts.privateKeyB64)}` : "";
+    const envExports = `export PANE_AGENT_ID=${shellEscape(opts.id)} PANE_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}${keyExport}`;
     const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${command}`;
 
     // Create screen session
