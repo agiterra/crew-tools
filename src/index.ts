@@ -1,5 +1,5 @@
 export { Orchestrator } from "./orchestrator.js";
-export { PaneStore, type Agent, type Tab, type Slot } from "./store.js";
+export { CrewStore, type Agent, type Tab, type Slot } from "./store.js";
 export * as screen from "./screen.js";
 export * as iterm from "./iterm.js";
 export { loadRuntimes, getLaunchCommand, expandCommand, type RuntimeConfig } from "./runtimes.js";

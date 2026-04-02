@@ -6,13 +6,13 @@
  */
 
 import { join } from "path";
-import { PaneStore, type Agent, type Tab, type Slot } from "./store.js";
+import { CrewStore, type Agent, type Tab, type Slot } from "./store.js";
 import * as screen from "./screen.js";
 import * as iterm from "./iterm.js";
 import { getLaunchCommand } from "./runtimes.js";
 import { reconcile, formatReport } from "./reconciler.js";
 
-const DEFAULT_DB = join(process.env.HOME ?? "/tmp", ".wire", "panes.db");
+const DEFAULT_DB = join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
 const SCREEN_PREFIX = "wire-";
 
 /** Escape a string for use in a shell command. */
@@ -21,17 +21,17 @@ function shellEscape(s: string): string {
 }
 
 export class Orchestrator {
-  readonly store: PaneStore;
+  readonly store: CrewStore;
 
   constructor(dbPath: string = DEFAULT_DB) {
-    this.store = new PaneStore(dbPath);
+    this.store = new CrewStore(dbPath);
   }
 
   // --- Agent lifecycle ---
 
   /**
    * Launch an agent in a screen session.
-   * The agent runs in background — no pane attachment required.
+   * The agent runs in background — no crew attachment required.
    */
   async launchAgent(opts: {
     id: string;
@@ -74,9 +74,9 @@ export class Orchestrator {
       command += ` ${opts.extraFlags}`;
     }
 
-    // Set pane-specific identity + key vars
-    const keyExport = opts.privateKeyB64 ? ` PANE_PRIVATE_KEY=${shellEscape(opts.privateKeyB64)}` : "";
-    const envExports = `export PANE_AGENT_ID=${shellEscape(opts.id)} PANE_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}${keyExport}`;
+    // Set crew-specific identity + key vars
+    const keyExport = opts.privateKeyB64 ? ` CREW_PRIVATE_KEY=${shellEscape(opts.privateKeyB64)}` : "";
+    const envExports = `export CREW_AGENT_ID=${shellEscape(opts.id)} CREW_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}${keyExport}`;
     const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${command}`;
 
     // Create screen session

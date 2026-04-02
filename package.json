@@ -1,7 +1,7 @@
 {
-  "name": "@agiterra/pane-tools",
+  "name": "@agiterra/crew-tools",
   "version": "0.4.2",
-  "description": "Agent pane orchestration primitives — screen sessions, iTerm2 panes, SQLite state, runtime-agnostic.",
+  "description": "Agent crew orchestration primitives — screen sessions, iTerm2 panes, SQLite state, runtime-agnostic.",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {

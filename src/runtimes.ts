@@ -23,7 +23,7 @@ export type RuntimeConfig = {
 const DEFAULTS: Record<string, RuntimeConfig> = {
   "claude-code": {
     command: "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions",
-    description: "Claude Code with Wire channel (SSE push). MCP plugins (wire-ipc, personai, pane) load from installed_plugins.json per project scope.",
+    description: "Claude Code with Wire channel (SSE push). MCP plugins (wire-ipc, personai, crew) load from installed_plugins.json per project scope.",
   },
   "codex": {
     command: "codex",

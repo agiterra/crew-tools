@@ -212,8 +212,8 @@ export async function setBadge(sessionId: string, text: string): Promise<void> {
           repeat with s in sessions of t
             if id of s is "${sessionId}" then
               tell s
-                set variable named "user.pane_badge" to "${escaped}"
-                set badge to "\\(user.pane_badge)"
+                set variable named "user.crew_badge" to "${escaped}"
+                set badge to "\\(user.crew_badge)"
               end tell
               return
             end if
@@ -230,7 +230,7 @@ const DYNAMIC_PROFILES_DIR = join(
   process.env.HOME ?? "/tmp",
   "Library/Application Support/iTerm2/DynamicProfiles",
 );
-const BROWSER_PROFILE_FILE = join(DYNAMIC_PROFILES_DIR, "pane-web-browser.json");
+const BROWSER_PROFILE_FILE = join(DYNAMIC_PROFILES_DIR, "crew-web-browser.json");
 const BROWSER_PROFILE_NAME = "Pane Web Browser";
 
 /**
@@ -245,7 +245,7 @@ function writeBrowserProfile(url: string): void {
     Profiles: [
       {
         Name: BROWSER_PROFILE_NAME,
-        Guid: "pane-web-browser-001",
+        Guid: "crew-web-browser-001",
         "Custom Command": "Browser",
         "Initial URL": url,
       },

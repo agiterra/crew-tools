@@ -1,7 +1,7 @@
 /**
  * Pane orchestration state — SQLite persistence.
  *
- * Three tables: tabs (workstream containers), slots (pane viewports),
+ * Three tables: tabs (workstream containers), slots (crew viewports),
  * agents (screen sessions with optional slot attachment).
  */
 
@@ -33,7 +33,7 @@ export type Agent = {
   last_seen: number;
 };
 
-export class PaneStore {
+export class CrewStore {
   private db: Database;
 
   constructor(dbPath: string) {
