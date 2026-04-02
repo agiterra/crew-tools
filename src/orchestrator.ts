@@ -40,6 +40,8 @@ export class Orchestrator {
     projectDir?: string;
     extraFlags?: string;
     privateKeyB64?: string;
+    /** Initial prompt — passed as positional arg to claude. */
+    prompt?: string;
   }): Promise<Agent> {
     const runtime = opts.runtime ?? "claude-code";
     const screenName = `${SCREEN_PREFIX}${opts.id}`;
@@ -65,12 +67,15 @@ export class Orchestrator {
       PROJECT_DIR: projectDir,
     };
     let command = getLaunchCommand(runtime, vars);
+    if (opts.prompt) {
+      command += ` ${shellEscape(opts.prompt)}`;
+    }
     if (opts.extraFlags) {
       command += ` ${opts.extraFlags}`;
     }
 
     // Set pane-specific identity + key vars
-    const keyExport = opts.privateKeyB64 ? ` WIRE_PRIVATE_KEY=${shellEscape(opts.privateKeyB64)}` : "";
+    const keyExport = opts.privateKeyB64 ? ` PANE_PRIVATE_KEY=${shellEscape(opts.privateKeyB64)}` : "";
     const envExports = `export PANE_AGENT_ID=${shellEscape(opts.id)} PANE_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}${keyExport}`;
     const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${command}`;
 
