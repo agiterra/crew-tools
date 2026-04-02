@@ -9,12 +9,17 @@
 
 import { $ } from "bun";
 import { join } from "path";
-import { existsSync } from "fs";
 
-// Prefer homebrew screen (5.x with color support) over macOS built-in (4.0)
-const SCREEN = existsSync("/opt/homebrew/bin/screen")
-  ? "/opt/homebrew/bin/screen"
-  : "screen";
+// Resolve screen binary: prefer homebrew 5.x (color support) over macOS built-in 4.0
+async function findScreen(): Promise<string> {
+  try {
+    const result = await $`command -v screen`.quiet();
+    return result.stdout.toString().trim();
+  } catch {
+    return "screen";
+  }
+}
+const SCREEN = await findScreen();
 
 export type ScreenSession = {
   name: string;
