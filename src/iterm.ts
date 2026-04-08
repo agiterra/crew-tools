@@ -312,29 +312,19 @@ const BROWSER_PROFILE_NAME = "Pane Web Browser";
 const EMPTY_PANE_PROFILE_FILE = join(DYNAMIC_PROFILES_DIR, "crew-empty-pane.json");
 const EMPTY_PANE_PROFILE_NAME = "Crew Empty Pane";
 
-/** Default blend: 0 = full image, 1 = background color only. 0.2 = mostly dark, subtle image. */
-const DEFAULT_BLEND = 0.2;
-
 /**
  * Write the "Crew Empty Pane" dynamic profile.
  * Optionally includes a background image with blend for readability.
  */
-export function writeEmptyPaneProfile(opts?: {
-  backgroundImage?: string;
-  blend?: number;
-}): void {
+export function writeEmptyPaneProfile(): void {
   mkdirSync(DYNAMIC_PROFILES_DIR, { recursive: true });
-  const profile: Record<string, unknown> = {
+  const profile = {
     Name: EMPTY_PANE_PROFILE_NAME,
     Guid: "crew-empty-pane-001",
     "Custom Command": "Yes",
     Command: "zsh -c 'printf \"\\n  \\033[2m☐ Available — no agent attached\\033[0m\\n\\n\" && exec zsh -l'",
     "Silence Bell": true,
   };
-  if (opts?.backgroundImage) {
-    profile["Background Image Location"] = opts.backgroundImage;
-    profile["Blend"] = opts.blend ?? DEFAULT_BLEND;
-  }
   writeFileSync(
     EMPTY_PANE_PROFILE_FILE,
     JSON.stringify({ Profiles: [profile] }, null, 2),
@@ -348,11 +338,8 @@ export function writeEmptyPaneProfile(opts?: {
  */
 export async function splitPaneEmpty(
   direction: "horizontal" | "vertical",
-  opts?: { backgroundImage?: string; blend?: number },
 ): Promise<string> {
-  writeEmptyPaneProfile(opts);
-  // Small delay for iTerm2 to pick up profile changes
-  await new Promise((r) => setTimeout(r, 200));
+  writeEmptyPaneProfile();
   const verb = direction === "horizontal" ? "horizontally" : "vertically";
   return osascript(`
     tell application "iTerm2"
@@ -374,10 +361,8 @@ export async function splitPaneEmpty(
 export async function splitSessionEmpty(
   sessionId: string,
   direction: "horizontal" | "vertical",
-  opts?: { backgroundImage?: string; blend?: number },
 ): Promise<string> {
-  writeEmptyPaneProfile(opts);
-  await new Promise((r) => setTimeout(r, 200));
+  writeEmptyPaneProfile();
   const verb = direction === "horizontal" ? "horizontally" : "vertically";
   return osascript(`
     tell application "iTerm2"
