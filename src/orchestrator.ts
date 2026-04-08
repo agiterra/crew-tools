@@ -49,17 +49,20 @@ export class Orchestrator {
     prompt?: string;
   }): Promise<Agent> {
     const runtime = opts.runtime ?? "claude-code";
-    const screenName = `${SCREEN_PREFIX}${opts.id}`;
+    let screenName = `${SCREEN_PREFIX}${opts.id}`;
 
-    // Check for existing agent
+    // Check for existing agent with the same ID
     const existing = this.store.getAgent(opts.id);
     if (existing) {
       const alive = await screen.isAlive(existing.screen_name);
       if (alive) {
-        throw new Error(`agent '${opts.id}' is already running`);
+        // During handoff, the old agent is still running.
+        // Use a suffixed screen name to avoid collision.
+        screenName = `${SCREEN_PREFIX}${opts.id}-${Date.now()}`;
+      } else {
+        // Dead agent — clean up stale record
+        this.store.deleteAgentByScreen(existing.screen_name);
       }
-      // Dead agent — clean up stale record
-      this.store.deleteAgent(opts.id);
     }
 
     // Build launch command with agent identity injected as env vars
@@ -116,8 +119,10 @@ export class Orchestrator {
     displayName: string;
     runtime?: string;
     callerItermId?: string;
+    ccSessionId?: string;
   }): Promise<Agent> {
     const runtime = opts.runtime ?? "claude-code";
+    const ccSessionId = opts.ccSessionId ?? process.env.CLAUDE_CODE_SESSION_ID;
 
     // Detect screen session from STY (format: "pid.name")
     const sty = process.env.STY;
@@ -138,14 +143,15 @@ export class Orchestrator {
       ? this.store.listPanes().find((p) => p.iterm_id === opts.callerItermId)?.name ?? null
       : null;
 
-    // Upsert: if agent exists, update pid and touch; otherwise create
-    const existing = this.store.getAgent(opts.id);
-    if (existing) {
-      this.store.updateAgentPid(opts.id, screenPid);
-      if (!existing.pane && callerPane) {
-        this.store.updateAgentPane(opts.id, callerPane);
+    // Check if this exact screen session is already registered
+    const existingByScreen = this.store.getAgentByScreen(screenName);
+    if (existingByScreen) {
+      this.store.updateAgentPid(existingByScreen.id, screenPid);
+      if (ccSessionId) this.store.updateAgentCcSession(screenName, ccSessionId);
+      if (!existingByScreen.pane && callerPane) {
+        this.store.updateAgentPane(existingByScreen.id, callerPane);
       }
-      return this.store.getAgent(opts.id)!;
+      return this.store.getAgentByScreen(screenName)!;
     }
 
     return this.store.createAgent({
@@ -154,19 +160,27 @@ export class Orchestrator {
       runtime,
       screen_name: screenName,
       screen_pid: screenPid,
+      cc_session_id: ccSessionId ?? undefined,
       pane: callerPane ?? undefined,
     });
   }
 
   /**
-   * Stop an agent — sends exit to screen session.
+   * Stop an agent — kills the screen session.
+   * Accepts optional ccSessionId to target a specific instance during handoff.
    */
-  async stopAgent(id: string): Promise<void> {
-    const agent = this.store.getAgent(id);
-    if (!agent) throw new Error(`agent '${id}' not found`);
+  async stopAgent(id: string, ccSessionId?: string): Promise<void> {
+    let agent: Agent | null;
+    if (ccSessionId) {
+      agent = this.store.getAgentBySession(ccSessionId);
+      if (!agent) throw new Error(`no agent with cc_session_id '${ccSessionId}'`);
+    } else {
+      agent = this.store.getAgent(id);
+      if (!agent) throw new Error(`agent '${id}' not found`);
+    }
 
     await screen.killSession(agent.screen_name);
-    this.store.deleteAgent(id);
+    this.store.deleteAgentByScreen(agent.screen_name);
   }
 
   /**
@@ -238,20 +252,35 @@ export class Orchestrator {
 
   /**
    * Send keystrokes to an agent's screen session.
+   * Accepts optional ccSessionId to target a specific instance during handoff.
    */
-  async sendToAgent(agentId: string, text: string): Promise<void> {
-    const agent = this.store.getAgent(agentId);
-    if (!agent) throw new Error(`agent '${agentId}' not found`);
+  async sendToAgent(agentId: string, text: string, ccSessionId?: string): Promise<void> {
+    const agent = this.resolveAgent(agentId, ccSessionId);
     await screen.sendKeys(agent.screen_name, text);
   }
 
   /**
    * Read an agent's current screen output.
+   * Accepts optional ccSessionId to target a specific instance during handoff.
    */
-  async readAgent(agentId: string): Promise<string> {
+  async readAgent(agentId: string, ccSessionId?: string): Promise<string> {
+    const agent = this.resolveAgent(agentId, ccSessionId);
+    return screen.readOutput(agent.screen_name);
+  }
+
+  /**
+   * Resolve an agent by ID or CC session ID.
+   * Used internally by send/read/stop for session-level addressing.
+   */
+  private resolveAgent(agentId: string, ccSessionId?: string): Agent {
+    if (ccSessionId) {
+      const agent = this.store.getAgentBySession(ccSessionId);
+      if (!agent) throw new Error(`no agent with cc_session_id '${ccSessionId}'`);
+      return agent;
+    }
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`agent '${agentId}' not found`);
-    return screen.readOutput(agent.screen_name);
+    return agent;
   }
 
   /**
@@ -303,9 +332,8 @@ export class Orchestrator {
    * Background: Ctrl-B Ctrl-B (background current task, preserves work).
    * Returns screen output so the caller can assess the result.
    */
-  async interruptAgent(agentId: string, background = false): Promise<{ method: string; output: string }> {
-    const agent = this.store.getAgent(agentId);
-    if (!agent) throw new Error(`agent '${agentId}' not found`);
+  async interruptAgent(agentId: string, background = false, ccSessionId?: string): Promise<{ method: string; output: string }> {
+    const agent = this.resolveAgent(agentId, ccSessionId);
 
     if (background) {
       await screen.sendKeys(agent.screen_name, "\x02\x02"); // Ctrl-B Ctrl-B

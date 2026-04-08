@@ -27,6 +27,7 @@ export type Agent = {
   runtime: string;
   screen_name: string;
   screen_pid: number | null;
+  cc_session_id: string | null;
   pane: string | null;
   status_name: string | null;
   status_desc: string | null;
@@ -98,6 +99,42 @@ export class CrewStore {
         ALTER TABLE agents RENAME COLUMN slot TO pane;
       `);
     }
+
+    // Add cc_session_id column if missing
+    const hasCcSession = this.db.prepare(
+      "SELECT * FROM pragma_table_info('agents') WHERE name='cc_session_id'"
+    ).get();
+    if (!hasCcSession) {
+      this.db.exec("ALTER TABLE agents ADD COLUMN cc_session_id TEXT");
+    }
+
+    // Migrate from single-agent-per-id to multi-agent-per-id (for handoff).
+    // Change PRIMARY KEY from id to screen_name — screen names are always unique.
+    const createSql = this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='agents'"
+    ).get() as { sql: string } | null;
+    if (createSql?.sql?.includes("id TEXT PRIMARY KEY")) {
+      this.db.exec(`
+        CREATE TABLE agents_new (
+          id TEXT NOT NULL,
+          display_name TEXT NOT NULL,
+          runtime TEXT NOT NULL DEFAULT 'claude-code',
+          screen_name TEXT NOT NULL PRIMARY KEY,
+          screen_pid INTEGER,
+          cc_session_id TEXT,
+          pane TEXT REFERENCES panes(name),
+          status_name TEXT,
+          status_desc TEXT,
+          launched_at INTEGER NOT NULL,
+          last_seen INTEGER NOT NULL
+        );
+        INSERT INTO agents_new SELECT id, display_name, runtime, screen_name, screen_pid,
+          cc_session_id, pane, status_name, status_desc, launched_at, last_seen FROM agents;
+        DROP TABLE agents;
+        ALTER TABLE agents_new RENAME TO agents;
+        CREATE INDEX IF NOT EXISTS idx_agents_id ON agents(id);
+      `);
+    }
   }
 
   // --- Tabs ---
@@ -164,15 +201,17 @@ export class CrewStore {
     runtime: string;
     screen_name: string;
     screen_pid?: number;
+    cc_session_id?: string;
     pane?: string;
   }): Agent {
     const now = Date.now();
     this.db.prepare(
-      `INSERT INTO agents (id, display_name, runtime, screen_name, screen_pid, pane, launched_at, last_seen)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO agents (id, display_name, runtime, screen_name, screen_pid, cc_session_id, pane, launched_at, last_seen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       agent.id, agent.display_name, agent.runtime, agent.screen_name,
-      agent.screen_pid ?? null, agent.pane ?? null, now, now,
+      agent.screen_pid ?? null, agent.cc_session_id ?? null,
+      agent.pane ?? null, now, now,
     );
     return {
       id: agent.id,
@@ -180,6 +219,7 @@ export class CrewStore {
       runtime: agent.runtime,
       screen_name: agent.screen_name,
       screen_pid: agent.screen_pid ?? null,
+      cc_session_id: agent.cc_session_id ?? null,
       pane: agent.pane ?? null,
       status_name: null,
       status_desc: null,
@@ -188,8 +228,25 @@ export class CrewStore {
     };
   }
 
+  /** Get agent by ID. If multiple exist (handoff in progress), returns the most recent. */
   getAgent(id: string): Agent | null {
-    return this.db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as Agent | null;
+    return this.db.prepare(
+      "SELECT * FROM agents WHERE id = ? ORDER BY launched_at DESC LIMIT 1"
+    ).get(id) as Agent | null;
+  }
+
+  /** Get agent by CC session ID — unambiguous, even during handoff. */
+  getAgentBySession(ccSessionId: string): Agent | null {
+    return this.db.prepare(
+      "SELECT * FROM agents WHERE cc_session_id = ?"
+    ).get(ccSessionId) as Agent | null;
+  }
+
+  /** Get agent by screen name — also unambiguous. */
+  getAgentByScreen(screenName: string): Agent | null {
+    return this.db.prepare(
+      "SELECT * FROM agents WHERE screen_name = ?"
+    ).get(screenName) as Agent | null;
   }
 
   listAgents(): Agent[] {
@@ -216,5 +273,17 @@ export class CrewStore {
 
   deleteAgent(id: string): void {
     this.db.prepare("DELETE FROM agents WHERE id = ?").run(id);
+  }
+
+  /** Delete a specific agent instance by screen name. */
+  deleteAgentByScreen(screenName: string): void {
+    this.db.prepare("DELETE FROM agents WHERE screen_name = ?").run(screenName);
+  }
+
+  /** Update CC session ID for an agent (set after launch when session ID becomes known). */
+  updateAgentCcSession(screenName: string, ccSessionId: string): void {
+    this.db.prepare(
+      "UPDATE agents SET cc_session_id = ?, last_seen = ? WHERE screen_name = ?"
+    ).run(ccSessionId, Date.now(), screenName);
   }
 }
