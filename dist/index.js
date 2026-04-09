@@ -72,6 +72,10 @@ class CrewStore {
     if (!hasCcSession) {
       this.db.exec("ALTER TABLE agents ADD COLUMN cc_session_id TEXT");
     }
+    const hasPaneTheme = this.db.prepare("SELECT * FROM pragma_table_info('panes') WHERE name='theme'").get();
+    if (!hasPaneTheme) {
+      this.db.exec("ALTER TABLE panes ADD COLUMN theme TEXT");
+    }
     const createSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='agents'").get();
     if (createSql?.sql?.includes("id TEXT PRIMARY KEY")) {
       this.db.exec(`
@@ -114,10 +118,10 @@ class CrewStore {
     this.db.prepare("DELETE FROM panes WHERE tab = ?").run(name);
     this.db.prepare("DELETE FROM tabs WHERE name = ?").run(name);
   }
-  createPane(name, tab, position = "") {
+  createPane(name, tab, position = "", theme) {
     const now = Date.now();
-    this.db.prepare("INSERT INTO panes (name, tab, position, created_at) VALUES (?, ?, ?, ?)").run(name, tab, position, now);
-    return { name, tab, position, iterm_id: null, created_at: now };
+    this.db.prepare("INSERT INTO panes (name, tab, position, theme, created_at) VALUES (?, ?, ?, ?, ?)").run(name, tab, position, theme ?? null, now);
+    return { name, tab, position, iterm_id: null, theme: theme ?? null, created_at: now };
   }
   getPane(name) {
     return this.db.prepare("SELECT * FROM panes WHERE name = ?").get(name);
@@ -1093,19 +1097,33 @@ class Orchestrator {
     const agent = this.store.getAgent(agentId);
     if (!agent)
       throw new Error(`agent '${agentId}' not found`);
-    const pane = this.store.getPane(paneName);
+    const resolvedPane = await this.ensureThemedPane(paneName);
+    const pane = this.store.getPane(resolvedPane);
     if (!pane)
-      throw new Error(`pane '${paneName}' not found`);
+      throw new Error(`pane '${resolvedPane}' not found`);
     if (!pane.iterm_id)
-      throw new Error(`pane '${paneName}' has no iTerm2 session`);
-    const occupants = this.store.listAgents().filter((a) => a.pane === paneName);
+      throw new Error(`pane '${resolvedPane}' has no iTerm2 session`);
+    const occupants = this.store.listAgents().filter((a) => a.pane === resolvedPane);
     for (const occ of occupants) {
       await detachSession(occ.screen_name);
       this.store.updateAgentPane(occ.id, null);
     }
     await detachSession(agent.screen_name);
     await writeToSession(pane.iterm_id, `screen -x ${agent.screen_name}`);
-    this.store.updateAgentPane(agentId, paneName);
+    this.store.updateAgentPane(agentId, resolvedPane);
+  }
+  async ensureThemedPane(paneName) {
+    const pane = this.store.getPane(paneName);
+    if (!pane)
+      return paneName;
+    const tab = this.store.getTab(pane.tab);
+    if (!tab?.theme)
+      return paneName;
+    if (pane.theme === tab.theme)
+      return paneName;
+    const newPane = await this.createPane(pane.tab, undefined, pane.position, paneName);
+    await this.closePane(paneName);
+    return newPane.name;
   }
   async detachAgent(agentId) {
     const agent = this.store.getAgent(agentId);
@@ -1221,7 +1239,8 @@ class Orchestrator {
       await setSessionName(itermSessionId, titleCase(paneName));
       return { ...existing, iterm_id: itermSessionId };
     }
-    const pane = this.store.createPane(paneName, tab, "registered");
+    const tabRow = this.store.getTab(tab);
+    const pane = this.store.createPane(paneName, tab, "registered", tabRow?.theme ?? undefined);
     this.store.setPaneItermId(paneName, itermSessionId);
     await setSessionName(itermSessionId, titleCase(paneName));
     return { ...pane, iterm_id: itermSessionId };
@@ -1258,7 +1277,7 @@ class Orchestrator {
     } else {
       itermId = await splitPaneWithProfile(direction, profileName);
     }
-    const pane = this.store.createPane(paneName, tab, position);
+    const pane = this.store.createPane(paneName, tab, position, tabRow?.theme ?? undefined);
     this.store.setPaneItermId(paneName, itermId);
     await setSessionName(itermId, titleCase(paneName));
     return { ...pane, iterm_id: itermId };

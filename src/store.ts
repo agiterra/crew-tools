@@ -18,6 +18,7 @@ export type Pane = {
   tab: string;
   position: string;
   iterm_id: string | null;
+  theme: string | null;
   created_at: number;
 };
 
@@ -108,6 +109,14 @@ export class CrewStore {
       this.db.exec("ALTER TABLE agents ADD COLUMN cc_session_id TEXT");
     }
 
+    // Add theme column to panes if missing
+    const hasPaneTheme = this.db.prepare(
+      "SELECT * FROM pragma_table_info('panes') WHERE name='theme'"
+    ).get();
+    if (!hasPaneTheme) {
+      this.db.exec("ALTER TABLE panes ADD COLUMN theme TEXT");
+    }
+
     // Migrate from single-agent-per-id to multi-agent-per-id (for handoff).
     // Change PRIMARY KEY from id to screen_name — screen names are always unique.
     const createSql = this.db.prepare(
@@ -164,12 +173,12 @@ export class CrewStore {
 
   // --- Panes ---
 
-  createPane(name: string, tab: string, position: string = ""): Pane {
+  createPane(name: string, tab: string, position: string = "", theme?: string): Pane {
     const now = Date.now();
     this.db.prepare(
-      "INSERT INTO panes (name, tab, position, created_at) VALUES (?, ?, ?, ?)"
-    ).run(name, tab, position, now);
-    return { name, tab, position, iterm_id: null, created_at: now };
+      "INSERT INTO panes (name, tab, position, theme, created_at) VALUES (?, ?, ?, ?, ?)"
+    ).run(name, tab, position, theme ?? null, now);
+    return { name, tab, position, iterm_id: null, theme: theme ?? null, created_at: now };
   }
 
   getPane(name: string): Pane | null {

@@ -185,18 +185,23 @@ export class Orchestrator {
 
   /**
    * Attach an agent to a pane (make it visible).
+   * If the pane doesn't match the tab's theme, auto-swaps to a themed pane.
    * Detaches the screen session first (remotely), then reattaches it
    * in the target pane's iTerm2 session.
    */
   async attachAgent(agentId: string, paneName: string): Promise<void> {
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`agent '${agentId}' not found`);
-    const pane = this.store.getPane(paneName);
-    if (!pane) throw new Error(`pane '${paneName}' not found`);
-    if (!pane.iterm_id) throw new Error(`pane '${paneName}' has no iTerm2 session`);
+
+    // Auto-swap to a themed pane if needed
+    const resolvedPane = await this.ensureThemedPane(paneName);
+
+    const pane = this.store.getPane(resolvedPane);
+    if (!pane) throw new Error(`pane '${resolvedPane}' not found`);
+    if (!pane.iterm_id) throw new Error(`pane '${resolvedPane}' has no iTerm2 session`);
 
     // Detach any agent currently in this pane (remotely via screen -d)
-    const occupants = this.store.listAgents().filter((a) => a.pane === paneName);
+    const occupants = this.store.listAgents().filter((a) => a.pane === resolvedPane);
     for (const occ of occupants) {
       await screen.detachSession(occ.screen_name);
       this.store.updateAgentPane(occ.id, null);
@@ -207,9 +212,30 @@ export class Orchestrator {
 
     // Attach screen session to the iTerm2 pane.
     // Use -x (multi-display) to handle edge cases where -r fails.
-    // Use full path to screen binary to avoid PATH issues in non-login shells.
     await iterm.writeToSession(pane.iterm_id, `screen -x ${agent.screen_name}`);
-    this.store.updateAgentPane(agentId, paneName);
+    this.store.updateAgentPane(agentId, resolvedPane);
+  }
+
+  /**
+   * Ensure a pane matches its tab's theme. If the pane was created without
+   * the tab's current theme (e.g., default profile, wrong theme), create a
+   * new themed pane in the same position, and close the old one.
+   * Returns the pane name to use (original if already themed, new if swapped).
+   */
+  async ensureThemedPane(paneName: string): Promise<string> {
+    const pane = this.store.getPane(paneName);
+    if (!pane) return paneName; // Let the caller handle missing pane
+
+    const tab = this.store.getTab(pane.tab);
+    if (!tab?.theme) return paneName; // No theme on tab — nothing to do
+
+    // Already matches the tab's theme
+    if (pane.theme === tab.theme) return paneName;
+
+    // Pane doesn't match — swap it
+    const newPane = await this.createPane(pane.tab, undefined, pane.position, paneName);
+    await this.closePane(paneName);
+    return newPane.name;
   }
 
   /**
@@ -391,7 +417,8 @@ export class Orchestrator {
       return { ...existing, iterm_id: itermSessionId };
     }
 
-    const pane = this.store.createPane(paneName, tab, "registered");
+    const tabRow = this.store.getTab(tab);
+    const pane = this.store.createPane(paneName, tab, "registered", tabRow?.theme ?? undefined);
     this.store.setPaneItermId(paneName, itermSessionId);
     await iterm.setSessionName(itermSessionId, titleCase(paneName));
     return { ...pane, iterm_id: itermSessionId };
@@ -456,7 +483,7 @@ export class Orchestrator {
       itermId = await iterm.splitPaneWithProfile(direction, profileName);
     }
 
-    const pane = this.store.createPane(paneName, tab, position);
+    const pane = this.store.createPane(paneName, tab, position, tabRow?.theme ?? undefined);
     this.store.setPaneItermId(paneName, itermId);
     await iterm.setSessionName(itermId, titleCase(paneName));
     return { ...pane, iterm_id: itermId };
