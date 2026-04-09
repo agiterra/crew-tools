@@ -281,12 +281,25 @@ export async function setBadge(sessionId: string, text: string): Promise<void> {
  * Returns the profile name to use when splitting.
  * Background images MUST be set at pane creation time via the profile —
  * iTerm2 can't change a session's profile after creation.
+ *
+ * Delete-before-write ensures iTerm2 re-reads the profile when a pane
+ * name is recycled (same filename, possibly different content).
  */
-export function writePaneProfile(paneName: string, backgroundImage: string): string {
+export function writePaneProfile(
+  paneName: string,
+  backgroundImage: string,
+  opts?: {
+    blend?: number;
+    mode?: number;
+  },
+): string {
   const profileName = `Crew ${paneName}`;
   const guid = `crew-pane-${paneName.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
   const profileFile = join(DYNAMIC_PROFILES_DIR, `crew-pane-${paneName}.json`);
   mkdirSync(DYNAMIC_PROFILES_DIR, { recursive: true });
+
+  // Delete first to force iTerm2 to re-read (prevents stale cache on name reuse)
+  try { unlinkSync(profileFile); } catch {}
 
   const profile = {
     Profiles: [
@@ -297,8 +310,8 @@ export function writePaneProfile(paneName: string, backgroundImage: string): str
         Command: "zsh -c 'printf \"\\n  \\033[2m☐ Available — no agent attached\\033[0m\\n\\n\" && exec zsh -l'",
         "Silence Bell": true,
         "Background Image Location": backgroundImage,
-        "Blend": 0.5,
-        "Background Image Mode": 2,
+        "Blend": opts?.blend ?? 0.5,
+        "Background Image Mode": opts?.mode ?? 2,
       },
     ],
   };

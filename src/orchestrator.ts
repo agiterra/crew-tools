@@ -11,7 +11,7 @@ import * as screen from "./screen.js";
 import * as iterm from "./iterm.js";
 import { getLaunchCommand } from "./runtimes.js";
 import { reconcile, formatReport } from "./reconciler.js";
-import { pickName, backgroundImagePath } from "./themes.js";
+import { pickName, backgroundImagePath, loadTheme } from "./themes.js";
 
 const DEFAULT_DB = join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
 const SCREEN_PREFIX = "wire-";
@@ -428,9 +428,13 @@ export class Orchestrator {
 
     // Resolve background image and choose the right profile
     const tabRow = this.store.getTab(tab);
-    const bgPath = tabRow?.theme ? backgroundImagePath(tabRow.theme, paneName) : null;
+    const theme = tabRow?.theme ? loadTheme(tabRow.theme) : null;
+    const bgPath = tabRow?.theme ? backgroundImagePath(tabRow.theme, paneName, theme) : null;
     const profileName = bgPath
-      ? iterm.writePaneProfile(paneName, bgPath)
+      ? iterm.writePaneProfile(paneName, bgPath, {
+          blend: theme?.background.blend,
+          mode: theme?.background.mode,
+        })
       : (iterm.writeEmptyPaneProfile(), "Crew Empty Pane");
 
     // Brief delay for iTerm2 to pick up the dynamic profile
