@@ -10,6 +10,7 @@ import { Database } from "bun:sqlite";
 export type Tab = {
   name: string;
   theme: string | null;
+  iterm_session_id: string | null;
   created_at: number;
 };
 
@@ -117,6 +118,14 @@ export class CrewStore {
       this.db.exec("ALTER TABLE panes ADD COLUMN theme TEXT");
     }
 
+    // Add iterm_session_id column to tabs if missing
+    const hasTabSession = this.db.prepare(
+      "SELECT * FROM pragma_table_info('tabs') WHERE name='iterm_session_id'"
+    ).get();
+    if (!hasTabSession) {
+      this.db.exec("ALTER TABLE tabs ADD COLUMN iterm_session_id TEXT");
+    }
+
     // Migrate from single-agent-per-id to multi-agent-per-id (for handoff).
     // Change PRIMARY KEY from id to screen_name — screen names are always unique.
     const createSql = this.db.prepare(
@@ -148,10 +157,10 @@ export class CrewStore {
 
   // --- Tabs ---
 
-  createTab(name: string, theme?: string): Tab {
+  createTab(name: string, theme?: string, itermSessionId?: string): Tab {
     const now = Date.now();
-    this.db.prepare("INSERT INTO tabs (name, theme, created_at) VALUES (?, ?, ?)").run(name, theme ?? null, now);
-    return { name, theme: theme ?? null, created_at: now };
+    this.db.prepare("INSERT INTO tabs (name, theme, iterm_session_id, created_at) VALUES (?, ?, ?, ?)").run(name, theme ?? null, itermSessionId ?? null, now);
+    return { name, theme: theme ?? null, iterm_session_id: itermSessionId ?? null, created_at: now };
   }
 
   setTabTheme(name: string, theme: string): void {

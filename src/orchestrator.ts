@@ -376,8 +376,9 @@ export class Orchestrator {
 
   // --- Tabs ---
 
-  createTab(name: string, theme?: string): Tab {
-    return this.store.createTab(name, theme);
+  async createTab(name: string, theme?: string): Promise<Tab> {
+    const itermSessionId = await iterm.createItermTab();
+    return this.store.createTab(name, theme, itermSessionId);
   }
 
   setTabTheme(name: string, theme: string): void {
@@ -467,15 +468,16 @@ export class Orchestrator {
     // Brief delay for iTerm2 to pick up the dynamic profile
     await new Promise((r) => setTimeout(r, 300));
 
-    // Split relative to a named pane, raw UUID, or fall back to current.
+    // Split relative to a named pane, raw UUID, tab's session, or fall back to current.
     let itermId: string;
-    if (relativeTo) {
-      const resolvedId = this.resolveSession(relativeTo);
+    const splitTarget = relativeTo ?? tabRow?.iterm_session_id;
+    if (splitTarget) {
+      const resolvedId = relativeTo ? this.resolveSession(relativeTo) : splitTarget;
       const alive = await iterm.isSessionAlive(resolvedId);
       if (!alive) {
         throw new Error(
-          `cannot split relative to '${relativeTo}': iTerm2 session ${resolvedId} is dead or stale. ` +
-          `Re-register the pane or omit relative_to to split the caller's pane.`
+          `cannot split relative to '${relativeTo ?? tab}': iTerm2 session ${resolvedId} is dead or stale. ` +
+          `Re-register the pane or tab, or omit relative_to to split the caller's pane.`
         );
       }
       itermId = await iterm.splitSessionWithProfile(resolvedId, direction, profileName);
