@@ -426,8 +426,17 @@ export class Orchestrator {
       ? "vertical"
       : "horizontal";
 
+    // Resolve background image and choose the right profile
+    const tabRow = this.store.getTab(tab);
+    const bgPath = tabRow?.theme ? backgroundImagePath(tabRow.theme, paneName) : null;
+    const profileName = bgPath
+      ? iterm.writePaneProfile(paneName, bgPath)
+      : (iterm.writeEmptyPaneProfile(), "Crew Empty Pane");
+
+    // Brief delay for iTerm2 to pick up the dynamic profile
+    await new Promise((r) => setTimeout(r, 300));
+
     // Split relative to a named pane, raw UUID, or fall back to current.
-    // Uses the "Crew Empty Pane" profile for a clean placeholder.
     let itermId: string;
     if (relativeTo) {
       const resolvedId = this.resolveSession(relativeTo);
@@ -438,25 +447,14 @@ export class Orchestrator {
           `Re-register the pane or omit relative_to to split the caller's pane.`
         );
       }
-      itermId = await iterm.splitSessionEmpty(resolvedId, direction);
+      itermId = await iterm.splitSessionWithProfile(resolvedId, direction, profileName);
     } else {
-      itermId = await iterm.splitPaneEmpty(direction);
+      itermId = await iterm.splitPaneWithProfile(direction, profileName);
     }
 
     const pane = this.store.createPane(paneName, tab, position);
     this.store.setPaneItermId(paneName, itermId);
     await iterm.setSessionName(itermId, titleCase(paneName));
-
-    // Set themed background image via AppleScript (not profile — profile
-    // is shared across panes and gets overwritten on next create)
-    const tabRow = this.store.getTab(tab);
-    if (tabRow?.theme) {
-      const bgPath = backgroundImagePath(tabRow.theme, paneName);
-      if (bgPath) {
-        await iterm.setBackgroundImage(itermId, bgPath);
-      }
-    }
-
     return { ...pane, iterm_id: itermId };
   }
 

@@ -277,28 +277,33 @@ export async function setBadge(sessionId: string, text: string): Promise<void> {
 // --- Background Images ---
 
 /**
- * Set the background image for a specific session.
- * Uses iTerm2's proprietary escape sequence (OSC 1337).
+ * Write a per-pane dynamic profile with a background image.
+ * Returns the profile name to use when splitting.
+ * Background images MUST be set at pane creation time via the profile —
+ * iTerm2 can't change a session's profile after creation.
  */
-export async function setBackgroundImage(
-  sessionId: string,
-  imagePath: string,
-): Promise<void> {
-  const escaped = imagePath.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  await osascript(`
-    tell application "iTerm2"
-      repeat with w in windows
-        repeat with t in tabs of w
-          repeat with s in sessions of t
-            if id of s is "${sessionId}" then
-              tell s to set background image to "${escaped}"
-              return
-            end if
-          end repeat
-        end repeat
-      end repeat
-    end tell
-  `);
+export function writePaneProfile(paneName: string, backgroundImage: string): string {
+  const profileName = `Crew ${paneName}`;
+  const guid = `crew-pane-${paneName.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
+  const profileFile = join(DYNAMIC_PROFILES_DIR, `crew-pane-${paneName}.json`);
+  mkdirSync(DYNAMIC_PROFILES_DIR, { recursive: true });
+
+  const profile = {
+    Profiles: [
+      {
+        Name: profileName,
+        Guid: guid,
+        "Custom Command": "Yes",
+        Command: "zsh -c 'printf \"\\n  \\033[2m☐ Available — no agent attached\\033[0m\\n\\n\" && exec zsh -l'",
+        "Silence Bell": true,
+        "Background Image Location": backgroundImage,
+        "Blend": 0.5,
+        "Background Image Mode": 2,
+      },
+    ],
+  };
+  writeFileSync(profileFile, JSON.stringify(profile, null, 2));
+  return profileName;
 }
 
 // --- Dynamic Profiles ---
@@ -332,19 +337,18 @@ export function writeEmptyPaneProfile(): void {
 }
 
 /**
- * Split the current pane using the "Crew Empty Pane" profile.
- * Optionally set a background image with blend.
- * Returns the new session's ID.
+ * Split the current pane using a named profile. Returns the new session's ID.
  */
-export async function splitPaneEmpty(
+export async function splitPaneWithProfile(
   direction: "horizontal" | "vertical",
+  profileName: string,
 ): Promise<string> {
-  writeEmptyPaneProfile();
+  const escaped = profileName.replace(/"/g, '\\"');
   const verb = direction === "horizontal" ? "horizontally" : "vertically";
   return osascript(`
     tell application "iTerm2"
       tell current session of current tab of current window
-        set newSession to split ${verb} with profile "${EMPTY_PANE_PROFILE_NAME}"
+        set newSession to split ${verb} with profile "${escaped}"
         tell newSession
           return id
         end tell
@@ -354,15 +358,14 @@ export async function splitPaneEmpty(
 }
 
 /**
- * Split a specific session using the "Crew Empty Pane" profile.
- * Optionally set a background image with blend.
- * Returns the new session's ID.
+ * Split a specific session using a named profile. Returns the new session's ID.
  */
-export async function splitSessionEmpty(
+export async function splitSessionWithProfile(
   sessionId: string,
   direction: "horizontal" | "vertical",
+  profileName: string,
 ): Promise<string> {
-  writeEmptyPaneProfile();
+  const escaped = profileName.replace(/"/g, '\\"');
   const verb = direction === "horizontal" ? "horizontally" : "vertically";
   return osascript(`
     tell application "iTerm2"
@@ -371,7 +374,7 @@ export async function splitSessionEmpty(
           repeat with s in sessions of t
             if id of s is "${sessionId}" then
               tell s
-                set newSession to split ${verb} with profile "${EMPTY_PANE_PROFILE_NAME}"
+                set newSession to split ${verb} with profile "${escaped}"
               end tell
               return id of newSession
             end if
