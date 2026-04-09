@@ -13,7 +13,7 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { Orchestrator } from "./orchestrator.js";
-import * as iterm from "./iterm.js";
+import { createBackend } from "./terminal.js";
 import { listThemes, loadTheme, resolveThemeDir } from "./themes.js";
 import { generateKeyPair, exportPrivateKey, importKeyPair, register, setPlan } from "@agiterra/wire-tools";
 import { execSync } from "child_process";
@@ -22,35 +22,50 @@ import { execSync } from "child_process";
  * Start the crew MCP server. Blocks until the transport disconnects.
  */
 export async function startServer(): Promise<void> {
-  const orchestrator = new Orchestrator();
+  const terminal = await createBackend();
+  const orchestrator = new Orchestrator(terminal);
+  const terminalName = terminal.name;
   const CALLER_AGENT_ID =
     process.env.CREW_AGENT_ID ?? process.env.WIRE_AGENT_ID ?? "unknown";
   let keyPair: { publicKey: string; privateKey: CryptoKey } | null = null;
 
+  /**
+   * Detect the caller's terminal session ID.
+   * Works with both iTerm2 (TTY lookup + ITERM_SESSION_ID) and cmux (CMUX_SURFACE_ID).
+   */
   async function callerSession(): Promise<string | undefined> {
+    // cmux: use CMUX_SURFACE_ID env var directly
+    if (terminalName === "cmux" && process.env.CMUX_SURFACE_ID) {
+      return process.env.CMUX_SURFACE_ID;
+    }
+
+    // Try resolving via TTY → terminal session lookup
     try {
       const tty = execSync(`ps -o tty= -p ${process.ppid}`, { encoding: "utf-8" }).trim();
       if (tty && tty !== "??") {
-        const id = await iterm.sessionIdForTty(tty);
+        const id = await terminal.sessionIdForTty(tty);
         if (id) return id;
       }
     } catch (e) {
       console.error(`[crew] TTY lookup failed for ppid ${process.ppid}:`, e);
     }
+
+    // Fall back to env vars
+    if (process.env.CMUX_SURFACE_ID) return process.env.CMUX_SURFACE_ID;
     const raw = process.env.ITERM_SESSION_ID;
     if (raw) return raw.split(":")[1];
     return undefined;
   }
 
   const mcp = new Server(
-    { name: "crew", version: "0.2.0" },
+    { name: "crew", version: "0.3.0" },
     {
       capabilities: { tools: {} },
       instructions:
-        "Crew manages agents across three independent layers:\n" +
+        `Crew manages agents across three independent layers (terminal: ${terminalName}):\n` +
         "- AGENT = the full stack: identity + CC session + CC process + screen. 1:1:1:1. Survives pane closes and terminal crashes.\n" +
-        "- PANE = an iTerm2 pane. A viewport — nothing more. Think of panes as conference rooms.\n" +
-        "- TAB = an iTerm2 tab containing a layout of panes.\n\n" +
+        "- PANE = a terminal pane. A viewport — nothing more. Think of panes as conference rooms.\n" +
+        "- TAB = a terminal tab/workspace containing a layout of panes.\n\n" +
         "Agents and panes are independent. An agent can run without a pane (headless), " +
         "and a pane can exist without an agent (empty shell). " +
         "`agent_attach` connects an agent's screen to a pane. `agent_detach` disconnects without stopping the agent.\n\n" +
@@ -201,7 +216,7 @@ export async function startServer(): Promise<void> {
     },
     {
       name: "tab_create",
-      description: "Create a named tab (iTerm2 tab — a container for panes). Optionally set a theme for auto-naming panes.",
+      description: "Create a named tab (a container for panes). Optionally set a theme for auto-naming panes.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -229,7 +244,7 @@ export async function startServer(): Promise<void> {
     },
     {
       name: "pane_register",
-      description: "Register your own iTerm2 pane. Call this at session start so other agents can split relative to your pane.",
+      description: "Register your own terminal pane. Call this at session start so other agents can split relative to your pane.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -241,21 +256,21 @@ export async function startServer(): Promise<void> {
     },
     {
       name: "pane_create",
-      description: "Create a pane by splitting an existing iTerm2 pane.",
+      description: "Create a pane by splitting an existing terminal pane.",
       inputSchema: {
         type: "object" as const,
         properties: {
           tab: { type: "string", description: "Tab name" },
           name: { type: "string", description: "Pane name (optional — auto-assigned from tab theme if omitted)" },
           position: { type: "string", description: "Split direction: below (default), right, left, above" },
-          relative_to: { type: "string", description: "Pane name or session UUID to split from (default: tab's session or caller's pane)" },
+          relative_to: { type: "string", description: "Pane name or session ID to split from (default: tab's session or caller's pane)" },
         },
         required: ["tab"],
       },
     },
     {
       name: "pane_send",
-      description: "Send keystrokes to a pane's iTerm2 session.",
+      description: "Send keystrokes to a pane's terminal session.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -267,7 +282,7 @@ export async function startServer(): Promise<void> {
     },
     {
       name: "pane_badge",
-      description: "Set the iTerm2 badge on a pane (overlay text in corner)",
+      description: "Set a badge/status on a pane (overlay text in corner for iTerm2, sidebar status for cmux)",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -321,7 +336,7 @@ export async function startServer(): Promise<void> {
         properties: {
           theme: { type: "string", description: "Theme name" },
           blend: { type: "number", description: "Background blend/opacity (0-1)" },
-          mode: { type: "number", description: "iTerm2 background image mode (0=tile, 1=stretch, 2=scale-to-fill)" },
+          mode: { type: "number", description: "Background image mode (0=tile, 1=stretch, 2=scale-to-fill)" },
           images: {
             type: "object",
             description: "Map of pane name → image filename to update",
@@ -391,7 +406,7 @@ export async function startServer(): Promise<void> {
             id: a.id as string,
             displayName: a.name as string,
             runtime: a.runtime as string | undefined,
-            callerItermId: await callerSession(),
+            callerSessionId: await callerSession(),
             ccSessionId: a.cc_session_id as string | undefined,
           });
           break;
@@ -439,12 +454,12 @@ export async function startServer(): Promise<void> {
           result = { destroyed: a.name };
           break;
         case "pane_register": {
-          const itermId = await callerSession();
-          if (!itermId) throw new Error("cannot detect iTerm2 session — are you running in iTerm2?");
+          const sessionId = await callerSession();
+          if (!sessionId) throw new Error(`cannot detect terminal session — are you running in ${terminalName}?`);
           if (!orchestrator.store.getTab(a.tab as string)) {
             orchestrator.createTab(a.tab as string);
           }
-          result = await orchestrator.registerPane(a.tab as string, a.name as string | undefined, itermId);
+          result = await orchestrator.registerPane(a.tab as string, a.name as string | undefined, sessionId);
           break;
         }
         case "pane_create":
@@ -540,5 +555,5 @@ export async function startServer(): Promise<void> {
 
   const report = await orchestrator.reconcile();
   console.error(`[crew] boot reconcile:\n${report}`);
-  console.error(`[crew] ready (caller=${CALLER_AGENT_ID})`);
+  console.error(`[crew] ready (caller=${CALLER_AGENT_ID}, terminal=${terminalName})`);
 }

@@ -1,14 +1,14 @@
 /**
  * Crew orchestrator — high-level agent lifecycle management.
  *
- * Composes store, screen, runtimes, and reconciler into the operations
- * that MCP adapters expose as tools.
+ * Composes store, screen, terminal backend, runtimes, and reconciler
+ * into the operations that MCP adapters expose as tools.
  */
 
 import { join } from "path";
 import { CrewStore, type Agent, type Tab, type Pane } from "./store.js";
 import * as screen from "./screen.js";
-import * as iterm from "./iterm.js";
+import type { TerminalBackend } from "./terminal.js";
 import { getLaunchCommand } from "./runtimes.js";
 import { reconcile, formatReport } from "./reconciler.js";
 import { pickName, backgroundImagePath, loadTheme, updateTheme } from "./themes.js";
@@ -27,8 +27,10 @@ function shellEscape(s: string): string {
 
 export class Orchestrator {
   readonly store: CrewStore;
+  readonly terminal: TerminalBackend;
 
-  constructor(dbPath: string = DEFAULT_DB) {
+  constructor(terminal: TerminalBackend, dbPath: string = DEFAULT_DB) {
+    this.terminal = terminal;
     this.store = new CrewStore(dbPath);
   }
 
@@ -112,13 +114,13 @@ export class Orchestrator {
   /**
    * Register an already-running agent (self-registration).
    * The agent detects its own screen session from STY env var.
-   * If callerItermId is provided, auto-links to the pane owning that session.
+   * If callerSessionId is provided, auto-links to the pane owning that session.
    */
   async registerAgent(opts: {
     id: string;
     displayName: string;
     runtime?: string;
-    callerItermId?: string;
+    callerSessionId?: string;
     ccSessionId?: string;
   }): Promise<Agent> {
     const runtime = opts.runtime ?? "claude-code";
@@ -138,9 +140,9 @@ export class Orchestrator {
     const alive = await screen.isAlive(screenName);
     if (!alive) throw new Error(`screen session '${screenName}' is not running`);
 
-    // Find the pane this agent is sitting in (by iTerm session ID)
-    const callerPane = opts.callerItermId
-      ? this.store.listPanes().find((p) => p.iterm_id === opts.callerItermId)?.name ?? null
+    // Find the pane this agent is sitting in (by terminal session ID)
+    const callerPane = opts.callerSessionId
+      ? this.store.listPanes().find((p) => p.iterm_id === opts.callerSessionId)?.name ?? null
       : null;
 
     // Check if this exact screen session is already registered
@@ -187,7 +189,7 @@ export class Orchestrator {
    * Attach an agent to a pane (make it visible).
    * If the pane doesn't match the tab's theme, auto-swaps to a themed pane.
    * Detaches the screen session first (remotely), then reattaches it
-   * in the target pane's iTerm2 session.
+   * in the target pane's terminal session.
    */
   async attachAgent(agentId: string, paneName: string): Promise<void> {
     const agent = this.store.getAgent(agentId);
@@ -198,7 +200,7 @@ export class Orchestrator {
 
     const pane = this.store.getPane(resolvedPane);
     if (!pane) throw new Error(`pane '${resolvedPane}' not found`);
-    if (!pane.iterm_id) throw new Error(`pane '${resolvedPane}' has no iTerm2 session`);
+    if (!pane.iterm_id) throw new Error(`pane '${resolvedPane}' has no terminal session`);
 
     // Detach any agent currently in this pane (remotely via screen -d)
     const occupants = this.store.listAgents().filter((a) => a.pane === resolvedPane);
@@ -210,9 +212,9 @@ export class Orchestrator {
     // Detach the agent's screen from wherever it currently is
     await screen.detachSession(agent.screen_name);
 
-    // Attach screen session to the iTerm2 pane.
+    // Attach screen session to the terminal pane.
     // Use -x (multi-display) to handle edge cases where -r fails.
-    await iterm.writeToSession(pane.iterm_id, `screen -x ${agent.screen_name}`);
+    await this.terminal.writeToSession(pane.iterm_id, `screen -x ${agent.screen_name}`);
     this.store.updateAgentPane(agentId, resolvedPane);
   }
 
@@ -330,26 +332,26 @@ export class Orchestrator {
   // --- Pane I/O ---
 
   /**
-   * Send keystrokes to a pane's iTerm2 session.
+   * Send keystrokes to a pane's terminal session.
    * Works whether or not an agent is attached.
    */
   async sendToPane(paneName: string, text: string): Promise<void> {
     const pane = this.store.getPane(paneName);
     if (!pane) throw new Error(`pane '${paneName}' not found`);
-    if (!pane.iterm_id) throw new Error(`pane '${paneName}' has no iTerm2 session`);
-    await iterm.writeToSession(pane.iterm_id, text);
+    if (!pane.iterm_id) throw new Error(`pane '${paneName}' has no terminal session`);
+    await this.terminal.writeToSession(pane.iterm_id, text);
   }
 
   // --- Badges ---
 
   /**
-   * Set the iTerm2 badge on a pane.
+   * Set the badge/status on a pane.
    */
   async setBadge(paneName: string, text: string): Promise<void> {
     const pane = this.store.getPane(paneName);
     if (!pane) throw new Error(`pane '${paneName}' not found`);
-    if (!pane.iterm_id) throw new Error(`pane '${paneName}' has no iTerm2 session`);
-    await iterm.setBadge(pane.iterm_id, text);
+    if (!pane.iterm_id) throw new Error(`pane '${paneName}' has no terminal session`);
+    await this.terminal.setBadge(pane.iterm_id, text);
   }
 
   // --- Interrupt ---
@@ -377,8 +379,8 @@ export class Orchestrator {
   // --- Tabs ---
 
   async createTab(name: string, theme?: string): Promise<Tab> {
-    const itermSessionId = await iterm.createItermTab();
-    return this.store.createTab(name, theme, itermSessionId);
+    const sessionId = await this.terminal.createTab();
+    return this.store.createTab(name, theme, sessionId);
   }
 
   setTabTheme(name: string, theme: string): void {
@@ -397,14 +399,14 @@ export class Orchestrator {
   // --- Panes ---
 
   /**
-   * Register an existing iTerm2 session as a named pane.
+   * Register an existing terminal session as a named pane.
    * Use this so agents can register their own pane and split relative to it.
    */
-  async registerPane(tab: string, name: string | undefined, itermSessionId: string): Promise<Pane> {
+  async registerPane(tab: string, name: string | undefined, sessionId: string): Promise<Pane> {
     if (!this.store.getTab(tab)) throw new Error(`tab '${tab}' not found`);
 
-    const alive = await iterm.isSessionAlive(itermSessionId);
-    if (!alive) throw new Error(`iTerm2 session ${itermSessionId} not found — ITERM_SESSION_ID may be stale`);
+    const alive = await this.terminal.isSessionAlive(sessionId);
+    if (!alive) throw new Error(`terminal session ${sessionId} not found — session ID may be stale`);
 
     // Auto-name from theme if no name given
     const paneName = name ?? this.nextPaneName(tab);
@@ -413,35 +415,35 @@ export class Orchestrator {
     const existing = this.store.getPane(paneName);
     if (existing) {
       // Update the iterm_id if pane already exists
-      this.store.setPaneItermId(paneName, itermSessionId);
-      await iterm.setSessionName(itermSessionId, titleCase(paneName));
-      return { ...existing, iterm_id: itermSessionId };
+      this.store.setPaneItermId(paneName, sessionId);
+      await this.terminal.setSessionName(sessionId, titleCase(paneName));
+      return { ...existing, iterm_id: sessionId };
     }
 
     const tabRow = this.store.getTab(tab);
     const pane = this.store.createPane(paneName, tab, "registered", tabRow?.theme ?? undefined);
-    this.store.setPaneItermId(paneName, itermSessionId);
-    await iterm.setSessionName(itermSessionId, titleCase(paneName));
-    return { ...pane, iterm_id: itermSessionId };
+    this.store.setPaneItermId(paneName, sessionId);
+    await this.terminal.setSessionName(sessionId, titleCase(paneName));
+    return { ...pane, iterm_id: sessionId };
   }
 
   /**
-   * Resolve a relativeTo value to an iTerm2 session UUID.
-   * Accepts a pane name (looked up in DB) or a raw UUID.
+   * Resolve a relativeTo value to a terminal session ID.
+   * Accepts a pane name (looked up in DB) or a raw session ID.
    */
   private resolveSession(relativeTo: string): string {
     // Check if it's a known pane name
     const pane = this.store.getPane(relativeTo);
     if (pane?.iterm_id) return pane.iterm_id;
-    // Otherwise treat as raw iTerm2 session UUID
+    // Otherwise treat as raw session ID
     return relativeTo;
   }
 
   /**
-   * Create a pane by splitting an existing iTerm2 pane.
+   * Create a pane by splitting an existing terminal pane.
    * Direction is inferred from position: "below"/"above" = horizontal,
    * "left"/"right" = vertical. Default: horizontal (below).
-   * relativeTo: pane name or iTerm2 session UUID to split from.
+   * relativeTo: pane name or session ID to split from.
    */
   async createPane(tab: string, name: string | undefined, position: string = "below", relativeTo?: string): Promise<Pane> {
     if (!this.store.getTab(tab)) throw new Error(`tab '${tab}' not found`);
@@ -459,36 +461,40 @@ export class Orchestrator {
     const theme = tabRow?.theme ? loadTheme(tabRow.theme) : null;
     const bgPath = tabRow?.theme ? backgroundImagePath(tabRow.theme, paneName, theme) : null;
     const profileName = bgPath
-      ? iterm.writePaneProfile(paneName, bgPath, {
+      ? this.terminal.writePaneProfile({
+          paneName,
+          backgroundImage: bgPath,
           blend: theme?.background.blend,
           mode: theme?.background.mode,
         })
-      : (iterm.writeEmptyPaneProfile(), "Crew Empty Pane");
+      : this.terminal.writeEmptyPaneProfile();
 
-    // Brief delay for iTerm2 to pick up the dynamic profile
-    await new Promise((r) => setTimeout(r, 300));
+    // Brief delay for iTerm2 to pick up the dynamic profile (cmux doesn't need this but it's harmless)
+    if (this.terminal.name === "iterm") {
+      await new Promise((r) => setTimeout(r, 300));
+    }
 
-    // Split relative to a named pane, raw UUID, tab's session, or fall back to current.
-    let itermId: string;
+    // Split relative to a named pane, raw session ID, tab's session, or fall back to current.
+    let sessionId: string;
     const splitTarget = relativeTo ?? tabRow?.iterm_session_id;
     if (splitTarget) {
       const resolvedId = relativeTo ? this.resolveSession(relativeTo) : splitTarget;
-      const alive = await iterm.isSessionAlive(resolvedId);
+      const alive = await this.terminal.isSessionAlive(resolvedId);
       if (!alive) {
         throw new Error(
-          `cannot split relative to '${relativeTo ?? tab}': iTerm2 session ${resolvedId} is dead or stale. ` +
+          `cannot split relative to '${relativeTo ?? tab}': terminal session ${resolvedId} is dead or stale. ` +
           `Re-register the pane or tab, or omit relative_to to split the caller's pane.`
         );
       }
-      itermId = await iterm.splitSessionWithProfile(resolvedId, direction, profileName);
+      sessionId = await this.terminal.splitSessionWithProfile(resolvedId, direction, profileName);
     } else {
-      itermId = await iterm.splitPaneWithProfile(direction, profileName);
+      sessionId = await this.terminal.splitPaneWithProfile(direction, profileName);
     }
 
     const pane = this.store.createPane(paneName, tab, position, tabRow?.theme ?? undefined);
-    this.store.setPaneItermId(paneName, itermId);
-    await iterm.setSessionName(itermId, titleCase(paneName));
-    return { ...pane, iterm_id: itermId };
+    this.store.setPaneItermId(paneName, sessionId);
+    await this.terminal.setSessionName(sessionId, titleCase(paneName));
+    return { ...pane, iterm_id: sessionId };
   }
 
   /**
@@ -507,16 +513,16 @@ export class Orchestrator {
   }
 
   /**
-   * Close a pane — closes the iTerm2 session and removes from DB.
+   * Close a pane — closes the terminal session and removes from DB.
    * Detaches any agent in the pane first (agent keeps running in its screen session).
    * Throws if the pane is not found or can't be closed.
    */
-  async closePane(name: string, callerItermId?: string): Promise<void> {
+  async closePane(name: string, callerSessionId?: string): Promise<void> {
     const pane = this.store.getPane(name);
     if (!pane) throw new Error(`pane '${name}' not found`);
 
     // Self-protection: prevent an agent from destroying the pane it's sitting in
-    if (callerItermId && pane.iterm_id === callerItermId) {
+    if (callerSessionId && pane.iterm_id === callerSessionId) {
       throw new Error(
         `refusing to close pane '${name}' — it is YOUR pane. ` +
         `Closing it would kill your process. Use agent_detach to leave a pane without closing it.`
@@ -530,7 +536,7 @@ export class Orchestrator {
     }
 
     if (pane.iterm_id) {
-      await iterm.closeSession(pane.iterm_id);
+      await this.terminal.closeSession(pane.iterm_id);
     }
     this.store.deletePane(name);
   }
@@ -538,8 +544,8 @@ export class Orchestrator {
   // --- URLs ---
 
   /**
-   * Open a URL in an iTerm2 web browser pane.
-   * Creates a pane with a native iTerm2 browser session.
+   * Open a URL in a web browser pane.
+   * Creates a pane with a browser session (iTerm2 native browser or cmux embedded browser).
    */
   async openUrl(opts: {
     tab: string;
@@ -556,14 +562,14 @@ export class Orchestrator {
       ? "vertical"
       : "horizontal";
 
-    const itermId = opts.relativeTo
-      ? await iterm.splitSessionWebBrowser(this.resolveSession(opts.relativeTo), opts.url, direction)
-      : await iterm.splitWebBrowser(opts.url, direction);
+    const sessionId = opts.relativeTo
+      ? await this.terminal.splitSessionWebBrowser(this.resolveSession(opts.relativeTo), opts.url, direction)
+      : await this.terminal.splitWebBrowser(opts.url, direction);
 
     const pane = this.store.createPane(paneName, opts.tab, position);
-    this.store.setPaneItermId(paneName, itermId);
+    this.store.setPaneItermId(paneName, sessionId);
 
-    return { pane: { ...pane, iterm_id: itermId }, url: opts.url };
+    return { pane: { ...pane, iterm_id: sessionId }, url: opts.url };
   }
 
   // --- Theme updates ---
