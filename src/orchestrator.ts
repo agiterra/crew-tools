@@ -47,6 +47,8 @@ export class Orchestrator {
     privateKeyB64?: string;
     /** Initial prompt — passed as positional arg to claude. */
     prompt?: string;
+    /** Optional badge text displayed in the pane's top-right when attached. */
+    badge?: string;
   }): Promise<Agent> {
     const runtime = opts.runtime ?? "claude-code";
     let screenName = `${SCREEN_PREFIX}${opts.id}`;
@@ -106,6 +108,7 @@ export class Orchestrator {
       runtime,
       screen_name: screenName,
       screen_pid: session.pid,
+      badge: opts.badge,
     });
   }
 
@@ -214,6 +217,15 @@ export class Orchestrator {
     // Use -x (multi-display) to handle edge cases where -r fails.
     await iterm.writeToSession(pane.iterm_id, `screen -x ${agent.screen_name}`);
     this.store.updateAgentPane(agentId, resolvedPane);
+
+    // Apply the agent's badge to the pane (color from pane's profile, text from agent)
+    if (agent.badge) {
+      try {
+        await iterm.setBadge(pane.iterm_id, agent.badge);
+      } catch (e) {
+        console.error(`[crew] failed to set badge for '${agentId}' on '${resolvedPane}':`, e);
+      }
+    }
   }
 
   /**
@@ -246,8 +258,32 @@ export class Orchestrator {
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`agent '${agentId}' not found`);
 
+    // Clear the badge from the pane before detaching
+    if (agent.pane) {
+      const pane = this.store.getPane(agent.pane);
+      if (pane?.iterm_id) {
+        try { await iterm.setBadge(pane.iterm_id, ""); } catch {}
+      }
+    }
+
     await screen.detachSession(agent.screen_name);
     this.store.updateAgentPane(agentId, null);
+  }
+
+  /**
+   * Update an agent's badge text. Persists in the DB and applies to the
+   * pane immediately if the agent is currently attached.
+   */
+  async setAgentBadge(agentId: string, badge: string): Promise<void> {
+    const agent = this.store.getAgent(agentId);
+    if (!agent) throw new Error(`agent '${agentId}' not found`);
+    this.store.setAgentBadge(agentId, badge);
+    if (agent.pane) {
+      const pane = this.store.getPane(agent.pane);
+      if (pane?.iterm_id) {
+        await iterm.setBadge(pane.iterm_id, badge);
+      }
+    }
   }
 
   /**

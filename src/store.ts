@@ -33,6 +33,7 @@ export type Agent = {
   pane: string | null;
   status_name: string | null;
   status_desc: string | null;
+  badge: string | null;
   launched_at: number;
   last_seen: number;
 };
@@ -124,6 +125,14 @@ export class CrewStore {
     ).get();
     if (!hasTabSession) {
       this.db.exec("ALTER TABLE tabs ADD COLUMN iterm_session_id TEXT");
+    }
+
+    // Add badge column to agents if missing
+    const hasBadge = this.db.prepare(
+      "SELECT * FROM pragma_table_info('agents') WHERE name='badge'"
+    ).get();
+    if (!hasBadge) {
+      this.db.exec("ALTER TABLE agents ADD COLUMN badge TEXT");
     }
 
     // Migrate from single-agent-per-id to multi-agent-per-id (for handoff).
@@ -221,15 +230,16 @@ export class CrewStore {
     screen_pid?: number;
     cc_session_id?: string;
     pane?: string;
+    badge?: string;
   }): Agent {
     const now = Date.now();
     this.db.prepare(
-      `INSERT INTO agents (id, display_name, runtime, screen_name, screen_pid, cc_session_id, pane, launched_at, last_seen)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO agents (id, display_name, runtime, screen_name, screen_pid, cc_session_id, pane, badge, launched_at, last_seen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       agent.id, agent.display_name, agent.runtime, agent.screen_name,
       agent.screen_pid ?? null, agent.cc_session_id ?? null,
-      agent.pane ?? null, now, now,
+      agent.pane ?? null, agent.badge ?? null, now, now,
     );
     return {
       id: agent.id,
@@ -241,9 +251,16 @@ export class CrewStore {
       pane: agent.pane ?? null,
       status_name: null,
       status_desc: null,
+      badge: agent.badge ?? null,
       launched_at: now,
       last_seen: now,
     };
+  }
+
+  setAgentBadge(id: string, badge: string | null): void {
+    this.db.prepare("UPDATE agents SET badge = ?, last_seen = ? WHERE id = ?").run(
+      badge, Date.now(), id,
+    );
   }
 
   /** Get agent by ID. If multiple exist (handoff in progress), returns the most recent. */

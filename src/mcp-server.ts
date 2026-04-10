@@ -79,8 +79,21 @@ export async function startServer(): Promise<void> {
           runtime: { type: "string", description: "Runtime: claude-code, codex, etc. Default: claude-code" },
           project_dir: { type: "string", description: "Working directory for the agent" },
           extra_flags: { type: "string", description: "Additional CLI flags" },
+          badge: { type: "string", description: "Badge text shown in pane top-right when attached (e.g. 'ENG-2998 Mochi')" },
         },
         required: ["id", "name"],
+      },
+    },
+    {
+      name: "agent_badge",
+      description: "Update an agent's badge text. The badge appears in the top-right of the pane when the agent is attached. Color is determined by the pane's theme.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          id: { type: "string", description: "Agent ID" },
+          text: { type: "string", description: "Badge text to display" },
+        },
+        required: ["id", "text"],
       },
     },
     {
@@ -383,6 +396,7 @@ export async function startServer(): Promise<void> {
             extraFlags: a.extra_flags as string | undefined,
             privateKeyB64,
             prompt: a.prompt as string | undefined,
+            badge: a.badge as string | undefined,
           });
           break;
         }
@@ -394,6 +408,10 @@ export async function startServer(): Promise<void> {
             callerItermId: await callerSession(),
             ccSessionId: a.cc_session_id as string | undefined,
           });
+          break;
+        case "agent_badge":
+          await orchestrator.setAgentBadge(a.id as string, a.text as string);
+          result = { badge_set: a.id, text: a.text };
           break;
         case "agent_interrupt":
           result = await orchestrator.interruptAgent(a.id as string, !!a.background, a.cc_session_id as string | undefined);
