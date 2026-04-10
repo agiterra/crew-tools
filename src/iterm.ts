@@ -250,30 +250,38 @@ export async function setTabName(_sessionId: string, _name: string): Promise<voi
 // --- Badges ---
 
 /**
- * Set the iTerm2 badge on a specific session.
- * Badges are overlay text shown in the corner of the pane.
+ * Set the iTerm2 badge on a specific session via OSC 1337 SetBadgeFormat.
+ * Badges appear in the top-right of the pane.
+ *
+ * Note: AppleScript-based badge setting does not work — iTerm2's AppleScript
+ * interface exposes `badge` and `user.crew_badge` properties but setting
+ * them doesn't cause the badge to render. The OSC escape sequence written
+ * to the session's TTY is the only reliable method.
  */
 export async function setBadge(sessionId: string, text: string): Promise<void> {
-  // Escape for AppleScript: backslashes, quotes, then convert real newlines to literal \n
-  const escaped = text.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "");
-  // Set custom variable AND badge format so CC can't clobber it
-  await osascript(`
+  // Find the TTY for this session
+  const tty = await osascript(`
     tell application "iTerm2"
       repeat with w in windows
         repeat with t in tabs of w
           repeat with s in sessions of t
             if id of s is "${sessionId}" then
-              tell s
-                set variable named "user.crew_badge" to "${escaped}"
-                set badge to "\\(user.crew_badge)"
-              end tell
-              return
+              return tty of s
             end if
           end repeat
         end repeat
       end repeat
+      return "NOT_FOUND"
     end tell
   `);
+  if (tty === "NOT_FOUND" || !tty) {
+    throw new Error(`iTerm2 session not found: ${sessionId}`);
+  }
+
+  // OSC 1337 ; SetBadgeFormat=<base64> BEL
+  const b64 = Buffer.from(text).toString("base64");
+  const sequence = `\x1b]1337;SetBadgeFormat=${b64}\x07`;
+  writeFileSync(tty, sequence);
 }
 
 // --- Background Images ---
