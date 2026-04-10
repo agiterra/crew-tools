@@ -100,6 +100,29 @@ export interface TerminalBackend {
     profileName: string,
   ): Promise<string>;
 
+  // --- Notifications & polish ---
+
+  /**
+   * Flash/highlight the tab containing a session.
+   * cmux: triggers the notification ring on the tab.
+   * iTerm2: no-op (no equivalent).
+   */
+  flashSession(sessionId: string): Promise<void>;
+
+  /**
+   * Send a rich notification tied to a session.
+   * cmux: native notification with title/body.
+   * iTerm2: falls back to setBadge with the title.
+   */
+  notifySession(sessionId: string, title: string, body?: string): Promise<void>;
+
+  /**
+   * Rename the workspace/tab container.
+   * cmux: renames the workspace.
+   * iTerm2: no-op (tab naming is limited).
+   */
+  renameWorkspace(sessionId: string, name: string): Promise<void>;
+
   // --- Browser ---
 
   /** Split the current pane with a web browser. Returns new session ID. */

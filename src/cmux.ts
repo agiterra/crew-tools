@@ -177,6 +177,45 @@ export class CmuxBackend implements TerminalBackend {
     }
   }
 
+  async flashSession(sessionId: string): Promise<void> {
+    try {
+      await cmux("trigger-flash", "--surface", sessionId);
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  async notifySession(sessionId: string, title: string, body?: string): Promise<void> {
+    try {
+      const args = ["notify", "--title", title, "--surface", sessionId];
+      if (body) args.push("--body", body);
+      await cmux(...args);
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  async renameWorkspace(sessionId: string, name: string): Promise<void> {
+    try {
+      // Find which workspace this surface belongs to
+      const tree = await cmuxJson("tree");
+      for (const win of tree.windows ?? []) {
+        for (const ws of win.workspaces ?? []) {
+          for (const pane of ws.panes ?? []) {
+            for (const surface of pane.surfaces ?? []) {
+              if (surface.ref === sessionId) {
+                await cmux("rename-workspace", "--workspace", ws.ref, name);
+                return;
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
+  }
+
   writePaneProfile(_profile: PaneProfile): string {
     // cmux doesn't use dynamic profiles — return a dummy name.
     return "cmux-default";

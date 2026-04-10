@@ -293,6 +293,19 @@ export async function startServer(): Promise<void> {
       },
     },
     {
+      name: "pane_notify",
+      description: "Flash a pane's tab and send a notification. On cmux: triggers the notification ring + desktop alert. On iTerm2: sets badge text.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          pane: { type: "string", description: "Pane name" },
+          title: { type: "string", description: "Notification title" },
+          body: { type: "string", description: "Notification body (optional)" },
+        },
+        required: ["pane", "title"],
+      },
+    },
+    {
       name: "pane_list",
       description: "List all panes, optionally filtered by tab",
       inputSchema: {
@@ -477,6 +490,10 @@ export async function startServer(): Promise<void> {
         case "pane_badge":
           await orchestrator.setBadge(a.pane as string, a.text as string);
           result = { badge_set: a.pane, text: a.text };
+          break;
+        case "pane_notify":
+          await orchestrator.notifyPane(a.pane as string, a.title as string, a.body as string | undefined);
+          result = { notified: a.pane, title: a.title };
           break;
         case "pane_list":
           result = orchestrator.listPanes(a.tab as string | undefined);

@@ -86,6 +86,19 @@ export class ItermBackend implements TerminalBackend {
     return iterm.splitSessionWithProfile(sessionId, direction, profileName);
   }
 
+  async flashSession(_sessionId: string): Promise<void> {
+    // iTerm2 has no tab flash/notification ring equivalent
+  }
+
+  async notifySession(sessionId: string, title: string, _body?: string): Promise<void> {
+    // Fall back to setting badge text with the title
+    return iterm.setBadge(sessionId, title);
+  }
+
+  async renameWorkspace(_sessionId: string, _name: string): Promise<void> {
+    // iTerm2 tab naming is limited — see setTabName
+  }
+
   splitWebBrowser(
     url: string,
     direction: "horizontal" | "vertical",

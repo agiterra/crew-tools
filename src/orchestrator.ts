@@ -216,6 +216,10 @@ export class Orchestrator {
     // Use -x (multi-display) to handle edge cases where -r fails.
     await this.terminal.writeToSession(pane.iterm_id, `screen -x ${agent.screen_name}`);
     this.store.updateAgentPane(agentId, resolvedPane);
+
+    // Flash the tab and notify — agent is now visible
+    await this.terminal.flashSession(pane.iterm_id);
+    await this.terminal.notifySession(pane.iterm_id, `${agent.display_name} attached`, `→ pane ${resolvedPane}`);
   }
 
   /**
@@ -354,6 +358,21 @@ export class Orchestrator {
     await this.terminal.setBadge(pane.iterm_id, text);
   }
 
+  // --- Notifications ---
+
+  /**
+   * Flash a pane's tab and send a notification.
+   * On cmux: triggers the notification ring + desktop notification.
+   * On iTerm2: sets the badge text (best effort).
+   */
+  async notifyPane(paneName: string, title: string, body?: string): Promise<void> {
+    const pane = this.store.getPane(paneName);
+    if (!pane) throw new Error(`pane '${paneName}' not found`);
+    if (!pane.iterm_id) throw new Error(`pane '${paneName}' has no terminal session`);
+    await this.terminal.flashSession(pane.iterm_id);
+    await this.terminal.notifySession(pane.iterm_id, title, body);
+  }
+
   // --- Interrupt ---
 
   /**
@@ -380,6 +399,8 @@ export class Orchestrator {
 
   async createTab(name: string, theme?: string): Promise<Tab> {
     const sessionId = await this.terminal.createTab();
+    // Name the workspace/tab to match
+    await this.terminal.renameWorkspace(sessionId, name);
     return this.store.createTab(name, theme, sessionId);
   }
 
