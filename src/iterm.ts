@@ -320,6 +320,21 @@ export function writePaneProfile(
     "Background Image Location": backgroundImage,
     "Blend": opts?.blend ?? 0.5,
     "Background Image Mode": opts?.mode ?? 2,
+    // Warm amber badge — high contrast against most background images,
+    // readable on dark terminals, not red (per Tim's preference).
+    "Badge Color": {
+      "Red Component": 1,
+      "Green Component": 0.75,
+      "Blue Component": 0.25,
+      "Alpha Component": 0.85,
+      "Color Space": "sRGB",
+    },
+    // Constrain badge size — iTerm2's default is 50% width / 20% height
+    // which is too large. These are point limits, not percentages.
+    "Badge Max Width": 200,
+    "Badge Max Height": 40,
+    "Badge Right Margin": 10,
+    "Badge Top Margin": 10,
   };
 
   const profile = { Profiles: [profileEntry] };
