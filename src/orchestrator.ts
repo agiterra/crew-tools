@@ -143,10 +143,15 @@ export class Orchestrator {
     const alive = await screen.isAlive(screenName);
     if (!alive) throw new Error(`screen session '${screenName}' is not running`);
 
-    // Find the pane this agent is sitting in (by terminal session ID)
-    const callerPane = opts.callerSessionId
-      ? this.store.listPanes().find((p) => p.iterm_id === opts.callerSessionId)?.name ?? null
-      : null;
+    // Find the pane this agent is sitting in (by terminal session ID).
+    // If the session isn't registered as a pane, auto-register it.
+    let callerPane: string | null = null;
+    if (opts.callerSessionId) {
+      callerPane = this.store.listPanes().find((p) => p.iterm_id === opts.callerSessionId)?.name ?? null;
+      if (!callerPane) {
+        callerPane = await this.autoRegisterPane(opts.callerSessionId);
+      }
+    }
 
     // Check if this exact screen session is already registered
     const existingByScreen = this.store.getAgentByScreen(screenName);
@@ -522,7 +527,16 @@ export class Orchestrator {
 
     // Auto-name from theme if no name given
     const paneName = name ?? this.nextPaneName(tab);
-    if (!paneName) throw new Error(`no name provided and tab '${tab}' has no theme (or pool exhausted)`);
+    if (!paneName) {
+      const tabRow = this.store.getTab(tab);
+      if (!tabRow?.theme) {
+        throw new Error(`tab '${tab}' has no theme — specify a pane name or set a theme first`);
+      }
+      const usedCount = this.store.listPanes(tab).length;
+      throw new Error(
+        `all names in theme '${tabRow.theme}' are in use on tab '${tab}' (${usedCount} panes) — specify a name explicitly`
+      );
+    }
 
     const existing = this.store.getPane(paneName);
     if (existing) {
@@ -562,7 +576,16 @@ export class Orchestrator {
 
     // Auto-name from theme if no name given
     const paneName = name ?? this.nextPaneName(tab);
-    if (!paneName) throw new Error(`no name provided and tab '${tab}' has no theme (or pool exhausted)`);
+    if (!paneName) {
+      const tabRow = this.store.getTab(tab);
+      if (!tabRow?.theme) {
+        throw new Error(`tab '${tab}' has no theme — specify a pane name or set a theme first`);
+      }
+      const usedCount = this.store.listPanes(tab).length;
+      throw new Error(
+        `all names in theme '${tabRow.theme}' are in use on tab '${tab}' (${usedCount} panes) — specify a name explicitly`
+      );
+    }
 
     const direction = (position === "left" || position === "right")
       ? "vertical"
@@ -637,6 +660,63 @@ export class Orchestrator {
 
   listPanes(tab?: string): Pane[] {
     return this.store.listPanes(tab);
+  }
+
+  /**
+   * Auto-register an unregistered terminal session as a pane.
+   * Finds the tab by matching sessionId against known tab/pane sessions,
+   * picks a theme name, writes the dynamic profile, and registers in the DB.
+   * Returns the new pane name, or null if the session can't be associated with a tab.
+   */
+  async autoRegisterPane(sessionId: string): Promise<string | null> {
+    // Already registered?
+    const existing = this.store.listPanes().find((p) => p.iterm_id === sessionId);
+    if (existing) return existing.name;
+
+    // Find which tab this session belongs to by checking tab sessions and sibling panes
+    const tabs = this.store.listTabs();
+    let targetTab: Tab | null = null;
+
+    for (const tab of tabs) {
+      // Direct tab session match
+      if (tab.iterm_session_id === sessionId) {
+        targetTab = tab;
+        break;
+      }
+      // Check if the session is a sibling of any pane in this tab
+      // (on iTerm2, sessions in the same tab share a tab container)
+      const tabPanes = this.store.listPanes(tab.name);
+      if (tabPanes.some((p) => p.iterm_id === sessionId)) {
+        targetTab = tab;
+        break;
+      }
+    }
+
+    if (!targetTab) return null;
+
+    // Pick a name from the theme pool
+    const paneName = this.nextPaneName(targetTab.name);
+    if (!paneName) return null; // pool exhausted, can't auto-name
+
+    // Write themed profile
+    const theme = targetTab.theme ? loadTheme(targetTab.theme) : null;
+    const bgPath = targetTab.theme ? backgroundImagePath(targetTab.theme, paneName, theme) : null;
+    if (bgPath) {
+      this.terminal.writePaneProfile({
+        paneName,
+        backgroundImage: bgPath,
+        blend: theme?.background.blend,
+        mode: theme?.background.mode,
+        badgeColor: theme?.badgeColors?.[paneName] ?? theme?.defaultBadgeColor,
+      });
+    }
+
+    // Register in DB
+    this.store.createPane(paneName, targetTab.name, "below", targetTab.theme ?? undefined);
+    this.store.setPaneItermId(paneName, sessionId);
+    await this.terminal.setSessionName(sessionId, titleCase(paneName));
+    console.error(`[crew] auto-registered pane '${paneName}' in tab '${targetTab.name}' (session ${sessionId})`);
+    return paneName;
   }
 
   /**
