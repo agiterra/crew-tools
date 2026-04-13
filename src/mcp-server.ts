@@ -120,7 +120,7 @@ export async function startServer(): Promise<void> {
           id: { type: "string", description: "Agent ID (your Wire agent name)" },
           name: { type: "string", description: "Display name" },
           runtime: { type: "string", description: "Runtime: claude-code, codex, etc. Default: claude-code" },
-          cc_session_id: { type: "string", description: "Claude Code session ID. Auto-detected from CLAUDE_CODE_SESSION_ID if omitted." },
+          cc_session_id: { type: "string", description: "Claude Code session ID. Auto-detected from ~/.claude/sessions/ if omitted." },
         },
         required: ["id", "name"],
       },
@@ -412,7 +412,7 @@ export async function startServer(): Promise<void> {
             displayName: a.name as string,
             runtime: a.runtime as string | undefined,
             callerSessionId: await callerSession(),
-            ccSessionId: a.cc_session_id as string | undefined,
+            ccSessionId: (a.cc_session_id as string | undefined) ?? ccSessionId ?? undefined,
           });
           break;
         case "agent_badge":
