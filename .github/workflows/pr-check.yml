@@ -1,0 +1,9 @@
+name: PR Check
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  plugin-check:
+    uses: agiterra/.github/.github/workflows/plugin-check.yml@main
