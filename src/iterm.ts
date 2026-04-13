@@ -330,12 +330,6 @@ export function writePaneProfile(
       "Alpha Component": opts?.badgeColor?.a ?? 0.85,
       "Color Space": "sRGB",
     },
-    // Constrain badge size — iTerm2's default is 50% width / 20% height
-    // which is too large. These are point limits, not percentages.
-    "Badge Max Width": 200,
-    "Badge Max Height": 40,
-    "Badge Right Margin": 10,
-    "Badge Top Margin": 10,
   };
 
   const profile = { Profiles: [profileEntry] };
