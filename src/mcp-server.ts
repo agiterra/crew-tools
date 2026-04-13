@@ -588,6 +588,29 @@ export async function startServer(): Promise<void> {
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
 
+  // Graceful shutdown on SIGTERM/SIGINT/SIGHUP: close the MCP transport so
+  // the parent CC process sees a clean disconnect. Without this, kill-mcp.sh
+  // or /reload-plugins leaves the transport half-open until the OS tears it
+  // down. Wire-session cleanup (if any) is owned by the wire plugin, not
+  // crew — this handler only covers MCP transport hygiene.
+  let shuttingDown = false;
+  const shutdown = async (sig: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error(`[crew] ${sig} received — closing transport`);
+    try {
+      await mcp.close();
+    } catch (e) {
+      console.error(`[crew] transport close failed:`, e);
+    }
+    // Small drain window for any in-flight wire ops
+    await new Promise((r) => setTimeout(r, 100));
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGHUP", () => void shutdown("SIGHUP"));
+
   const report = await orchestrator.reconcile();
   console.error(`[crew] boot reconcile:\n${report}`);
   console.error(`[crew] ready (caller=${CALLER_AGENT_ID}, terminal=${terminalName})`);
