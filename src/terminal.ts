@@ -69,9 +69,6 @@ export interface TerminalBackend {
   /** Set the title/name of a session/surface. */
   setSessionName(sessionId: string, name: string): Promise<void>;
 
-  /** Set the tab/workspace name (may be a no-op on some backends). */
-  setTabName(sessionId: string, name: string): Promise<void>;
-
   /** Set a badge/status overlay on a session/surface. */
   setBadge(sessionId: string, text: string): Promise<void>;
 

@@ -47,10 +47,6 @@ export class ItermBackend implements TerminalBackend {
     return iterm.setSessionName(sessionId, name);
   }
 
-  setTabName(sessionId: string, name: string): Promise<void> {
-    return iterm.setTabName(sessionId, name);
-  }
-
   setBadge(sessionId: string, text: string): Promise<void> {
     return iterm.setBadge(sessionId, text);
   }

@@ -160,16 +160,6 @@ export class CmuxBackend implements TerminalBackend {
     }
   }
 
-  async setTabName(_sessionId: string, name: string): Promise<void> {
-    try {
-      if (process.env.CMUX_WORKSPACE_ID) {
-        await cmux("rename-workspace", "--workspace", process.env.CMUX_WORKSPACE_ID, name);
-      }
-    } catch {
-      // No-op if not supported
-    }
-  }
-
   async setBadge(sessionId: string, text: string): Promise<void> {
     try {
       await cmux("notify", "--title", text, "--surface", sessionId);
