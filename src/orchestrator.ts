@@ -88,7 +88,7 @@ export class Orchestrator {
 
     // Set crew-specific identity + key vars
     const keyExport = opts.privateKeyB64 ? ` CREW_PRIVATE_KEY=${shellEscape(opts.privateKeyB64)}` : "";
-    const envExports = `export CREW_AGENT_ID=${shellEscape(opts.id)} CREW_AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}${keyExport}`;
+    const envExports = `export AGENT_ID=${shellEscape(opts.id)} AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}${keyExport}`;
     const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${command}`;
 
     // Create screen session

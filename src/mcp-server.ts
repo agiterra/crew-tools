@@ -26,7 +26,7 @@ export async function startServer(): Promise<void> {
   const orchestrator = new Orchestrator(terminal);
   const terminalName = terminal.name;
   const CALLER_AGENT_ID =
-    process.env.CREW_AGENT_ID ?? process.env.WIRE_AGENT_ID ?? "unknown";
+    process.env.AGENT_ID ?? "unknown";
   const ccSessionId = getClaudeCodeSessionId();
 
   /**
