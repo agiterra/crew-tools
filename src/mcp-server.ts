@@ -29,6 +29,22 @@ export async function startServer(): Promise<void> {
     process.env.AGENT_ID ?? "unknown";
   const ccSessionId = getClaudeCodeSessionId();
 
+  // Self-stamp: if we can identify the current agent (via STY) and we have a
+  // session ID, update the agent's cc_session_id immediately. Without this,
+  // existing agent records keep null cc_session_id forever — agent_register
+  // is never automatically called on restart.
+  const sty = process.env.STY;
+  if (ccSessionId && sty) {
+    const screenName = sty.split(".").slice(1).join(".");
+    if (screenName) {
+      const existing = orchestrator.store.getAgentByScreen(screenName);
+      if (existing) {
+        orchestrator.store.updateAgentCcSession(screenName, ccSessionId);
+        console.error(`[crew] self-stamped ${existing.id} cc_session_id=${ccSessionId.slice(0, 8)}\u2026`);
+      }
+    }
+  }
+
   /**
    * Detect the caller's terminal session ID.
    * Works with both iTerm2 (TTY lookup + ITERM_SESSION_ID) and cmux (CMUX_SURFACE_ID).
