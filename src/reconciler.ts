@@ -27,16 +27,21 @@ export type ReconcileResult = {
   panesCleared: string[];
   panesDeleted: string[];
   tabsCleared: string[];
+  tabsDeleted: string[];
   tabsThemed: Array<{ tab: string; theme: string }>;
   panesThemed: Array<{ pane: string; theme: string }>;
   panesRenamed: Array<{ from: string; to: string; theme: string }>;
   profilesApplied: Array<{ pane: string; profile: string }>;
 };
 
+const DEFAULT_TAB_ORPHAN_AGE_MS = 60 * 1000;
+
 export async function reconcile(
   store: CrewStore,
   terminal?: TerminalBackend,
+  options?: { tabOrphanAgeMs?: number },
 ): Promise<ReconcileResult> {
+  const tabOrphanAgeMs = options?.tabOrphanAgeMs ?? DEFAULT_TAB_ORPHAN_AGE_MS;
   const agents = store.listAgents();
   const sessions = await listSessions();
   const sessionByName = new Map(sessions.map((s) => [s.name, s]));
@@ -80,28 +85,45 @@ export async function reconcile(
     }
   }
 
-  // --- Tab session check + theme heal ---
+  // --- Tab session check ---
+  // Clear iterm_session_id for tabs whose iTerm session is gone.
   const tabsCleared: string[] = [];
-  const tabsThemed: Array<{ tab: string; theme: string }> = [];
-  const availableThemes = listThemes();
-
-  for (const tab of store.listTabs()) {
-    if (terminal && tab.iterm_session_id) {
+  if (terminal) {
+    for (const tab of store.listTabs()) {
+      if (!tab.iterm_session_id) continue;
       const isAlive = await terminal.isSessionAlive(tab.iterm_session_id).catch(() => false);
       if (!isAlive) {
         store.clearTabSession(tab.name);
         tabsCleared.push(tab.name);
       }
     }
+  }
 
-    if (!tab.theme && availableThemes.length > 0) {
-      const usedThemes = new Set(
-        store.listTabs().map((t) => t.theme).filter(Boolean) as string[],
-      );
-      const picked = availableThemes.find((t) => !usedThemes.has(t)) ?? availableThemes[0];
-      store.setTabTheme(tab.name, picked);
-      tabsThemed.push({ tab: tab.name, theme: picked });
-    }
+  // --- Tab orphan prune ---
+  // Delete unbound tabs that have no panes and are older than the safety
+  // threshold. Age gate avoids racing a just-created tab that hasn't had
+  // its iterm_session_id stamped yet.
+  const tabsDeleted: string[] = [];
+  const nowMs = Date.now();
+  for (const tab of store.listTabs()) {
+    if (tab.iterm_session_id) continue;
+    if (store.listPanes(tab.name).length > 0) continue;
+    if (nowMs - tab.created_at < tabOrphanAgeMs) continue;
+    store.deleteTab(tab.name);
+    tabsDeleted.push(tab.name);
+  }
+
+  // --- Tab theme auto-assign ---
+  const tabsThemed: Array<{ tab: string; theme: string }> = [];
+  const availableThemes = listThemes();
+  for (const tab of store.listTabs()) {
+    if (tab.theme || availableThemes.length === 0) continue;
+    const usedThemes = new Set(
+      store.listTabs().map((t) => t.theme).filter(Boolean) as string[],
+    );
+    const picked = availableThemes.find((t) => !usedThemes.has(t)) ?? availableThemes[0];
+    store.setTabTheme(tab.name, picked);
+    tabsThemed.push({ tab: tab.name, theme: picked });
   }
 
   // --- Pane theme heal (inherit from tab) ---
@@ -172,7 +194,7 @@ export async function reconcile(
 
   return {
     alive, dead, orphans,
-    panesCleared, panesDeleted, tabsCleared,
+    panesCleared, panesDeleted, tabsCleared, tabsDeleted,
     tabsThemed, panesThemed,
     panesRenamed, profilesApplied,
   };
@@ -199,6 +221,9 @@ export function formatReport(result: ReconcileResult, agents: Agent[]): string {
   }
   if (result.tabsCleared.length > 0) {
     lines.push(`${result.tabsCleared.length} tab(s) with dead terminal session: ${result.tabsCleared.join(", ")}`);
+  }
+  if (result.tabsDeleted.length > 0) {
+    lines.push(`${result.tabsDeleted.length} orphan tab(s) pruned: ${result.tabsDeleted.join(", ")}`);
   }
   if (result.tabsThemed.length > 0) {
     lines.push(`${result.tabsThemed.length} tab(s) auto-themed: ${result.tabsThemed.map((t) => `${t.tab}→${t.theme}`).join(", ")}`);

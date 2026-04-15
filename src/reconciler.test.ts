@@ -204,3 +204,59 @@ describe("reconcile terminal session checks", () => {
     expect(store.getPane("oak")!.iterm_id).toBe("session-anything");
   });
 });
+
+describe("reconcile tab orphan prune", () => {
+  test("deletes unbound tab with no panes once past age threshold", async () => {
+    store.createTab("eng", "trees"); // never bound, no panes
+    const result = await reconcile(store, undefined, { tabOrphanAgeMs: 0 });
+    expect(result.tabsDeleted).toEqual(["eng"]);
+    expect(store.getTab("eng")).toBeNull();
+  });
+
+  test("keeps unbound tab that still has panes", async () => {
+    store.createTab("brioche", "cities");
+    store.createPane("paris", "brioche");
+    const result = await reconcile(store, undefined, { tabOrphanAgeMs: 0 });
+    expect(result.tabsDeleted).toEqual([]);
+    expect(store.getTab("brioche")).not.toBeNull();
+    expect(store.getPane("paris")).not.toBeNull();
+  });
+
+  test("keeps bound tab even with no panes", async () => {
+    store.createTab("eng", "trees", "session-live");
+    const terminal = makeTerminal(["session-live"]);
+    const result = await reconcile(store, terminal, { tabOrphanAgeMs: 0 });
+    expect(result.tabsDeleted).toEqual([]);
+    expect(store.getTab("eng")).not.toBeNull();
+  });
+
+  test("respects age threshold — fresh unbound empty tab is kept", async () => {
+    store.createTab("eng", "trees");
+    // Default threshold is 60s — a just-created tab must not be pruned.
+    const result = await reconcile(store);
+    expect(result.tabsDeleted).toEqual([]);
+    expect(store.getTab("eng")).not.toBeNull();
+  });
+
+  test("prunes tab whose session was just cleared by the same reconcile pass", async () => {
+    store.createTab("eng", "trees", "session-dead");
+    const terminal = makeTerminal([]); // session is dead
+    const result = await reconcile(store, terminal, { tabOrphanAgeMs: 0 });
+    expect(result.tabsCleared).toEqual(["eng"]);
+    expect(result.tabsDeleted).toEqual(["eng"]);
+    expect(store.getTab("eng")).toBeNull();
+  });
+
+  test("cascade: deleting tab removes its panes too", async () => {
+    store.createTab("orphan-tab", "trees");
+    store.createPane("ghost", "orphan-tab");
+    // First check: tab is not pruned because it has a pane
+    let result = await reconcile(store, undefined, { tabOrphanAgeMs: 0 });
+    expect(result.tabsDeleted).toEqual([]);
+    // Now delete the pane manually and reconcile again — tab should prune and cascade is a no-op
+    store.deletePane("ghost");
+    result = await reconcile(store, undefined, { tabOrphanAgeMs: 0 });
+    expect(result.tabsDeleted).toEqual(["orphan-tab"]);
+    expect(store.getTab("orphan-tab")).toBeNull();
+  });
+});
