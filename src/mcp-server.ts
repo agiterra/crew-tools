@@ -34,13 +34,58 @@ export async function startServer(): Promise<void> {
   // existing agent records keep null cc_session_id forever — agent_register
   // is never automatically called on restart.
   const sty = process.env.STY;
-  if (ccSessionId && sty) {
-    const screenName = sty.split(".").slice(1).join(".");
-    if (screenName) {
-      const existing = orchestrator.store.getAgentByScreen(screenName);
-      if (existing) {
-        orchestrator.store.updateAgentCcSession(screenName, ccSessionId);
-        console.error(`[crew] self-stamped ${existing.id} cc_session_id=${ccSessionId.slice(0, 8)}\u2026`);
+  const screenName = sty ? sty.split(".").slice(1).join(".") : undefined;
+  const myAgent = screenName ? orchestrator.store.getAgentByScreen(screenName) : null;
+
+  if (ccSessionId && myAgent) {
+    orchestrator.store.updateAgentCcSession(myAgent.screen_name, ccSessionId);
+    console.error(`[crew] self-stamped ${myAgent.id} cc_session_id=${ccSessionId.slice(0, 8)}\u2026`);
+  }
+
+  // Self-stamp pane.iterm_id and agent.pane. The MCP server inherits the
+  // terminal session ID of the agent's pane via env (ITERM_SESSION_ID's UUID
+  // suffix on iTerm2, CMUX_SURFACE_ID on cmux). Without this, panes keep null
+  // iterm_id forever and reconcile's live theme heal is inert because it only
+  // touches panes WITH iterm_id. Same class of fix as cc_session_id self-stamp.
+  if (myAgent) {
+    const itermSession = process.env.ITERM_SESSION_ID?.split(":").pop();
+    const cmuxSurface = process.env.CMUX_SURFACE_ID;
+    const sessionId = cmuxSurface ?? itermSession;
+
+    if (sessionId) {
+      // Find the pane this agent occupies. Prefer existing iterm_id match.
+      let myPane = orchestrator.store.listPanes().find((p) => p.iterm_id === sessionId);
+
+      // Fallback A: agent.pane already assigned but missing iterm_id — stamp it.
+      if (!myPane && myAgent.pane) {
+        const named = orchestrator.store.getPane(myAgent.pane);
+        if (named && !named.iterm_id) {
+          orchestrator.store.setPaneItermId(myAgent.pane, sessionId);
+          myPane = orchestrator.store.getPane(myAgent.pane) ?? undefined;
+          console.error(`[crew] self-stamped pane '${myAgent.pane}' iterm_id=${sessionId}`);
+        } else if (named) {
+          myPane = named;
+        }
+      }
+
+      // Fallback B: no agent.pane — try to find an unambiguous pane in the tab
+      // matching the agent's id (common convention: tab name == agent id).
+      if (!myPane && !myAgent.pane) {
+        const tabName = myAgent.id;
+        const candidates = orchestrator.store.listPanes(tabName).filter((p) => !p.iterm_id);
+        if (candidates.length === 1) {
+          orchestrator.store.setPaneItermId(candidates[0].name, sessionId);
+          myPane = orchestrator.store.getPane(candidates[0].name) ?? undefined;
+          console.error(`[crew] self-stamped pane '${candidates[0].name}' iterm_id=${sessionId} (matched via tab='${tabName}')`);
+        } else if (candidates.length > 1) {
+          console.error(`[crew] cannot auto-bind: tab '${tabName}' has ${candidates.length} unbound panes — call agent_register with caller_session_id`);
+        }
+      }
+
+      // Bind agent to pane if mismatched.
+      if (myPane && myAgent.pane !== myPane.name) {
+        orchestrator.store.updateAgentPane(myAgent.id, myPane.name);
+        console.error(`[crew] self-stamped agent '${myAgent.id}' pane='${myPane.name}'`);
       }
     }
   }
