@@ -9,7 +9,7 @@
  * and iTerm2 picks it up automatically.
  */
 
-import { writeFileSync, mkdirSync, unlinkSync } from "fs";
+import { writeFileSync, readFileSync, mkdirSync, unlinkSync } from "fs";
 import { join } from "path";
 
 /**
@@ -403,6 +403,50 @@ export function writeEmptyPaneProfile(): void {
 }
 
 /**
+ * Re-touch a Crew pane profile file on disk so iTerm2's DynamicProfiles
+ * watcher re-reads it. Used when AppleScript split fails with
+ * "No profile named ..." — usually a transient iTerm2 watcher miss.
+ */
+function nudgeCrewProfile(profileName: string): void {
+  if (!profileName.startsWith("Crew ")) return;
+  const paneName = profileName.slice("Crew ".length);
+  const file = join(DYNAMIC_PROFILES_DIR, `crew-pane-${paneName}.json`);
+  try {
+    const contents = readFileSync(file);
+    writeFileSync(file, contents);
+  } catch {
+    // File missing or unreadable — nothing to nudge.
+  }
+}
+
+/**
+ * Run an iTerm2 AppleScript split. If it fails with "No profile named <X>",
+ * re-touch the profile file to nudge iTerm2's watcher and retry up to 3x
+ * with exponential backoff (300/600/900ms).
+ */
+async function splitWithRetry(
+  profileName: string,
+  runScript: () => Promise<string>,
+): Promise<string> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await runScript();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!msg.includes("No profile named")) throw e;
+      lastErr = e;
+      console.error(
+        `[crew] iTerm2 didn't register profile '${profileName}' (attempt ${attempt}/3) — nudging watcher and retrying`,
+      );
+      nudgeCrewProfile(profileName);
+      await new Promise((r) => setTimeout(r, 300 * attempt));
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Split the current pane using a named profile. Returns the new session's ID.
  */
 export async function splitPaneWithProfile(
@@ -411,7 +455,7 @@ export async function splitPaneWithProfile(
 ): Promise<string> {
   const escaped = profileName.replace(/"/g, '\\"');
   const verb = direction === "horizontal" ? "horizontally" : "vertically";
-  return osascript(`
+  return splitWithRetry(profileName, () => osascript(`
     tell application "iTerm2"
       tell current session of current tab of current window
         set newSession to split ${verb} with profile "${escaped}"
@@ -420,7 +464,7 @@ export async function splitPaneWithProfile(
         end tell
       end tell
     end tell
-  `);
+  `));
 }
 
 /**
@@ -433,7 +477,7 @@ export async function splitSessionWithProfile(
 ): Promise<string> {
   const escaped = profileName.replace(/"/g, '\\"');
   const verb = direction === "horizontal" ? "horizontally" : "vertically";
-  return osascript(`
+  return splitWithRetry(profileName, () => osascript(`
     tell application "iTerm2"
       repeat with w in windows
         repeat with t in tabs of w
@@ -449,7 +493,7 @@ export async function splitSessionWithProfile(
       end repeat
       error "session not found: ${sessionId}"
     end tell
-  `);
+  `));
 }
 
 /**
