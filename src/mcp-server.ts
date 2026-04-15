@@ -487,14 +487,27 @@ export async function startServer(): Promise<void> {
           result = await orchestrator.registerPane(a.tab as string, a.name as string | undefined, sessionId);
           break;
         }
-        case "pane_create":
+        case "pane_create": {
+          // Only fall back to caller's session if creating in the caller's OWN tab.
+          // Cross-tab creates must NOT use the caller's pane as splitTarget — that's
+          // how new panes ended up in the caller's tab instead of the target.
+          const targetTab = a.tab as string;
+          let relTo = a.relative_to as string | undefined;
+          if (!relTo) {
+            const callerId = await callerSession();
+            if (callerId) {
+              const callerPane = orchestrator.store.listPanes().find((p) => p.iterm_id === callerId);
+              if (callerPane && callerPane.tab === targetTab) relTo = callerId;
+            }
+          }
           result = await orchestrator.createPane(
-            a.tab as string,
+            targetTab,
             a.name as string | undefined,
             a.position as string | undefined,
-            (a.relative_to as string) ?? await callerSession(),
+            relTo,
           );
           break;
+        }
         case "pane_send":
           await orchestrator.sendToPane(a.pane as string, a.text as string);
           result = { sent: true, pane: a.pane };

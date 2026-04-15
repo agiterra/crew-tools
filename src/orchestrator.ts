@@ -655,7 +655,10 @@ export class Orchestrator {
   nextPaneName(tab: string): string | null {
     const tabRow = this.store.getTab(tab);
     if (!tabRow?.theme) return null;
-    const usedNames = this.store.listPanes(tab).map((p) => p.name);
+    // Names are globally unique (panes.name PK), so check across ALL panes,
+    // not just this tab. Filtering per-tab caused pickName to return a name
+    // that already existed in another tab → INSERT hit UNIQUE constraint.
+    const usedNames = this.store.listPanes().map((p) => p.name);
     return pickName(tabRow.theme, usedNames);
   }
 

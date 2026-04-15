@@ -115,6 +115,29 @@ describe("panes", () => {
     expect(store.getPane("oak")).toBeNull();
     expect(store.getAgent("fondant")!.pane).toBeNull();
   });
+
+  test("renamePane updates pane row and agent FK", () => {
+    store.createPane("oak", "eng");
+    store.createAgent({ id: "fondant", display_name: "Fondant", runtime: "claude-code", screen_name: "wire-fondant", pane: "oak" });
+
+    store.renamePane("oak", "maple");
+
+    expect(store.getPane("oak")).toBeNull();
+    expect(store.getPane("maple")).not.toBeNull();
+    expect(store.getAgent("fondant")!.pane).toBe("maple");
+  });
+
+  test("renamePane is a no-op when from === to", () => {
+    store.createPane("oak", "eng");
+    store.renamePane("oak", "oak");
+    expect(store.getPane("oak")).not.toBeNull();
+  });
+
+  test("renamePane throws if target name exists", () => {
+    store.createPane("oak", "eng");
+    store.createPane("maple", "eng");
+    expect(() => store.renamePane("oak", "maple")).toThrow();
+  });
 });
 
 // --- Agents ---
