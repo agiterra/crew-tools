@@ -42,44 +42,52 @@ export class Orchestrator {
    * The agent runs in background — no pane attachment required.
    */
   async launchAgent(opts: {
-    id: string;
-    displayName: string;
+    /**
+     * Env vars exported into the spawned agent's process. Crew has no domain
+     * knowledge of what these mean — it just forwards them.
+     *
+     * MUST include AGENT_ID. Crew uses it as the agent's primary identifier
+     * (screen session name, DB record key, dedupe lookups). All other vars
+     * are opaque to crew. AGENT_NAME defaults to AGENT_ID if omitted.
+     *
+     * For Wire-using agents the orchestrator generates a keypair, pre-registers
+     * the public key on Wire (sponsoring-agent register flow), and includes
+     * the base64 PKCS8 private key as AGENT_PRIVATE_KEY here.
+     */
+    env: Record<string, string>;
     runtime?: string;
     projectDir?: string;
     extraFlags?: string;
-    privateKeyB64?: string;
-    /** Initial prompt — passed as positional arg to claude. */
+    /** Initial prompt — passed as positional arg to the runtime command. */
     prompt?: string;
     /** Optional badge text displayed in the pane's top-right when attached. */
     badge?: string;
   }): Promise<Agent> {
+    const id = opts.env.AGENT_ID;
+    if (!id) throw new Error("env.AGENT_ID is required");
+    const displayName = opts.env.AGENT_NAME ?? id;
+
     const runtime = opts.runtime ?? "claude-code";
-    let screenName = `${SCREEN_PREFIX}${opts.id}`;
+    let screenName = `${SCREEN_PREFIX}${id}`;
 
     // Check for existing agent with the same ID
-    const existing = this.store.getAgent(opts.id);
+    const existing = this.store.getAgent(id);
     if (existing) {
       const alive = await screen.isAlive(existing.screen_name);
       if (alive) {
         // During handoff, the old agent is still running.
         // Use a suffixed screen name to avoid collision.
-        screenName = `${SCREEN_PREFIX}${opts.id}-${Date.now()}`;
+        screenName = `${SCREEN_PREFIX}${id}-${Date.now()}`;
       } else {
         // Dead agent — clean up stale record
         this.store.deleteAgentByScreen(existing.screen_name);
       }
     }
 
-    // Build launch command with agent identity injected as env vars
-    const wireUrl = process.env.WIRE_URL ?? "http://localhost:9800";
+    // Build launch command. Template variables expand from env + PROJECT_DIR.
     const projectDir = opts.projectDir ?? process.cwd();
-    const vars = {
-      AGENT_ID: opts.id,
-      AGENT_NAME: opts.displayName,
-      WIRE_URL: wireUrl,
-      PROJECT_DIR: projectDir,
-    };
-    let command = getLaunchCommand(runtime, vars);
+    const templateVars = { ...opts.env, PROJECT_DIR: projectDir };
+    let command = getLaunchCommand(runtime, templateVars);
     if (opts.prompt) {
       command += ` ${shellEscape(opts.prompt)}`;
     }
@@ -87,9 +95,11 @@ export class Orchestrator {
       command += ` ${opts.extraFlags}`;
     }
 
-    // Set crew-specific identity + key vars
-    const keyExport = opts.privateKeyB64 ? ` CREW_PRIVATE_KEY=${shellEscape(opts.privateKeyB64)}` : "";
-    const envExports = `export AGENT_ID=${shellEscape(opts.id)} AGENT_NAME=${shellEscape(opts.displayName)} WIRE_URL=${shellEscape(wireUrl)}${keyExport}`;
+    // Forward env into the launched process. Verbatim — no synthesis, no
+    // built-ins. The orchestrator owns identity and config semantics.
+    const envExports = `export ${Object.entries(opts.env)
+      .map(([k, v]) => `${k}=${shellEscape(v)}`)
+      .join(" ")}`;
     const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${command}`;
 
     // Create screen session
@@ -100,14 +110,14 @@ export class Orchestrator {
       try {
         await screen.sendKeys(screenName, "\n");
       } catch (e) {
-        console.error(`[crew] failed to auto-confirm dev-channel prompt for ${opts.id}:`, e);
+        console.error(`[crew] failed to auto-confirm dev-channel prompt for ${id}:`, e);
       }
     }, 3000);
 
     // Record in DB
     return this.store.createAgent({
-      id: opts.id,
-      display_name: opts.displayName,
+      id,
+      display_name: displayName,
       runtime,
       screen_name: screenName,
       screen_pid: session.pid,

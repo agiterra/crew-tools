@@ -144,20 +144,26 @@ export async function startServer(): Promise<void> {
   const TOOLS = [
     {
       name: "agent_launch",
-      description: "Launch an agent in a persistent screen session (runs headless until attached to a pane)",
+      description: "Launch an agent in a persistent screen session (runs headless until attached to a pane). Identity and configuration flow through the env map; crew is a pure env-forwarder with no domain knowledge of what the vars mean.",
       inputSchema: {
         type: "object" as const,
         properties: {
-          id: { type: "string", description: "Agent ID (Wire agent name)" },
-          name: { type: "string", description: "Display name" },
-          plan: { type: "string", description: "Initial plan (shown on Wire dashboard)" },
-          prompt: { type: "string", description: "Initial prompt — the agent's task. Passed as positional arg to claude." },
+          env: {
+            type: "object",
+            additionalProperties: { type: "string" },
+            description:
+              "Env vars exported into the spawned agent's environment. " +
+              "MUST include AGENT_ID — crew uses it as the agent's primary identifier (screen session name, DB key). AGENT_NAME defaults to AGENT_ID. " +
+              "All other vars are opaque to crew. " +
+              "For Wire-using agents include AGENT_PRIVATE_KEY: orchestrator generates the keypair, pre-registers the public key on Wire (sponsoring-agent register flow), and passes the base64 PKCS8 private key here.",
+          },
+          prompt: { type: "string", description: "Initial prompt — passed as positional arg to the runtime command." },
           runtime: { type: "string", description: "Runtime: claude-code, codex, etc. Default: claude-code" },
-          project_dir: { type: "string", description: "Working directory for the agent" },
-          extra_flags: { type: "string", description: "Additional CLI flags" },
+          project_dir: { type: "string", description: "Working directory for the spawned process" },
+          extra_flags: { type: "string", description: "Additional CLI flags appended to the runtime command" },
           badge: { type: "string", description: "Badge text shown in pane top-right when attached (e.g. 'ENG-2998 Mochi')" },
         },
-        required: ["id", "name"],
+        required: ["env"],
       },
     },
     {
@@ -457,8 +463,7 @@ export async function startServer(): Promise<void> {
       switch (name) {
         case "agent_launch": {
           result = await orchestrator.launchAgent({
-            id: a.id as string,
-            displayName: a.name as string,
+            env: a.env as Record<string, string>,
             runtime: a.runtime as string | undefined,
             projectDir: a.project_dir as string | undefined,
             extraFlags: a.extra_flags as string | undefined,
