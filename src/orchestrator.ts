@@ -12,6 +12,7 @@ import type { TerminalBackend } from "./terminal.js";
 import { getLaunchCommand } from "./runtimes.js";
 import { reconcile, formatReport } from "./reconciler.js";
 import { pickName, backgroundImagePath, loadTheme, updateTheme, listThemes } from "./themes.js";
+import { getClaudeCodeSessionId } from "./claude-session.js";
 
 const DEFAULT_DB = join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
 const SCREEN_PREFIX = "wire-";
@@ -127,7 +128,7 @@ export class Orchestrator {
     ccSessionId?: string;
   }): Promise<Agent> {
     const runtime = opts.runtime ?? "claude-code";
-    const ccSessionId = opts.ccSessionId ?? process.env.CLAUDE_CODE_SESSION_ID;
+    const ccSessionId = opts.ccSessionId ?? getClaudeCodeSessionId() ?? undefined;
 
     // Detect screen session from STY (format: "pid.name")
     const sty = process.env.STY;
