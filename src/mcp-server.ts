@@ -173,7 +173,15 @@ export async function startServer(): Promise<void> {
     },
     {
       name: "agent_badge",
-      description: "Update an agent's badge text. The badge appears in the top-right of the pane when the agent is attached. Color is determined by the pane's theme.",
+      description:
+        "Set an agent's badge. Writes the text to the agent's DB row AND, " +
+        "if the agent is currently attached to a pane, pushes the text to " +
+        "that pane's iTerm2/cmux overlay immediately. This is the single " +
+        "call you should reach for when you want a badge to appear — no " +
+        "need to also call pane_badge. " +
+        "On subsequent agent_attach, the saved badge is re-rendered " +
+        "automatically. On agent_detach or agent_stop, the pane's badge is " +
+        "cleared. Badge color is determined by the pane's theme profile.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -384,7 +392,15 @@ export async function startServer(): Promise<void> {
     },
     {
       name: "pane_badge",
-      description: "Set a badge/status on a pane (overlay text in corner for iTerm2, sidebar status for cmux)",
+      description:
+        "Set a badge on a pane directly, bypassing any agent that may be " +
+        "attached. Use this for pane-purpose labels on panes that don't " +
+        "currently host an agent (e.g., an empty pane reserved for a future " +
+        "role, a tab-metadata slot). For agent-identity badges, prefer " +
+        "agent_badge — it writes the DB and auto-renders when the agent " +
+        "attaches, and it survives detach/reattach cycles. A badge set via " +
+        "pane_badge is transient — an agent attaching to the pane will " +
+        "overwrite it with its own badge.",
       inputSchema: {
         type: "object" as const,
         properties: {

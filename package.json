@@ -1,6 +1,6 @@
 {
   "name": "@agiterra/crew-tools",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Agent crew orchestration primitives \u2014 screen sessions, iTerm2 panes, SQLite state, runtime-agnostic.",
   "type": "module",
   "main": "./src/index.ts",

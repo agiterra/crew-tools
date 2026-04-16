@@ -7,7 +7,7 @@ import type { TerminalBackend } from "./terminal";
 // Capture the command passed to screen.createSession so we can assert on the
 // spawn-time env exports. Mock is installed before Orchestrator is imported.
 const createSessionCalls: Array<{ name: string; command: string }> = [];
-const screenState = { isAliveResult: false };
+const screenState = { isAliveResult: false, isAttachedResult: false };
 mock.module("./screen", () => ({
   createSession: async (name: string, command: string) => {
     createSessionCalls.push({ name, command });
@@ -16,6 +16,7 @@ mock.module("./screen", () => ({
   listSessions: async () => [],
   getSessionPid: async () => null,
   isAlive: async () => screenState.isAliveResult,
+  isAttached: async () => screenState.isAttachedResult,
   detachSession: async () => {},
   sendKeys: async () => {},
   readOutput: async () => "",

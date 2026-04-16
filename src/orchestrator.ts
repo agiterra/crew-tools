@@ -164,8 +164,18 @@ export class Orchestrator {
 
     // Find the pane this agent is sitting in (by terminal session ID).
     // If the session isn't registered as a pane, auto-register it.
+    //
+    // IMPORTANT: only auto-link when the screen is actually attached to a
+    // terminal right now. A detached screen has no iTerm pane of its own —
+    // callerSessionId may still be set (inherited from the shell that ran
+    // `screen -dmS`), but that shell's pane is not where this agent lives.
+    // Example breakage: Brioche (in lisbon) runs `screen -dmS wire-danish`;
+    // Danish's inherited ITERM_SESSION_ID points at lisbon; if we auto-link,
+    // Danish ends up with pane='lisbon' (Brioche's pane). Skip auto-link
+    // for detached screens — the caller can agent_attach explicitly later.
     let callerPane: string | null = null;
-    if (opts.callerSessionId) {
+    const attached = await screen.isAttached(screenName);
+    if (opts.callerSessionId && attached) {
       callerPane = this.store.listPanes().find((p) => p.iterm_id === opts.callerSessionId)?.name ?? null;
       if (!callerPane) {
         callerPane = await this.autoRegisterPane(opts.callerSessionId);
@@ -222,6 +232,17 @@ export class Orchestrator {
     } else {
       agent = this.store.getAgent(id);
       if (!agent) throw new Error(`agent '${id}' not found`);
+    }
+
+    // Clear the pane's badge before killing — otherwise the dead agent's
+    // badge text lingers on the now-empty pane until something else clobbers
+    // it. Matches the agent_badge/attach/detach convention of "the agent
+    // owns the pane's badge slot while it's attached."
+    if (agent.pane) {
+      const pane = this.store.getPane(agent.pane);
+      if (pane?.iterm_id) {
+        try { await this.terminal.setBadge(pane.iterm_id, ""); } catch {}
+      }
     }
 
     await screen.killSession(agent.screen_name);

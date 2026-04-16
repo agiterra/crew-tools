@@ -84,6 +84,30 @@ export async function getSessionPid(name: string): Promise<number | null> {
 }
 
 /**
+ * Check whether a screen session is currently attached to a terminal.
+ * Returns false for detached-but-alive sessions and for sessions that
+ * don't exist. Used by registerAgent to avoid auto-linking a headless
+ * agent to a pane — a detached screen has no iTerm session of its own
+ * and any ITERM_SESSION_ID env it sees is inherited from whoever ran
+ * `screen -dmS`, not where it's actually displayed.
+ */
+export async function isAttached(name: string): Promise<boolean> {
+  try {
+    const result = await $`${SCREEN} -ls`.quiet().nothrow();
+    const output = result.stdout.toString();
+    for (const line of output.split("\n")) {
+      const match = line.match(/^\t(\d+)\.(\S+)\t.*\((Attached|Detached)\)/);
+      if (match && match[2] === name) {
+        return match[3] === "Attached";
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Check if a screen session is alive.
  */
 export async function isAlive(name: string): Promise<boolean> {
