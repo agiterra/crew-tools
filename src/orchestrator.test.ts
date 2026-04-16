@@ -213,6 +213,58 @@ describe("idle TTL + reaper", () => {
   });
 });
 
+describe("spawn manifest + tombstones", () => {
+  test("launchAgent persists a manifest stripped of AGENT_PRIVATE_KEY", async () => {
+    await orch.launchAgent({
+      env: {
+        AGENT_ID: "danish",
+        AGENT_NAME: "Danish",
+        AGENT_PRIVATE_KEY: "secret-key-base64",
+        KNOWLEDGE_ENRICH_RULES: '{"ipc":{"from":["brioche"]}}',
+      },
+      projectDir: "/tmp/danish-wd",
+      prompt: "Run the ENG-3021 audit.",
+      badge: "ENG-3021 Danish",
+      ttlIdleMinutes: 60,
+    });
+
+    const row = orch.store.getAgent("danish");
+    expect(row?.spawn_manifest).not.toBeNull();
+    const manifest = JSON.parse(row!.spawn_manifest!);
+    expect(manifest.env.AGENT_ID).toBe("danish");
+    expect(manifest.env.AGENT_NAME).toBe("Danish");
+    expect(manifest.env.KNOWLEDGE_ENRICH_RULES).toBe('{"ipc":{"from":["brioche"]}}');
+    expect(manifest.env.AGENT_PRIVATE_KEY).toBeUndefined();
+    expect(manifest.project_dir).toBe("/tmp/danish-wd");
+    expect(manifest.prompt).toBe("Run the ENG-3021 audit.");
+    expect(manifest.badge).toBe("ENG-3021 Danish");
+    expect(manifest.ttl_idle_minutes).toBe(60);
+  });
+
+  test("stopAgent writes a tombstone and deletes the live row", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "galette" },
+      projectDir: "/tmp/galette",
+      badge: "ENG-3020",
+    });
+    screenState.isAliveResult = true;
+    try {
+      await orch.stopAgent("galette");
+    } finally {
+      screenState.isAliveResult = false;
+    }
+
+    expect(orch.store.getAgent("galette")).toBeNull();
+    const tomb = orch.store.getLatestTombstone("galette");
+    expect(tomb).not.toBeNull();
+    expect(tomb!.id).toBe("galette");
+    expect(tomb!.badge).toBe("ENG-3020");
+    expect(tomb!.spawn_manifest).not.toBeNull();
+    const manifest = JSON.parse(tomb!.spawn_manifest!);
+    expect(manifest.project_dir).toBe("/tmp/galette");
+  });
+});
+
 describe("resumeAgent", () => {
   test("builds a claude --resume command with explicit channels list", async () => {
     await orch.resumeAgent({
@@ -275,6 +327,63 @@ describe("resumeAgent", () => {
         env: { AGENT_ID: "beta" },
       }),
     ).rejects.toThrow(/does not match env\.AGENT_ID/);
+  });
+
+  test("single-arg resume pulls cc_session_id + project_dir from tombstone", async () => {
+    // Launch, stop, then resume with JUST id.
+    await orch.launchAgent({
+      env: { AGENT_ID: "ghost", AGENT_NAME: "Ghost", KNOWLEDGE_ENRICH_RULES: "{}" },
+      projectDir: "/tmp/ghost-wd",
+      badge: "Ghost in the shell",
+    });
+    // Fake the cc_session_id so the tombstone carries a real one.
+    orch.store["db"].prepare("UPDATE agents SET cc_session_id = ? WHERE id = ?")
+      .run("cc-session-ghost", "ghost");
+    screenState.isAliveResult = true;
+    try { await orch.stopAgent("ghost"); } finally { screenState.isAliveResult = false; }
+    createSessionCalls.length = 0;
+
+    const resumed = await orch.resumeAgent({ id: "ghost" });
+
+    // Spawn command pulls the tombstone's cc_session_id + project_dir
+    expect(createSessionCalls).toHaveLength(1);
+    const cmd = createSessionCalls[0]!.command;
+    expect(cmd).toContain("cd '/tmp/ghost-wd'");
+    expect(cmd).toContain("--resume 'cc-session-ghost'");
+    expect(cmd).toContain("AGENT_NAME='Ghost'");
+    expect(cmd).toContain("KNOWLEDGE_ENRICH_RULES='{}'");
+
+    // Resumed row inherits identity defaults from the tombstone
+    expect(resumed.display_name).toBe("Ghost");
+    expect(resumed.badge).toBe("Ghost in the shell");
+    expect(resumed.cc_session_id).toBe("cc-session-ghost");
+  });
+
+  test("resume env overrides are merged on top of tombstone env", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "merge", FROM_MANIFEST: "original" },
+      projectDir: "/tmp/merge",
+    });
+    orch.store["db"].prepare("UPDATE agents SET cc_session_id = ? WHERE id = ?")
+      .run("cc-merge", "merge");
+    screenState.isAliveResult = true;
+    try { await orch.stopAgent("merge"); } finally { screenState.isAliveResult = false; }
+    createSessionCalls.length = 0;
+
+    await orch.resumeAgent({
+      id: "merge",
+      env: { AGENT_PRIVATE_KEY: "fresh-key", FROM_MANIFEST: "overridden" },
+    });
+
+    const cmd = createSessionCalls[0]!.command;
+    expect(cmd).toContain("FROM_MANIFEST='overridden'");
+    expect(cmd).toContain("AGENT_PRIVATE_KEY='fresh-key'");
+  });
+
+  test("throws when neither tombstone nor cc_session_id is available", async () => {
+    await expect(
+      orch.resumeAgent({ id: "never-existed" }),
+    ).rejects.toThrow(/no cc_session_id supplied and no tombstone/);
   });
 });
 

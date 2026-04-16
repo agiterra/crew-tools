@@ -6,7 +6,7 @@
  */
 
 import { join } from "path";
-import { CrewStore, type Agent, type Tab, type Pane } from "./store.js";
+import { CrewStore, type Agent, type Tab, type Pane, type AgentTombstone } from "./store.js";
 import * as screen from "./screen.js";
 import type { TerminalBackend } from "./terminal.js";
 import { getLaunchCommand } from "./runtimes.js";
@@ -20,6 +20,37 @@ const SCREEN_PREFIX = "wire-";
 function titleCase(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
+
+/** Env keys that must never be persisted to the spawn manifest. */
+const SECRET_ENV_KEYS = new Set([
+  "AGENT_PRIVATE_KEY",
+  "WIRE_PRIVATE_KEY",
+  "CREW_PRIVATE_KEY",
+]);
+
+/** Strip known secret env keys so the manifest can be stored in the DB. */
+function sanitizeEnv(env: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (SECRET_ENV_KEYS.has(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+/** Shape of the persisted spawn manifest (agents.spawn_manifest JSON). */
+export type SpawnManifest = {
+  env: Record<string, string>;       // sanitized — no AGENT_PRIVATE_KEY
+  runtime: string;
+  project_dir: string;
+  extra_flags?: string;
+  prompt?: string;
+  badge?: string;
+  display_name: string;
+  ttl_idle_minutes?: number;
+  /** Only populated for resume-style spawns. */
+  channels?: string[];
+};
 
 /** Escape a string for use in a shell command. */
 function shellEscape(s: string): string {
@@ -121,6 +152,20 @@ export class Orchestrator {
       }
     }, 3000);
 
+    // Persist a sanitized manifest alongside the agent row so agent_resume
+    // can reconstruct the spawn later. AGENT_PRIVATE_KEY is stripped — the
+    // caller re-provisions identity via register_agent on resume.
+    const manifest: SpawnManifest = {
+      env: sanitizeEnv(opts.env),
+      runtime,
+      project_dir: projectDir,
+      extra_flags: opts.extraFlags,
+      prompt: opts.prompt,
+      badge: opts.badge,
+      display_name: displayName,
+      ttl_idle_minutes: opts.ttlIdleMinutes,
+    };
+
     // Record in DB
     return this.store.createAgent({
       id,
@@ -130,6 +175,7 @@ export class Orchestrator {
       screen_pid: session.pid,
       badge: opts.badge,
       ttl_idle_minutes: opts.ttlIdleMinutes,
+      spawn_manifest: JSON.stringify(manifest),
     });
   }
 
@@ -156,30 +202,37 @@ export class Orchestrator {
   async resumeAgent(opts: {
     /** Agent ID to resume. Must not already be alive. */
     id: string;
-    /** Claude Code session ID (the JSONL filename stem). */
-    ccSessionId: string;
-    /** Working directory for the resumed process. */
-    projectDir: string;
-    /** Optional env — mirrors launchAgent semantics. */
+    /**
+     * Claude Code session ID (the JSONL filename stem). Falls back to the
+     * tombstone's cc_session_id if a tombstone exists for `id`.
+     */
+    ccSessionId?: string;
+    /** Working directory. Falls back to the tombstone manifest's project_dir. */
+    projectDir?: string;
+    /**
+     * Env overrides. Merged on top of the tombstone manifest's env (overrides
+     * win). AGENT_PRIVATE_KEY is stripped from the manifest for security, so
+     * callers who want Wire identity should re-provision via register_agent
+     * and pass the new key here.
+     */
     env?: Record<string, string>;
-    /** Dev-channel plugin list. Defaults to ["plugin:wire@agiterra"]. */
+    /**
+     * Dev-channel plugin list. Falls back to tombstone manifest's channels,
+     * then to ["plugin:wire@agiterra"]. Explicit list sidesteps the
+     * --resume / --dangerously-load-development-channels argparser conflict.
+     */
     channels?: string[];
-    /** Runtime name. Default: claude-code. */
+    /** Runtime name. Default: tombstone's runtime or "claude-code". */
     runtime?: string;
-    /** Display name. Defaults to env.AGENT_NAME or opts.id. */
+    /** Display name. Falls back to tombstone manifest's display_name. */
     displayName?: string;
     /** Additional CLI flags appended after --resume. */
     extraFlags?: string;
     /** Optional pane to attach to once the resumed screen is up. */
     attachToPane?: string;
-    /** Optional badge text — forwarded to agent record + pane on attach. */
+    /** Badge text. Falls back to tombstone's badge. */
     badge?: string;
   }): Promise<Agent> {
-    if (opts.runtime && opts.runtime !== "claude-code") {
-      throw new Error(`resumeAgent only supports claude-code today (got '${opts.runtime}')`);
-    }
-    const runtime = opts.runtime ?? "claude-code";
-
     // Refuse to double-resume
     const existing = this.store.getAgent(opts.id);
     if (existing) {
@@ -194,26 +247,65 @@ export class Orchestrator {
       this.store.deleteAgentByScreen(existing.screen_name);
     }
 
-    const env: Record<string, string> = { ...(opts.env ?? {}), AGENT_ID: opts.id };
+    // Pull defaults from the most recent tombstone, if one exists.
+    const tomb = this.store.getLatestTombstone(opts.id);
+    let manifest: SpawnManifest | null = null;
+    if (tomb?.spawn_manifest) {
+      try {
+        manifest = JSON.parse(tomb.spawn_manifest) as SpawnManifest;
+      } catch (e) {
+        console.error(`[crew] resumeAgent: failed to parse tombstone manifest for '${opts.id}':`, e);
+      }
+    }
+
+    const ccSessionId = opts.ccSessionId ?? tomb?.cc_session_id ?? null;
+    if (!ccSessionId) {
+      throw new Error(
+        `resumeAgent: no cc_session_id supplied and no tombstone for '${opts.id}'. ` +
+        `Pass cc_session_id explicitly, or launch the agent once via agent_launch so a manifest is recorded.`,
+      );
+    }
+
+    const projectDir = opts.projectDir ?? manifest?.project_dir;
+    if (!projectDir) {
+      throw new Error(
+        `resumeAgent: no project_dir supplied and no tombstone manifest for '${opts.id}'. ` +
+        `Pass project_dir explicitly.`,
+      );
+    }
+
+    const runtime = opts.runtime ?? tomb?.runtime ?? manifest?.runtime ?? "claude-code";
+    if (runtime !== "claude-code") {
+      throw new Error(`resumeAgent only supports claude-code today (got '${runtime}')`);
+    }
+
+    // Merge env: manifest (sanitized, no private key) < opts.env < { AGENT_ID }
+    const mergedEnv: Record<string, string> = {
+      ...(manifest?.env ?? {}),
+      ...(opts.env ?? {}),
+      AGENT_ID: opts.id,
+    };
     if (opts.env?.AGENT_ID && opts.env.AGENT_ID !== opts.id) {
       throw new Error(`resumeAgent: opts.id ('${opts.id}') does not match env.AGENT_ID ('${opts.env.AGENT_ID}')`);
     }
-    const displayName = opts.displayName ?? env.AGENT_NAME ?? opts.id;
+    const displayName = opts.displayName ?? mergedEnv.AGENT_NAME ?? manifest?.display_name ?? tomb?.display_name ?? opts.id;
+    const badge = opts.badge ?? manifest?.badge ?? tomb?.badge ?? undefined;
+    const extraFlags = opts.extraFlags ?? manifest?.extra_flags;
+    const channels = (opts.channels ?? manifest?.channels ?? ["plugin:wire@agiterra"]).join(",");
     const screenName = `${SCREEN_PREFIX}${opts.id}`;
-    const channels = (opts.channels ?? ["plugin:wire@agiterra"]).join(",");
 
     // Build: claude --dangerously-load-development-channels <channels> \
     //        --permission-mode bypassPermissions --resume <cc_session_id> [extra]
     // Explicit channels list sidesteps the --resume positional-arg conflict.
     let command =
       `claude --dangerously-load-development-channels ${shellEscape(channels)} ` +
-      `--permission-mode bypassPermissions --resume ${shellEscape(opts.ccSessionId)}`;
-    if (opts.extraFlags) command += ` ${opts.extraFlags}`;
+      `--permission-mode bypassPermissions --resume ${shellEscape(ccSessionId)}`;
+    if (extraFlags) command += ` ${extraFlags}`;
 
-    const envExports = `export ${Object.entries(env)
+    const envExports = `export ${Object.entries(mergedEnv)
       .map(([k, v]) => `${k}=${shellEscape(v)}`)
       .join(" ")}`;
-    const fullCommand = `cd ${shellEscape(opts.projectDir)} && ${envExports} && ${command}`;
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${command}`;
 
     const session = await screen.createSession(screenName, fullCommand);
 
@@ -226,18 +318,32 @@ export class Orchestrator {
       }
     }, 3000);
 
-    // Seed the DB row directly from what the caller told us — no need to
-    // wait for the resumed agent to self-register (and no risk of the
-    // callerSessionId trap biting; we have no callerSessionId here).
+    // Write a fresh manifest for the resumed agent so it can be resumed
+    // again later. Channels flow into the manifest only here (launchAgent
+    // doesn't record them because the runtime command template carries
+    // the default). Env is re-sanitized.
+    const resumedManifest: SpawnManifest = {
+      env: sanitizeEnv(mergedEnv),
+      runtime,
+      project_dir: projectDir,
+      extra_flags: extraFlags,
+      badge,
+      display_name: displayName,
+      ttl_idle_minutes: manifest?.ttl_idle_minutes,
+      channels: opts.channels ?? manifest?.channels,
+    };
+
     const created = this.store.createAgent({
       id: opts.id,
       display_name: displayName,
       runtime,
       screen_name: screenName,
       screen_pid: session.pid,
-      cc_session_id: opts.ccSessionId,
+      cc_session_id: ccSessionId,
       pane: undefined,
-      badge: opts.badge,
+      badge,
+      ttl_idle_minutes: manifest?.ttl_idle_minutes,
+      spawn_manifest: JSON.stringify(resumedManifest),
     });
 
     // If the caller wants the resumed agent visible, attach now. attachAgent
@@ -363,6 +469,8 @@ export class Orchestrator {
     }
 
     await screen.killSession(agent.screen_name);
+    // Leave a tombstone so agent_resume can reconstruct the spawn later.
+    this.store.tombstoneAgent(agent);
     this.store.deleteAgentByScreen(agent.screen_name);
   }
 

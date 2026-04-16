@@ -37,6 +37,26 @@ export type Agent = {
   launched_at: number;
   last_seen: number;
   ttl_idle_minutes: number | null;
+  spawn_manifest: string | null;
+};
+
+/**
+ * Tombstone left behind when an agent is stopped. Lets agent_resume
+ * reconstruct the spawn without the caller re-supplying every arg.
+ *
+ * `env_json` is the manifest's env map with secrets stripped
+ * (AGENT_PRIVATE_KEY in particular) — callers re-provision identity
+ * via register_agent and pass the new key as an override on resume.
+ */
+export type AgentTombstone = {
+  id: string;
+  screen_name: string;
+  display_name: string;
+  runtime: string;
+  cc_session_id: string | null;
+  badge: string | null;
+  spawn_manifest: string | null;
+  stopped_at: number;
 };
 
 export class CrewStore {
@@ -175,6 +195,31 @@ export class CrewStore {
     if (!hasTtl) {
       this.db.exec("ALTER TABLE agents ADD COLUMN ttl_idle_minutes INTEGER");
     }
+
+    // Add spawn_manifest column (v2.3.0 persistent manifest for agent_resume).
+    const hasManifest = this.db.prepare(
+      "SELECT * FROM pragma_table_info('agents') WHERE name='spawn_manifest'"
+    ).get();
+    if (!hasManifest) {
+      this.db.exec("ALTER TABLE agents ADD COLUMN spawn_manifest TEXT");
+    }
+
+    // Tombstone table — one row per stop, keyed by (id, stopped_at) so
+    // multiple resume cycles for the same id each leave a record.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_tombstones (
+        id TEXT NOT NULL,
+        screen_name TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        runtime TEXT NOT NULL,
+        cc_session_id TEXT,
+        badge TEXT,
+        spawn_manifest TEXT,
+        stopped_at INTEGER NOT NULL,
+        PRIMARY KEY (id, stopped_at)
+      );
+      CREATE INDEX IF NOT EXISTS idx_tombstones_id ON agent_tombstones(id);
+    `);
   }
 
   // --- Tabs ---
@@ -270,16 +315,18 @@ export class CrewStore {
     pane?: string;
     badge?: string;
     ttl_idle_minutes?: number;
+    spawn_manifest?: string;
   }): Agent {
     const now = Date.now();
     this.db.prepare(
-      `INSERT INTO agents (id, display_name, runtime, screen_name, screen_pid, cc_session_id, pane, badge, launched_at, last_seen, ttl_idle_minutes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO agents (id, display_name, runtime, screen_name, screen_pid, cc_session_id, pane, badge, launched_at, last_seen, ttl_idle_minutes, spawn_manifest)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       agent.id, agent.display_name, agent.runtime, agent.screen_name,
       agent.screen_pid ?? null, agent.cc_session_id ?? null,
       agent.pane ?? null, agent.badge ?? null, now, now,
       agent.ttl_idle_minutes ?? null,
+      agent.spawn_manifest ?? null,
     );
     return {
       id: agent.id,
@@ -295,7 +342,39 @@ export class CrewStore {
       launched_at: now,
       last_seen: now,
       ttl_idle_minutes: agent.ttl_idle_minutes ?? null,
+      spawn_manifest: agent.spawn_manifest ?? null,
     };
+  }
+
+  /** Copy an agent row into the tombstones table. Call before deleteAgent. */
+  tombstoneAgent(agent: Agent): void {
+    this.db.prepare(
+      `INSERT OR REPLACE INTO agent_tombstones
+       (id, screen_name, display_name, runtime, cc_session_id, badge, spawn_manifest, stopped_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      agent.id, agent.screen_name, agent.display_name, agent.runtime,
+      agent.cc_session_id, agent.badge, agent.spawn_manifest, Date.now(),
+    );
+  }
+
+  /** Get the most recent tombstone for an id, or null if none. */
+  getLatestTombstone(id: string): AgentTombstone | null {
+    return this.db.prepare(
+      "SELECT * FROM agent_tombstones WHERE id = ? ORDER BY stopped_at DESC LIMIT 1"
+    ).get(id) as AgentTombstone | null;
+  }
+
+  /** List tombstones (most recent first). Used for debugging / resume UIs. */
+  listTombstones(id?: string, limit = 50): AgentTombstone[] {
+    if (id) {
+      return this.db.prepare(
+        "SELECT * FROM agent_tombstones WHERE id = ? ORDER BY stopped_at DESC LIMIT ?"
+      ).all(id, limit) as AgentTombstone[];
+    }
+    return this.db.prepare(
+      "SELECT * FROM agent_tombstones ORDER BY stopped_at DESC LIMIT ?"
+    ).all(limit) as AgentTombstone[];
   }
 
   setAgentTtl(id: string, minutes: number | null): void {

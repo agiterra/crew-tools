@@ -194,37 +194,59 @@ export async function startServer(): Promise<void> {
     {
       name: "agent_resume",
       description:
-        "Resume a stopped agent whose Claude Code session JSONL is still " +
-        "on disk. Starts a new screen session running `claude --resume " +
-        "<cc_session_id>` with the provided env and channels, seeds the " +
-        "DB row from the inputs (no self-register dance required), and " +
-        "optionally attaches to a pane. Use when agent_stop was premature " +
-        "and you want the agent back with its conversation history intact. " +
-        "The session JSONL is stored at " +
-        "`~/.claude/projects/<encoded-project-dir>/<cc_session_id>.jsonl`.",
+        "Resume a stopped agent from its tombstone. Since v2.3.0, every " +
+        "agent_launch persists a spawn manifest (project_dir, env, channels, " +
+        "badge, ttl_idle_minutes, …). agent_stop copies that manifest into a " +
+        "tombstone row. Calling agent_resume({ id }) looks up the most " +
+        "recent tombstone for that id and reconstructs the spawn with one " +
+        "call — no re-supplying inputs.\n\n" +
+        "Wire identity: AGENT_PRIVATE_KEY is stripped from the stored " +
+        "manifest, so if the agent uses Wire, first call " +
+        "`register_agent` (from wire-ipc) to rotate the keypair on Wire, " +
+        "then pass the new key as `env.AGENT_PRIVATE_KEY` here. Wire's " +
+        "/agents/register is UPSERT keyed on id, so the same agent id " +
+        "continues to exist with a new pubkey.\n\n" +
+        "Any explicit field overrides the tombstone's value (including " +
+        "cc_session_id and project_dir — useful for resuming into a " +
+        "different worktree).",
       inputSchema: {
         type: "object" as const,
         properties: {
           id: { type: "string", description: "Agent ID to resume (the id it was running under before agent_stop)." },
-          cc_session_id: { type: "string", description: "Claude Code session ID — the JSONL filename stem under ~/.claude/projects/<cwd>/. Required in v1 (auto-detection planned)." },
-          project_dir: { type: "string", description: "Working directory the original agent was launched in. Claude resumes the matching session from ~/.claude/projects/<encoded-cwd>/." },
+          cc_session_id: { type: "string", description: "Claude Code session ID — the JSONL filename stem. If omitted, falls back to the tombstone's cc_session_id (the session that was live when the agent was stopped)." },
+          project_dir: { type: "string", description: "Working directory. Defaults to the tombstone manifest's project_dir." },
           env: {
             type: "object",
             additionalProperties: { type: "string" },
-            description: "Env to export into the resumed process. Mirrors agent_launch semantics. Must include AGENT_ID matching `id`.",
+            description: "Env overrides, merged on top of the tombstone's sanitized env. AGENT_PRIVATE_KEY is never in the tombstone — supply it here for Wire-using agents.",
           },
           channels: {
             type: "array",
             items: { type: "string" },
-            description: "Dev-channel plugin list (e.g. ['plugin:wire@agiterra', 'plugin:wire-ipc@agiterra']). Defaults to just wire. Explicit list sidesteps the --resume/--dangerously-load-development-channels argparser conflict.",
+            description: "Dev-channel plugin list. Overrides the tombstone's recorded list; falls back to ['plugin:wire@agiterra'].",
           },
-          extra_flags: { type: "string", description: "Additional CLI flags appended after --resume." },
-          attach_to_pane: { type: "string", description: "Optional pane name to attach the resumed agent to once the screen is up. Badge auto-renders on attach." },
-          display_name: { type: "string", description: "Display name. Defaults to env.AGENT_NAME or id." },
-          badge: { type: "string", description: "Badge text written to the agent's DB row; rendered on the pane if attach_to_pane is set." },
-          runtime: { type: "string", description: "Runtime. Only 'claude-code' is supported in v1." },
+          extra_flags: { type: "string", description: "Additional CLI flags appended after --resume. Defaults to tombstone's extra_flags." },
+          attach_to_pane: { type: "string", description: "Optional pane to attach the resumed agent to once the screen is up." },
+          display_name: { type: "string", description: "Display name. Defaults to tombstone's display_name." },
+          badge: { type: "string", description: "Badge text. Defaults to tombstone's badge." },
+          runtime: { type: "string", description: "Runtime. Defaults to tombstone's runtime. Only 'claude-code' is supported today." },
         },
-        required: ["id", "cc_session_id", "project_dir"],
+        required: ["id"],
+      },
+    },
+    {
+      name: "tombstone_list",
+      description:
+        "List tombstones (stopped-agent records) with their manifests. " +
+        "Useful for discovering what's resumable. Without `id`, returns " +
+        "the most recent tombstones across all agents; with `id`, returns " +
+        "all tombstones for that agent, most recent first.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          id: { type: "string", description: "Filter by agent id." },
+          limit: { type: "number", description: "Max rows (default 50)." },
+        },
       },
     },
     {
@@ -550,8 +572,8 @@ export async function startServer(): Promise<void> {
         case "agent_resume": {
           result = await orchestrator.resumeAgent({
             id: a.id as string,
-            ccSessionId: a.cc_session_id as string,
-            projectDir: a.project_dir as string,
+            ccSessionId: a.cc_session_id as string | undefined,
+            projectDir: a.project_dir as string | undefined,
             env: a.env as Record<string, string> | undefined,
             channels: a.channels as string[] | undefined,
             extraFlags: a.extra_flags as string | undefined,
@@ -560,6 +582,13 @@ export async function startServer(): Promise<void> {
             badge: a.badge as string | undefined,
             runtime: a.runtime as string | undefined,
           });
+          break;
+        }
+        case "tombstone_list": {
+          result = orchestrator.store.listTombstones(
+            a.id as string | undefined,
+            a.limit as number | undefined,
+          );
           break;
         }
         case "agent_register":
