@@ -144,3 +144,69 @@ describe("launchAgent env forwarding", () => {
     expect(cmd).toContain("WIRE_URL='https://wire.example.com'");
   });
 });
+
+describe("idle TTL + reaper", () => {
+  test("ttlIdleMinutes is persisted on the agent row", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "ephemeral" },
+      ttlIdleMinutes: 60,
+    });
+    const agent = orch.store.getAgent("ephemeral");
+    expect(agent?.ttl_idle_minutes).toBe(60);
+  });
+
+  test("omitting ttlIdleMinutes leaves the column null (unreapable)", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "permanent" } });
+    const agent = orch.store.getAgent("permanent");
+    expect(agent?.ttl_idle_minutes).toBeNull();
+  });
+
+  test("reap() stops agents past their idle threshold", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "stale" },
+      ttlIdleMinutes: 30,
+    });
+    // Backdate last_seen so the agent looks 61 minutes idle.
+    orch.store["db"].prepare("UPDATE agents SET last_seen = ? WHERE id = ?")
+      .run(Date.now() - 61 * 60_000, "stale");
+
+    const reaped = await orch.reap();
+    expect(reaped).toContain("stale");
+    expect(orch.store.getAgent("stale")).toBeNull();
+  });
+
+  test("reap() leaves fresh agents alone", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "fresh" },
+      ttlIdleMinutes: 30,
+    });
+    const reaped = await orch.reap();
+    expect(reaped).not.toContain("fresh");
+    expect(orch.store.getAgent("fresh")).not.toBeNull();
+  });
+
+  test("reap() ignores agents without a ttl_idle_minutes", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "untracked" } });
+    orch.store["db"].prepare("UPDATE agents SET last_seen = ? WHERE id = ?")
+      .run(Date.now() - 24 * 60 * 60_000, "untracked");
+    const reaped = await orch.reap();
+    expect(reaped).not.toContain("untracked");
+    expect(orch.store.getAgent("untracked")).not.toBeNull();
+  });
+
+  test("agent_send bumps last_seen so TTL timer restarts on activity", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "active" },
+      ttlIdleMinutes: 5,
+    });
+    // Backdate last_seen
+    const staleTs = Date.now() - 10 * 60_000;
+    orch.store["db"].prepare("UPDATE agents SET last_seen = ? WHERE id = ?")
+      .run(staleTs, "active");
+
+    await orch.sendToAgent("active", "ping\n");
+
+    const fresh = orch.store.getAgent("active");
+    expect(fresh!.last_seen).toBeGreaterThan(staleTs);
+  });
+});

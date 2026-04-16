@@ -62,6 +62,13 @@ export class Orchestrator {
     prompt?: string;
     /** Optional badge text displayed in the pane's top-right when attached. */
     badge?: string;
+    /**
+     * Idle TTL in minutes. If set, the orchestrator's reaper (see
+     * {@link startReaper}) stops this agent once `now - last_seen`
+     * exceeds the threshold. `last_seen` is bumped on every send / attach /
+     * status update, so the timer restarts on real activity.
+     */
+    ttlIdleMinutes?: number;
   }): Promise<Agent> {
     const id = opts.env.AGENT_ID;
     if (!id) throw new Error("env.AGENT_ID is required");
@@ -122,6 +129,7 @@ export class Orchestrator {
       screen_name: screenName,
       screen_pid: session.pid,
       badge: opts.badge,
+      ttl_idle_minutes: opts.ttlIdleMinutes,
     });
   }
 
@@ -351,6 +359,7 @@ export class Orchestrator {
   async sendToAgent(agentId: string, text: string, ccSessionId?: string): Promise<void> {
     const agent = this.resolveAgent(agentId, ccSessionId);
     await screen.sendKeys(agent.screen_name, text);
+    this.store.touchAgent(agent.id);
   }
 
   /**
@@ -863,5 +872,50 @@ export class Orchestrator {
     const result = await reconcile(this.store, this.terminal);
     const agents = this.store.listAgents();
     return formatReport(result, agents);
+  }
+
+  // --- Reaper (idle TTL enforcement) ---
+
+  private reaperInterval: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * Scan agents with `ttl_idle_minutes` set and stop any whose
+   * `last_seen` is older than the threshold. Returns the IDs reaped.
+   */
+  async reap(): Promise<string[]> {
+    const now = Date.now();
+    const candidates = this.store.listAgentsWithTtl();
+    const reaped: string[] = [];
+    for (const agent of candidates) {
+      const ttlMs = (agent.ttl_idle_minutes ?? 0) * 60_000;
+      if (ttlMs <= 0) continue;
+      const idleMs = now - agent.last_seen;
+      if (idleMs <= ttlMs) continue;
+      try {
+        await this.stopAgent(agent.id, agent.cc_session_id ?? undefined);
+        reaped.push(agent.id);
+        console.error(
+          `[crew] reaper stopped '${agent.id}' (idle ${Math.round(idleMs / 60_000)}min > ttl ${agent.ttl_idle_minutes}min)`,
+        );
+      } catch (e) {
+        console.error(`[crew] reaper failed to stop '${agent.id}':`, e);
+      }
+    }
+    return reaped;
+  }
+
+  /** Start the reaper interval. Call once from a long-lived process. */
+  startReaper(intervalMs = 60_000): void {
+    if (this.reaperInterval) return;
+    this.reaperInterval = setInterval(() => {
+      this.reap().catch((e) => console.error(`[crew] reaper tick failed:`, e));
+    }, intervalMs);
+  }
+
+  stopReaper(): void {
+    if (this.reaperInterval) {
+      clearInterval(this.reaperInterval);
+      this.reaperInterval = null;
+    }
   }
 }

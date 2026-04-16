@@ -162,6 +162,11 @@ export async function startServer(): Promise<void> {
           project_dir: { type: "string", description: "Working directory for the spawned process" },
           extra_flags: { type: "string", description: "Additional CLI flags appended to the runtime command" },
           badge: { type: "string", description: "Badge text shown in pane top-right when attached (e.g. 'ENG-2998 Mochi')" },
+          ttl_idle_minutes: {
+            type: "number",
+            description:
+              "Optional idle TTL in minutes. If set, crew's reaper stops the agent once it has been idle (no agent_send / agent_attach / status update) for longer than this. Use for ephemeral spawns (e.g. indexing sidecars) that should self-clean rather than run forever.",
+          },
         },
         required: ["env"],
       },
@@ -206,8 +211,25 @@ export async function startServer(): Promise<void> {
     },
     {
       name: "agent_list",
-      description: "List all agents with status, pane, and runtime",
-      inputSchema: { type: "object" as const, properties: {} },
+      description:
+        "List agents with status, pane, and runtime. Optional filters narrow the result — useful when you only want attached agents (for routing) or headless ones (for cleanup). Dead agents are pruned by the boot-time reconciler, so the list only contains agents whose screen session was alive at last check.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          attached: {
+            type: "boolean",
+            description: "If true, return only agents attached to a pane. If false, return only headless agents. Omit for all.",
+          },
+          pane: {
+            type: "string",
+            description: "Return only agents attached to this exact pane.",
+          },
+          with_ttl: {
+            type: "boolean",
+            description: "If true, return only agents that have a ttl_idle_minutes set (ephemeral spawns). If false, return only agents without a TTL (permanent).",
+          },
+        },
+      },
     },
     {
       name: "agent_attach",
@@ -469,6 +491,7 @@ export async function startServer(): Promise<void> {
             extraFlags: a.extra_flags as string | undefined,
             prompt: a.prompt as string | undefined,
             badge: a.badge as string | undefined,
+            ttlIdleMinutes: a.ttl_idle_minutes as number | undefined,
           });
           break;
         }
@@ -492,9 +515,20 @@ export async function startServer(): Promise<void> {
           await orchestrator.stopAgent(a.id as string, a.cc_session_id as string | undefined);
           result = { stopped: a.id, cc_session_id: a.cc_session_id };
           break;
-        case "agent_list":
-          result = orchestrator.listAgents();
+        case "agent_list": {
+          let agents = orchestrator.listAgents();
+          if (typeof a.attached === "boolean") {
+            agents = agents.filter((ag) => (ag.pane !== null) === a.attached);
+          }
+          if (typeof a.pane === "string") {
+            agents = agents.filter((ag) => ag.pane === a.pane);
+          }
+          if (typeof a.with_ttl === "boolean") {
+            agents = agents.filter((ag) => (ag.ttl_idle_minutes !== null) === a.with_ttl);
+          }
+          result = agents;
           break;
+        }
         case "agent_attach":
           await orchestrator.attachAgent(a.id as string, a.pane as string);
           result = { attached: a.id, pane: a.pane };
@@ -658,5 +692,6 @@ export async function startServer(): Promise<void> {
 
   const report = await orchestrator.reconcile();
   console.error(`[crew] boot reconcile:\n${report}`);
+  orchestrator.startReaper();
   console.error(`[crew] ready (caller=${CALLER_AGENT_ID}, terminal=${terminalName}, cc_session=${ccSessionId ?? "unknown"})`);
 }

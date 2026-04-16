@@ -36,6 +36,7 @@ export type Agent = {
   badge: string | null;
   launched_at: number;
   last_seen: number;
+  ttl_idle_minutes: number | null;
 };
 
 export class CrewStore {
@@ -165,6 +166,15 @@ export class CrewStore {
         CREATE INDEX IF NOT EXISTS idx_agents_id ON agents(id);
       `);
     }
+
+    // Add ttl_idle_minutes column to agents if missing (v2.1.0 reaper).
+    // Runs AFTER the handoff rebuild so the column survives the table swap.
+    const hasTtl = this.db.prepare(
+      "SELECT * FROM pragma_table_info('agents') WHERE name='ttl_idle_minutes'"
+    ).get();
+    if (!hasTtl) {
+      this.db.exec("ALTER TABLE agents ADD COLUMN ttl_idle_minutes INTEGER");
+    }
   }
 
   // --- Tabs ---
@@ -259,15 +269,17 @@ export class CrewStore {
     cc_session_id?: string;
     pane?: string;
     badge?: string;
+    ttl_idle_minutes?: number;
   }): Agent {
     const now = Date.now();
     this.db.prepare(
-      `INSERT INTO agents (id, display_name, runtime, screen_name, screen_pid, cc_session_id, pane, badge, launched_at, last_seen)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO agents (id, display_name, runtime, screen_name, screen_pid, cc_session_id, pane, badge, launched_at, last_seen, ttl_idle_minutes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       agent.id, agent.display_name, agent.runtime, agent.screen_name,
       agent.screen_pid ?? null, agent.cc_session_id ?? null,
       agent.pane ?? null, agent.badge ?? null, now, now,
+      agent.ttl_idle_minutes ?? null,
     );
     return {
       id: agent.id,
@@ -282,7 +294,19 @@ export class CrewStore {
       badge: agent.badge ?? null,
       launched_at: now,
       last_seen: now,
+      ttl_idle_minutes: agent.ttl_idle_minutes ?? null,
     };
+  }
+
+  setAgentTtl(id: string, minutes: number | null): void {
+    this.db.prepare("UPDATE agents SET ttl_idle_minutes = ? WHERE id = ?").run(minutes, id);
+  }
+
+  /** List agents that have a TTL set — used by the reaper. */
+  listAgentsWithTtl(): Agent[] {
+    return this.db.prepare(
+      "SELECT * FROM agents WHERE ttl_idle_minutes IS NOT NULL"
+    ).all() as Agent[];
   }
 
   setAgentBadge(id: string, badge: string | null): void {
