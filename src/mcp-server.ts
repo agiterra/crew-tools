@@ -192,6 +192,42 @@ export async function startServer(): Promise<void> {
       },
     },
     {
+      name: "agent_resume",
+      description:
+        "Resume a stopped agent whose Claude Code session JSONL is still " +
+        "on disk. Starts a new screen session running `claude --resume " +
+        "<cc_session_id>` with the provided env and channels, seeds the " +
+        "DB row from the inputs (no self-register dance required), and " +
+        "optionally attaches to a pane. Use when agent_stop was premature " +
+        "and you want the agent back with its conversation history intact. " +
+        "The session JSONL is stored at " +
+        "`~/.claude/projects/<encoded-project-dir>/<cc_session_id>.jsonl`.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          id: { type: "string", description: "Agent ID to resume (the id it was running under before agent_stop)." },
+          cc_session_id: { type: "string", description: "Claude Code session ID — the JSONL filename stem under ~/.claude/projects/<cwd>/. Required in v1 (auto-detection planned)." },
+          project_dir: { type: "string", description: "Working directory the original agent was launched in. Claude resumes the matching session from ~/.claude/projects/<encoded-cwd>/." },
+          env: {
+            type: "object",
+            additionalProperties: { type: "string" },
+            description: "Env to export into the resumed process. Mirrors agent_launch semantics. Must include AGENT_ID matching `id`.",
+          },
+          channels: {
+            type: "array",
+            items: { type: "string" },
+            description: "Dev-channel plugin list (e.g. ['plugin:wire@agiterra', 'plugin:wire-ipc@agiterra']). Defaults to just wire. Explicit list sidesteps the --resume/--dangerously-load-development-channels argparser conflict.",
+          },
+          extra_flags: { type: "string", description: "Additional CLI flags appended after --resume." },
+          attach_to_pane: { type: "string", description: "Optional pane name to attach the resumed agent to once the screen is up. Badge auto-renders on attach." },
+          display_name: { type: "string", description: "Display name. Defaults to env.AGENT_NAME or id." },
+          badge: { type: "string", description: "Badge text written to the agent's DB row; rendered on the pane if attach_to_pane is set." },
+          runtime: { type: "string", description: "Runtime. Only 'claude-code' is supported in v1." },
+        },
+        required: ["id", "cc_session_id", "project_dir"],
+      },
+    },
+    {
       name: "agent_register",
       description: "Register yourself as a crew agent. Call this on boot if you're running in a screen session. Auto-links to your pane if one exists with the same name.",
       inputSchema: {
@@ -508,6 +544,21 @@ export async function startServer(): Promise<void> {
             prompt: a.prompt as string | undefined,
             badge: a.badge as string | undefined,
             ttlIdleMinutes: a.ttl_idle_minutes as number | undefined,
+          });
+          break;
+        }
+        case "agent_resume": {
+          result = await orchestrator.resumeAgent({
+            id: a.id as string,
+            ccSessionId: a.cc_session_id as string,
+            projectDir: a.project_dir as string,
+            env: a.env as Record<string, string> | undefined,
+            channels: a.channels as string[] | undefined,
+            extraFlags: a.extra_flags as string | undefined,
+            attachToPane: a.attach_to_pane as string | undefined,
+            displayName: a.display_name as string | undefined,
+            badge: a.badge as string | undefined,
+            runtime: a.runtime as string | undefined,
           });
           break;
         }

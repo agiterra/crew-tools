@@ -134,6 +134,123 @@ export class Orchestrator {
   }
 
   /**
+   * Resume a stopped agent whose Claude Code session JSONL still exists.
+   *
+   * Mirrors {@link launchAgent} but passes `--resume <ccSessionId>` to the
+   * runtime so the agent picks up its conversation history, and pre-seeds
+   * the DB row with everything the caller tells us (id, cc_session_id,
+   * optional pane) rather than relying on the resumed agent to
+   * self-register from inside.
+   *
+   * Why this exists: premature agent_stop is irreversible today — the DB
+   * row is gone and recreating it by hand is ~10 non-obvious steps
+   * (see crew-tools#40). This collapses recovery into one call for the
+   * common case where the JSONL is still on disk.
+   *
+   * Channels handling: Claude Code's argparser treats positionals after
+   * --dangerously-load-development-channels as part of the channel list,
+   * which collides with --resume. We always pass an explicit channels
+   * list to sidestep that. The default list is the runtime default's
+   * channel; override via opts.channels for fuller plugin loads.
+   */
+  async resumeAgent(opts: {
+    /** Agent ID to resume. Must not already be alive. */
+    id: string;
+    /** Claude Code session ID (the JSONL filename stem). */
+    ccSessionId: string;
+    /** Working directory for the resumed process. */
+    projectDir: string;
+    /** Optional env — mirrors launchAgent semantics. */
+    env?: Record<string, string>;
+    /** Dev-channel plugin list. Defaults to ["plugin:wire@agiterra"]. */
+    channels?: string[];
+    /** Runtime name. Default: claude-code. */
+    runtime?: string;
+    /** Display name. Defaults to env.AGENT_NAME or opts.id. */
+    displayName?: string;
+    /** Additional CLI flags appended after --resume. */
+    extraFlags?: string;
+    /** Optional pane to attach to once the resumed screen is up. */
+    attachToPane?: string;
+    /** Optional badge text — forwarded to agent record + pane on attach. */
+    badge?: string;
+  }): Promise<Agent> {
+    if (opts.runtime && opts.runtime !== "claude-code") {
+      throw new Error(`resumeAgent only supports claude-code today (got '${opts.runtime}')`);
+    }
+    const runtime = opts.runtime ?? "claude-code";
+
+    // Refuse to double-resume
+    const existing = this.store.getAgent(opts.id);
+    if (existing) {
+      const alive = await screen.isAlive(existing.screen_name);
+      if (alive) {
+        throw new Error(
+          `resumeAgent: agent '${opts.id}' is already running (screen '${existing.screen_name}'). ` +
+          `Stop it first with agent_stop or use agent_attach to view it.`,
+        );
+      }
+      // Dead row left behind — prune it so createAgent doesn't collide.
+      this.store.deleteAgentByScreen(existing.screen_name);
+    }
+
+    const env: Record<string, string> = { ...(opts.env ?? {}), AGENT_ID: opts.id };
+    if (opts.env?.AGENT_ID && opts.env.AGENT_ID !== opts.id) {
+      throw new Error(`resumeAgent: opts.id ('${opts.id}') does not match env.AGENT_ID ('${opts.env.AGENT_ID}')`);
+    }
+    const displayName = opts.displayName ?? env.AGENT_NAME ?? opts.id;
+    const screenName = `${SCREEN_PREFIX}${opts.id}`;
+    const channels = (opts.channels ?? ["plugin:wire@agiterra"]).join(",");
+
+    // Build: claude --dangerously-load-development-channels <channels> \
+    //        --permission-mode bypassPermissions --resume <cc_session_id> [extra]
+    // Explicit channels list sidesteps the --resume positional-arg conflict.
+    let command =
+      `claude --dangerously-load-development-channels ${shellEscape(channels)} ` +
+      `--permission-mode bypassPermissions --resume ${shellEscape(opts.ccSessionId)}`;
+    if (opts.extraFlags) command += ` ${opts.extraFlags}`;
+
+    const envExports = `export ${Object.entries(env)
+      .map(([k, v]) => `${k}=${shellEscape(v)}`)
+      .join(" ")}`;
+    const fullCommand = `cd ${shellEscape(opts.projectDir)} && ${envExports} && ${command}`;
+
+    const session = await screen.createSession(screenName, fullCommand);
+
+    // Auto-confirm dev-channel prompt (same cadence as launchAgent).
+    setTimeout(async () => {
+      try {
+        await screen.sendKeys(screenName, "\n");
+      } catch (e) {
+        console.error(`[crew] failed to auto-confirm dev-channel prompt for resumed '${opts.id}':`, e);
+      }
+    }, 3000);
+
+    // Seed the DB row directly from what the caller told us — no need to
+    // wait for the resumed agent to self-register (and no risk of the
+    // callerSessionId trap biting; we have no callerSessionId here).
+    const created = this.store.createAgent({
+      id: opts.id,
+      display_name: displayName,
+      runtime,
+      screen_name: screenName,
+      screen_pid: session.pid,
+      cc_session_id: opts.ccSessionId,
+      pane: undefined,
+      badge: opts.badge,
+    });
+
+    // If the caller wants the resumed agent visible, attach now. attachAgent
+    // will re-render the badge on the pane per the badge-slot convention.
+    if (opts.attachToPane) {
+      await this.attachAgent(opts.id, opts.attachToPane);
+      return this.store.getAgent(opts.id) ?? created;
+    }
+
+    return created;
+  }
+
+  /**
    * Register an already-running agent (self-registration).
    * The agent detects its own screen session from STY env var.
    * If callerSessionId is provided, auto-links to the pane owning that session.

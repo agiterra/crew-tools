@@ -213,6 +213,71 @@ describe("idle TTL + reaper", () => {
   });
 });
 
+describe("resumeAgent", () => {
+  test("builds a claude --resume command with explicit channels list", async () => {
+    await orch.resumeAgent({
+      id: "danish",
+      ccSessionId: "7cc4b34e-225b-42ed-b2e3-bafa696cfc70",
+      projectDir: "/tmp/danish-wd",
+      channels: ["plugin:wire@agiterra", "plugin:knowledge@agiterra"],
+      env: { AGENT_PRIVATE_KEY: "k" },
+    });
+
+    expect(createSessionCalls).toHaveLength(1);
+    const cmd = createSessionCalls[0]!.command;
+    // explicit channels list sidesteps the --resume positional-arg conflict
+    expect(cmd).toContain("--dangerously-load-development-channels 'plugin:wire@agiterra,plugin:knowledge@agiterra'");
+    expect(cmd).toContain("--resume '7cc4b34e-225b-42ed-b2e3-bafa696cfc70'");
+    expect(cmd).toContain("cd '/tmp/danish-wd'");
+    expect(cmd).toContain("AGENT_ID='danish'");
+    expect(cmd).toContain("AGENT_PRIVATE_KEY='k'");
+  });
+
+  test("pre-seeds the DB row from inputs (no self-register required)", async () => {
+    await orch.resumeAgent({
+      id: "galette",
+      ccSessionId: "fake-session-id",
+      projectDir: "/tmp/galette-wd",
+      displayName: "Galette",
+      badge: "ENG-3020 Galette",
+    });
+
+    const agent = orch.store.getAgent("galette");
+    expect(agent).not.toBeNull();
+    expect(agent!.cc_session_id).toBe("fake-session-id");
+    expect(agent!.display_name).toBe("Galette");
+    expect(agent!.badge).toBe("ENG-3020 Galette");
+    expect(agent!.screen_name).toBe("wire-galette");
+  });
+
+  test("throws if agent is already alive", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "already-running" } });
+    screenState.isAliveResult = true;
+    try {
+      await expect(
+        orch.resumeAgent({
+          id: "already-running",
+          ccSessionId: "x",
+          projectDir: "/tmp",
+        }),
+      ).rejects.toThrow(/already running/);
+    } finally {
+      screenState.isAliveResult = false;
+    }
+  });
+
+  test("rejects env.AGENT_ID mismatch", async () => {
+    await expect(
+      orch.resumeAgent({
+        id: "alpha",
+        ccSessionId: "s",
+        projectDir: "/tmp",
+        env: { AGENT_ID: "beta" },
+      }),
+    ).rejects.toThrow(/does not match env\.AGENT_ID/);
+  });
+});
+
 describe("registerAgent id-mismatch safety", () => {
   test("throws when caller id doesn't match the agent owning the screen", async () => {
     // Simulate Brioche running in screen 'wire-brioche' with an existing row
