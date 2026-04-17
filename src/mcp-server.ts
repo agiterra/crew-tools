@@ -600,10 +600,11 @@ export async function startServer(): Promise<void> {
             ccSessionId: (a.cc_session_id as string | undefined) ?? ccSessionId ?? undefined,
           });
           break;
-        case "agent_badge":
-          await orchestrator.setAgentBadge(a.id as string, a.text as string);
-          result = { badge_set: a.id, text: a.text };
+        case "agent_badge": {
+          const outcome = await orchestrator.setAgentBadge(a.id as string, a.text as string);
+          result = { badge_set: a.id, text: a.text, ...outcome };
           break;
+        }
         case "agent_interrupt":
           result = await orchestrator.interruptAgent(a.id as string, !!a.background, a.cc_session_id as string | undefined);
           break;
