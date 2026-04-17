@@ -185,6 +185,16 @@ export async function reconcile(
         // SetProfile switches profile attributes but leaves the session title untouched.
         // Always set the session name so live iTerm UI matches the DB pane name.
         await terminal.setSessionName(original.iterm_id, titleCase(workingName));
+        // setProfile clears the session's badge (the dynamic profile has no
+        // badge text set). If an agent is attached to this pane, re-apply its
+        // badge so the operator's view survives boot-time reconcile. Without
+        // this, any agent_badge call made in the window between mcp.connect
+        // and reconcile completing gets silently blown away — exactly what
+        // Brioche observed in v2.3.2 post-restart.
+        const occupant = store.listAgents().find((a) => a.pane === workingName);
+        if (occupant?.badge) {
+          try { await terminal.setBadge(original.iterm_id, occupant.badge); } catch {}
+        }
         profilesApplied.push({ pane: workingName, profile: profileName });
       } catch (e) {
         console.error(`[crew] reconcile: failed to apply profile for pane '${workingName}':`, e);
