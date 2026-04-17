@@ -259,17 +259,24 @@ export class Orchestrator {
     }
 
     const ccSessionId = opts.ccSessionId ?? tomb?.cc_session_id ?? null;
-    if (!ccSessionId) {
+    // cc_session_id is optional on resume: when the original agent never
+    // booted a CC session (agent_stop'd before CC wrote a session JSONL, or
+    // a prompt like "/exit" caused CC to bail), the tombstone exists with
+    // cc_session_id=null. In that case we can still use the manifest to
+    // re-launch fresh (no --resume flag). If there's NO tombstone and NO
+    // manifest AND no opts.projectDir, we have nothing to work with.
+    if (!ccSessionId && !tomb && !opts.projectDir) {
       throw new Error(
-        `resumeAgent: no cc_session_id supplied and no tombstone for '${opts.id}'. ` +
-        `Pass cc_session_id explicitly, or launch the agent once via agent_launch so a manifest is recorded.`,
+        `resumeAgent: no tombstone for '${opts.id}' and no explicit inputs. ` +
+        `Launch the agent once via agent_launch so a manifest is recorded, ` +
+        `or pass cc_session_id + project_dir explicitly.`,
       );
     }
 
     const projectDir = opts.projectDir ?? manifest?.project_dir;
     if (!projectDir) {
       throw new Error(
-        `resumeAgent: no project_dir supplied and no tombstone manifest for '${opts.id}'. ` +
+        `resumeAgent: tombstone for '${opts.id}' has no project_dir in its manifest. ` +
         `Pass project_dir explicitly.`,
       );
     }
@@ -295,11 +302,15 @@ export class Orchestrator {
     const screenName = `${SCREEN_PREFIX}${opts.id}`;
 
     // Build: claude --dangerously-load-development-channels <channels> \
-    //        --permission-mode bypassPermissions --resume <cc_session_id> [extra]
+    //        --permission-mode bypassPermissions [--resume <cc_session_id>] [extra]
     // Explicit channels list sidesteps the --resume positional-arg conflict.
+    // --resume is only added when we have a cc_session_id to resume; if the
+    // original agent never booted a CC session (cc_session_id=null in the
+    // tombstone) we launch fresh from the manifest instead.
     let command =
       `claude --dangerously-load-development-channels ${shellEscape(channels)} ` +
-      `--permission-mode bypassPermissions --resume ${shellEscape(ccSessionId)}`;
+      `--permission-mode bypassPermissions`;
+    if (ccSessionId) command += ` --resume ${shellEscape(ccSessionId)}`;
     if (extraFlags) command += ` ${extraFlags}`;
 
     const envExports = `export ${Object.entries(mergedEnv)
@@ -339,7 +350,7 @@ export class Orchestrator {
       runtime,
       screen_name: screenName,
       screen_pid: session.pid,
-      cc_session_id: ccSessionId,
+      cc_session_id: ccSessionId ?? undefined,
       pane: undefined,
       badge,
       ttl_idle_minutes: manifest?.ttl_idle_minutes,

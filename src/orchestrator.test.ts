@@ -420,7 +420,29 @@ describe("resumeAgent", () => {
   test("throws when neither tombstone nor cc_session_id is available", async () => {
     await expect(
       orch.resumeAgent({ id: "never-existed" }),
-    ).rejects.toThrow(/no cc_session_id supplied and no tombstone/);
+    ).rejects.toThrow(/no tombstone for 'never-existed'/);
+  });
+
+  test("resumes from tombstone with null cc_session_id by launching fresh (no --resume flag)", async () => {
+    // Agent that /exit'd before CC wrote a session file — tombstone has
+    // manifest but no cc_session_id. Brioche's verification case #9.
+    await orch.launchAgent({
+      env: { AGENT_ID: "never-booted" },
+      projectDir: "/tmp/nb",
+    });
+    // Leave cc_session_id as NULL — simulate an agent that never booted CC.
+    screenState.isAliveResult = true;
+    try { await orch.stopAgent("never-booted"); } finally { screenState.isAliveResult = false; }
+    createSessionCalls.length = 0;
+
+    const resumed = await orch.resumeAgent({ id: "never-booted" });
+    expect(resumed.id).toBe("never-booted");
+    expect(resumed.cc_session_id).toBeNull();
+    expect(createSessionCalls).toHaveLength(1);
+    const cmd = createSessionCalls[0]!.command;
+    expect(cmd).not.toContain("--resume");
+    expect(cmd).toContain("cd '/tmp/nb'");
+    expect(cmd).toContain("AGENT_ID='never-booted'");
   });
 });
 
