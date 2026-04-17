@@ -265,6 +265,43 @@ describe("spawn manifest + tombstones", () => {
   });
 });
 
+describe("setAgentBadge ambiguous-pane safeguard", () => {
+  test("skips render when multiple agents claim the target's pane", async () => {
+    // Construct the bad state: two agents both claim pane 'shared'.
+    await orch.launchAgent({ env: { AGENT_ID: "a" } });
+    await orch.launchAgent({ env: { AGENT_ID: "b" } });
+    orch.store["db"].prepare("UPDATE agents SET pane = 'shared' WHERE id IN ('a','b')").run();
+
+    const outcome = await orch.setAgentBadge("a", "should-not-render");
+
+    expect(outcome.rendered).toBe(false);
+    expect(outcome.reason).toMatch(/claimed by 2 agents/);
+    // DB badge still written — only the pane render is skipped.
+    expect(orch.store.getAgent("a")?.badge).toBe("should-not-render");
+  });
+
+  test("skips render when the target's screen is detached", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "lonely" } });
+    orch.store["db"].prepare("UPDATE agents SET pane = 'rome' WHERE id = 'lonely'").run();
+    // Fake a pane row so the iterm_id lookup succeeds.
+    orch.store["db"].prepare(
+      "INSERT INTO tabs (name, created_at) VALUES ('t', 0)"
+    ).run();
+    orch.store["db"].prepare(
+      "INSERT INTO panes (name, tab, position, iterm_id, created_at) VALUES ('rome','t','below','iterm-rome',0)"
+    ).run();
+
+    screenState.isAttachedResult = false; // detached
+    try {
+      const outcome = await orch.setAgentBadge("lonely", "x");
+      expect(outcome.rendered).toBe(false);
+      expect(outcome.reason).toMatch(/detached/);
+    } finally {
+      screenState.isAttachedResult = false;
+    }
+  });
+});
+
 describe("resumeAgent", () => {
   test("builds a claude --resume command with explicit channels list", async () => {
     await orch.resumeAgent({

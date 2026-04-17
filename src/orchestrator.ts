@@ -573,17 +573,65 @@ export class Orchestrator {
   /**
    * Update an agent's badge text. Persists in the DB and applies to the
    * pane immediately if the agent is currently attached.
+   *
+   * Returns a summary of what happened: the DB badge is always written;
+   * the pane render is skipped when the pane's occupancy is ambiguous
+   * (more than one agent row claims it). Ambiguous panes happen when an
+   * operator reattaches a screen via raw `screen -x` or iTerm controls
+   * instead of `agent_attach`, leaving the DB lying about which pane
+   * shows which agent. Rendering the badge in that state would push the
+   * escape sequence to whichever iTerm session the pane is wired to,
+   * clobbering whatever agent is ACTUALLY displayed there — classically
+   * the caller's own badge.
    */
-  async setAgentBadge(agentId: string, badge: string): Promise<void> {
+  async setAgentBadge(agentId: string, badge: string): Promise<{
+    rendered: boolean;
+    pane: string | null;
+    reason?: string;
+  }> {
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`agent '${agentId}' not found`);
     this.store.setAgentBadge(agentId, badge);
-    if (agent.pane) {
-      const pane = this.store.getPane(agent.pane);
-      if (pane?.iterm_id) {
-        await this.terminal.setBadge(pane.iterm_id, badge);
-      }
+
+    if (!agent.pane) {
+      return { rendered: false, pane: null, reason: "agent is headless (no pane)" };
     }
+
+    // Invariant: each pane hosts at most one agent. Check BEFORE iterm_id
+    // resolution — a drifted DB is a more informative signal than "no iterm
+    // session." If multiple rows claim this pane we cannot safely render:
+    // the iterm_id may be wired to a different agent, and rendering would
+    // clobber whoever is actually displayed (classically the caller's own
+    // badge, when an operator calls agent_badge for another agent that
+    // nominally shares the caller's pane).
+    const claimants = this.store.listAgents().filter((a) => a.pane === agent.pane);
+    if (claimants.length > 1) {
+      const reason =
+        `pane '${agent.pane}' is claimed by ${claimants.length} agents (${claimants.map((c) => c.id).join(", ")}). ` +
+        `DB is stale — probably an operator reattached a screen outside of agent_attach. ` +
+        `Resolve by calling agent_attach / agent_detach on the affected agents, or run reconcile.`;
+      console.error(`[crew] setAgentBadge skipped render: ${reason}`);
+      return { rendered: false, pane: agent.pane, reason };
+    }
+
+    const pane = this.store.getPane(agent.pane);
+    if (!pane?.iterm_id) {
+      return { rendered: false, pane: agent.pane, reason: "pane has no iterm session" };
+    }
+
+    // Defence in depth: if the target's screen session isn't attached to any
+    // terminal right now, the DB pane is stale (headless agents can't render).
+    const attached = await screen.isAttached(agent.screen_name);
+    if (!attached) {
+      return {
+        rendered: false,
+        pane: agent.pane,
+        reason: `target screen '${agent.screen_name}' is detached — rendering would go to a stale iterm session`,
+      };
+    }
+
+    await this.terminal.setBadge(pane.iterm_id, badge);
+    return { rendered: true, pane: agent.pane };
   }
 
   /**
