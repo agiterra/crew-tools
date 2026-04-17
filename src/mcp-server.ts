@@ -82,10 +82,28 @@ export async function startServer(): Promise<void> {
         }
       }
 
-      // Bind agent to pane if mismatched.
-      if (myPane && myAgent.pane !== myPane.name) {
-        orchestrator.store.updateAgentPane(myAgent.id, myPane.name);
-        console.error(`[crew] self-stamped agent '${myAgent.id}' pane='${myPane.name}'`);
+      // Bind agent to pane ONLY when it's still unset.
+      //
+      // agent_attach is authoritative for pane bindings — self-stamp may
+      // not override it. Classic race: agent is spawned via `screen -dmS`
+      // from a launcher shell, inheriting that shell's ITERM_SESSION_ID
+      // (which points at the LAUNCHER's pane, not where the agent ends up).
+      // Meanwhile the orchestrator agent_attach'es this agent to its real
+      // pane. The self-stamp's `myAgent` snapshot predates that write, so
+      // `myAgent.pane` looks null. Without this guard we'd write the env-
+      // derived guess and clobber the correct binding. Re-read RIGHT before
+      // writing so a racing agent_attach wins.
+      if (myPane) {
+        const fresh = orchestrator.store.getAgentByScreen(screenName!);
+        if (fresh && !fresh.pane) {
+          orchestrator.store.updateAgentPane(fresh.id, myPane.name);
+          console.error(`[crew] self-stamped agent '${fresh.id}' pane='${myPane.name}'`);
+        } else if (fresh && fresh.pane !== myPane.name) {
+          console.error(
+            `[crew] self-stamp: env-derived pane '${myPane.name}' differs from DB pane '${fresh.pane}' for '${fresh.id}' — NOT overriding (agent_attach is authoritative). ` +
+            `This usually means ITERM_SESSION_ID was inherited from a launcher shell in a different pane.`,
+          );
+        }
       }
     }
   }
