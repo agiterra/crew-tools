@@ -9,4 +9,5 @@ export { loadRuntimes, getLaunchCommand, expandCommand, type RuntimeConfig } fro
 export { reconcile, formatReport, type ReconcileResult } from "./reconciler.js";
 export { pickName, isValidTheme, THEME_NAMES, backgroundImagePath, loadTheme, listThemes, resolveThemeDir, saveTheme, updateTheme, type ThemeConfig } from "./themes.js";
 export { startServer } from "./mcp-server.js";
+export { runCli } from "./cli.js";
 export { getClaudeCodeSessionId } from "./claude-session.js";
