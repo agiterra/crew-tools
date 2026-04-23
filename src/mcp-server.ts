@@ -563,6 +563,63 @@ export async function startServer(): Promise<void> {
       description: "Sync DB state with running screen sessions.",
       inputSchema: { type: "object" as const, properties: {} },
     },
+    {
+      name: "machine_register",
+      description:
+        "Register a machine in the local crew DB so cross-machine tools " +
+        "(crew-fleet, fleet_move) can reach it. Probes SSH with " +
+        "BatchMode=yes + ConnectTimeout=5 and reads the remote crew " +
+        "plugin version. Each crew DB is local-truth for 'machines I " +
+        "know how to reach' — no central registry. Pass `reciprocal: " +
+        "true` to also register the local machine on the remote side.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string", description: "User-friendly alias (e.g. 'home-mini')." },
+          ssh_host: { type: "string", description: "SSH destination (e.g. 'tim@mac-mini.local')." },
+          ssh_port: { type: "number", description: "Optional SSH port. Default: 22." },
+          notes: { type: "string", description: "Free-form notes." },
+          skip_probe: { type: "boolean", description: "Skip the SSH reachability check at register time (default false)." },
+          reciprocal: { type: "boolean", description: "If true, SSH to the destination and register the local machine there too. (Best-effort; failure is non-fatal.)" },
+        },
+        required: ["name", "ssh_host"],
+      },
+    },
+    {
+      name: "machine_list",
+      description:
+        "List all machines registered in the local crew DB. The local " +
+        "machine is auto-registered on first boot and appears as a row " +
+        "with ssh_host='localhost'.",
+      inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
+      name: "machine_remove",
+      description:
+        "Remove a registered machine. Refuses to delete the local " +
+        "machine — its row is required for agents.machine_name joins.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string", description: "Machine name to remove." },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "machine_probe",
+      description:
+        "Re-probe a registered machine for reachability. Updates " +
+        "last_seen + crew_version on success; returns the probe result " +
+        "either way.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string", description: "Machine name to probe." },
+        },
+        required: ["name"],
+      },
+    },
   ];
 
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -760,6 +817,36 @@ export async function startServer(): Promise<void> {
         }
         case "reconcile":
           result = { report: await orchestrator.reconcile() };
+          break;
+        case "machine_register": {
+          const m = await orchestrator.registerMachine({
+            name: a.name as string,
+            sshHost: a.ssh_host as string,
+            sshPort: a.ssh_port as number | undefined,
+            notes: a.notes as string | undefined,
+            skipProbe: Boolean(a.skip_probe),
+          });
+          // Best-effort reciprocal: SSH to the destination and run
+          // `claude -p` / equivalent to invoke its own machine_register
+          // pointing back at us. For now we only note the intent; the
+          // reciprocal wiring lands with crew-fleet (#50) where we have
+          // a clean remote-MCP-invoke primitive.
+          if (a.reciprocal) {
+            result = { ...m, reciprocal_note: "reciprocal registration deferred to crew-fleet; register on the remote side manually for now" };
+          } else {
+            result = m;
+          }
+          break;
+        }
+        case "machine_list":
+          result = orchestrator.listMachines();
+          break;
+        case "machine_remove":
+          orchestrator.removeMachine(a.name as string);
+          result = { removed: a.name };
+          break;
+        case "machine_probe":
+          result = await orchestrator.probeMachine(a.name as string);
           break;
         default:
           throw new Error(`unknown tool: ${name}`);

@@ -6,6 +6,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { hostname } from "os";
 
 export type Tab = {
   name: string;
@@ -38,6 +39,33 @@ export type Agent = {
   last_seen: number;
   ttl_idle_minutes: number | null;
   spawn_manifest: string | null;
+  /**
+   * Which machine this agent runs on. Populated from `hostname()` at
+   * insert time. Enables cross-machine orchestration (see crew-fleet
+   * plugin) — fleet-level queries union agent rows across every
+   * machine's local crew DB, annotated by this column.
+   */
+  machine_name: string;
+};
+
+/**
+ * A machine the orchestrator can SSH into. Used by crew-fleet for
+ * cross-machine queries and by fleet_move for handoffs.
+ *
+ * Each crew DB is local-truth for "machines I know how to reach." There
+ * is no central registry — register a machine on both sides if you want
+ * bidirectional awareness (machine_register supports `reciprocal: true`
+ * as a convenience).
+ */
+export type Machine = {
+  name: string;              // user-friendly alias ("home-mini")
+  hostname: string;          // OS hostname, for dedupe + self-detect
+  ssh_host: string;          // 'tim@mac-mini.local' or similar
+  ssh_port: number | null;   // null = default 22
+  added_at: number;
+  last_seen: number | null;
+  crew_version: string | null;
+  notes: string | null;
 };
 
 /**
@@ -220,6 +248,43 @@ export class CrewStore {
       );
       CREATE INDEX IF NOT EXISTS idx_tombstones_id ON agent_tombstones(id);
     `);
+
+    // Add machine_name column to agents (v2.4.0). Default is the local
+    // hostname so every pre-existing row gets a sensible value. The column
+    // is NOT NULL in principle; we default in application code rather than
+    // DB-side DEFAULT because sqlite ALTER TABLE DEFAULT can't reference
+    // functions at migration time.
+    const hasMachineName = this.db.prepare(
+      "SELECT * FROM pragma_table_info('agents') WHERE name='machine_name'"
+    ).get();
+    if (!hasMachineName) {
+      const localName = hostname().toLowerCase();
+      this.db.exec(`ALTER TABLE agents ADD COLUMN machine_name TEXT NOT NULL DEFAULT '${localName.replace(/'/g, "''")}'`);
+    }
+
+    // Machines table (v2.4.0) — cross-machine orchestration registry.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS machines (
+        name TEXT PRIMARY KEY,
+        hostname TEXT NOT NULL,
+        ssh_host TEXT NOT NULL,
+        ssh_port INTEGER,
+        added_at INTEGER NOT NULL,
+        last_seen INTEGER,
+        crew_version TEXT,
+        notes TEXT
+      );
+    `);
+
+    // First-boot: ensure the local machine is registered so JOINs on
+    // agents.machine_name always resolve for local rows. Idempotent.
+    const localHost = hostname().toLowerCase();
+    const localRow = this.db.prepare("SELECT 1 FROM machines WHERE name = ?").get(localHost);
+    if (!localRow) {
+      this.db.prepare(
+        "INSERT INTO machines (name, hostname, ssh_host, ssh_port, added_at, last_seen, crew_version, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).run(localHost, localHost, "localhost", null, Date.now(), Date.now(), null, "auto-registered on first boot");
+    }
   }
 
   // --- Tabs ---
@@ -318,15 +383,17 @@ export class CrewStore {
     spawn_manifest?: string;
   }): Agent {
     const now = Date.now();
+    const machineName = hostname().toLowerCase();
     this.db.prepare(
-      `INSERT INTO agents (id, display_name, runtime, screen_name, screen_pid, cc_session_id, pane, badge, launched_at, last_seen, ttl_idle_minutes, spawn_manifest)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO agents (id, display_name, runtime, screen_name, screen_pid, cc_session_id, pane, badge, launched_at, last_seen, ttl_idle_minutes, spawn_manifest, machine_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       agent.id, agent.display_name, agent.runtime, agent.screen_name,
       agent.screen_pid ?? null, agent.cc_session_id ?? null,
       agent.pane ?? null, agent.badge ?? null, now, now,
       agent.ttl_idle_minutes ?? null,
       agent.spawn_manifest ?? null,
+      machineName,
     );
     return {
       id: agent.id,
@@ -343,6 +410,7 @@ export class CrewStore {
       last_seen: now,
       ttl_idle_minutes: agent.ttl_idle_minutes ?? null,
       spawn_manifest: agent.spawn_manifest ?? null,
+      machine_name: machineName,
     };
   }
 
@@ -451,5 +519,69 @@ export class CrewStore {
     this.db.prepare(
       "UPDATE agents SET cc_session_id = ?, last_seen = ? WHERE screen_name = ?"
     ).run(ccSessionId, Date.now(), screenName);
+  }
+
+  // --- Machines ---
+
+  /** Return the local machine's registry name (lowercase OS hostname). */
+  localMachineName(): string {
+    return hostname().toLowerCase();
+  }
+
+  createMachine(opts: {
+    name: string;
+    hostname: string;
+    ssh_host: string;
+    ssh_port?: number;
+    notes?: string;
+  }): Machine {
+    const now = Date.now();
+    this.db.prepare(
+      `INSERT INTO machines (name, hostname, ssh_host, ssh_port, added_at, last_seen, crew_version, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      opts.name, opts.hostname, opts.ssh_host, opts.ssh_port ?? null,
+      now, null, null, opts.notes ?? null,
+    );
+    return {
+      name: opts.name,
+      hostname: opts.hostname,
+      ssh_host: opts.ssh_host,
+      ssh_port: opts.ssh_port ?? null,
+      added_at: now,
+      last_seen: null,
+      crew_version: null,
+      notes: opts.notes ?? null,
+    };
+  }
+
+  getMachine(name: string): Machine | null {
+    return this.db.prepare("SELECT * FROM machines WHERE name = ?").get(name) as Machine | null;
+  }
+
+  listMachines(): Machine[] {
+    return this.db.prepare("SELECT * FROM machines ORDER BY name").all() as Machine[];
+  }
+
+  /**
+   * Remove a machine by name. Refuses to delete the local machine —
+   * every crew DB needs to retain self-knowledge so agents.machine_name
+   * JOINs against machines still resolve for locally-spawned rows.
+   */
+  deleteMachine(name: string): void {
+    if (name === this.localMachineName()) {
+      throw new Error(
+        `deleteMachine: refusing to remove local machine '${name}'. ` +
+        `The local machine is auto-registered on every boot and is required ` +
+        `for agents.machine_name joins to resolve.`,
+      );
+    }
+    this.db.prepare("DELETE FROM machines WHERE name = ?").run(name);
+  }
+
+  updateMachineProbe(name: string, opts: { last_seen: number; crew_version?: string }): void {
+    this.db.prepare(
+      "UPDATE machines SET last_seen = ?, crew_version = COALESCE(?, crew_version) WHERE name = ?"
+    ).run(opts.last_seen, opts.crew_version ?? null, name);
   }
 }

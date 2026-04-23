@@ -213,6 +213,60 @@ describe("idle TTL + reaper", () => {
   });
 });
 
+describe("machine-aware crew (v2.4.0)", () => {
+  test("first-boot auto-registers the local machine", () => {
+    const machines = orch.store.listMachines();
+    expect(machines).toHaveLength(1);
+    expect(machines[0].name).toBe(orch.store.localMachineName());
+    expect(machines[0].ssh_host).toBe("localhost");
+  });
+
+  test("launchAgent stamps machine_name on the agent row", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "mx" } });
+    const agent = orch.store.getAgent("mx");
+    expect(agent?.machine_name).toBe(orch.store.localMachineName());
+  });
+
+  test("createMachine + listMachines round-trip", () => {
+    orch.store.createMachine({
+      name: "home-mini",
+      hostname: "home-mini",
+      ssh_host: "tim@home-mini.local",
+    });
+    const names = orch.store.listMachines().map((m) => m.name).sort();
+    expect(names).toContain("home-mini");
+    expect(names).toContain(orch.store.localMachineName());
+  });
+
+  test("deleteMachine refuses to remove the local machine", () => {
+    expect(() => orch.store.deleteMachine(orch.store.localMachineName())).toThrow(
+      /refusing to remove local machine/,
+    );
+  });
+
+  test("deleteMachine removes non-local rows", () => {
+    orch.store.createMachine({
+      name: "other",
+      hostname: "other",
+      ssh_host: "tim@other.local",
+    });
+    orch.store.deleteMachine("other");
+    expect(orch.store.getMachine("other")).toBeNull();
+  });
+
+  test("updateMachineProbe refreshes last_seen and crew_version", () => {
+    orch.store.createMachine({
+      name: "probe-target",
+      hostname: "probe-target",
+      ssh_host: "tim@probe-target.local",
+    });
+    orch.store.updateMachineProbe("probe-target", { last_seen: 12345, crew_version: "2.4.0" });
+    const m = orch.store.getMachine("probe-target");
+    expect(m?.last_seen).toBe(12345);
+    expect(m?.crew_version).toBe("2.4.0");
+  });
+});
+
 describe("spawn manifest + tombstones", () => {
   test("launchAgent persists a manifest stripped of AGENT_PRIVATE_KEY", async () => {
     await orch.launchAgent({

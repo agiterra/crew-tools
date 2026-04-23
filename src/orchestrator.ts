@@ -6,7 +6,7 @@
  */
 
 import { join } from "path";
-import { CrewStore, type Agent, type Tab, type Pane, type AgentTombstone } from "./store.js";
+import { CrewStore, type Agent, type Tab, type Pane, type AgentTombstone, type Machine } from "./store.js";
 import * as screen from "./screen.js";
 import type { TerminalBackend } from "./terminal.js";
 import { getLaunchCommand } from "./runtimes.js";
@@ -1181,6 +1181,114 @@ export class Orchestrator {
     }
 
     return { updated, errors };
+  }
+
+  // --- Machines (cross-machine orchestration registry) ---
+
+  /**
+   * Register a machine in the local crew DB so crew-fleet can fan-out
+   * queries + handoffs to it. Probes SSH reachability; refuses to
+   * register unreachable hosts unless `skipProbe` is set.
+   */
+  async registerMachine(opts: {
+    name: string;
+    sshHost: string;
+    sshPort?: number;
+    notes?: string;
+    skipProbe?: boolean;
+  }): Promise<Machine> {
+    const existing = this.store.getMachine(opts.name);
+    if (existing) {
+      throw new Error(
+        `registerMachine: '${opts.name}' is already registered (ssh_host='${existing.ssh_host}'). ` +
+        `Call machine_remove first if you want to re-register.`,
+      );
+    }
+    let probedHostname = opts.name;
+    let crewVersion: string | undefined;
+    if (!opts.skipProbe) {
+      const probe = await this.probeMachineSsh(opts.sshHost, opts.sshPort);
+      if (!probe.reachable) {
+        throw new Error(
+          `registerMachine: SSH probe to '${opts.sshHost}' failed: ${probe.error ?? "unreachable"}. ` +
+          `Pass skipProbe: true to register anyway.`,
+        );
+      }
+      probedHostname = probe.hostname ?? opts.name;
+      crewVersion = probe.crewVersion;
+    }
+    const row = this.store.createMachine({
+      name: opts.name,
+      hostname: probedHostname,
+      ssh_host: opts.sshHost,
+      ssh_port: opts.sshPort,
+      notes: opts.notes,
+    });
+    if (crewVersion) {
+      this.store.updateMachineProbe(opts.name, { last_seen: Date.now(), crew_version: crewVersion });
+    }
+    return this.store.getMachine(opts.name) ?? row;
+  }
+
+  listMachines(): Machine[] {
+    return this.store.listMachines();
+  }
+
+  removeMachine(name: string): void {
+    this.store.deleteMachine(name);
+  }
+
+  /**
+   * Re-probe a registered machine. Updates `last_seen` and `crew_version`
+   * in the DB. Returns the probe result.
+   */
+  async probeMachine(name: string): Promise<{ reachable: boolean; hostname?: string; crewVersion?: string; error?: string }> {
+    const m = this.store.getMachine(name);
+    if (!m) throw new Error(`probeMachine: '${name}' not registered`);
+    const probe = await this.probeMachineSsh(m.ssh_host, m.ssh_port ?? undefined);
+    if (probe.reachable) {
+      this.store.updateMachineProbe(name, {
+        last_seen: Date.now(),
+        crew_version: probe.crewVersion,
+      });
+    }
+    return probe;
+  }
+
+  /**
+   * Low-level SSH probe: `ssh <host> 'hostname && bun ... --version'`.
+   * Returns reachable + remote hostname + crew version (if detectable).
+   * All failures reduce to `{ reachable: false, error }` so callers get a
+   * uniform shape. Timeout is 5 seconds.
+   */
+  private async probeMachineSsh(
+    sshHost: string,
+    sshPort?: number,
+  ): Promise<{ reachable: boolean; hostname?: string; crewVersion?: string; error?: string }> {
+    try {
+      const portArg = sshPort ? ["-p", String(sshPort)] : [];
+      const proc = Bun.spawn(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ...portArg, sshHost, "hostname && (cat ~/.claude/plugins/cache/agiterra/crew/*/package.json 2>/dev/null | grep '\"version\"' | head -1 || true)"],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const exitCode = await proc.exited;
+      if (exitCode !== 0) {
+        const err = await new Response(proc.stderr).text();
+        return { reachable: false, error: err.trim() || `exit ${exitCode}` };
+      }
+      const out = (await new Response(proc.stdout).text()).trim().split("\n");
+      const remoteHost = out[0]?.toLowerCase() ?? undefined;
+      const versionLine = out.find((l) => l.includes('"version"'));
+      const versionMatch = versionLine?.match(/"version":\s*"([^"]+)"/);
+      return {
+        reachable: true,
+        hostname: remoteHost,
+        crewVersion: versionMatch?.[1],
+      };
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { reachable: false, error: msg };
+    }
   }
 
   // --- Reconciler ---
