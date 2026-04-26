@@ -25,12 +25,15 @@ import pkg from "../package.json" with { type: "json" };
 const USAGE = `Usage: crew <command> [args]
 
 Commands:
-  version                           Print crew-tools version.
-  launch  --json <path|->           Launch a fresh agent. JSON opts fed to Orchestrator.launchAgent().
-                                    Use '-' to read from stdin (preferred for secrets like AGENT_PRIVATE_KEY).
-  resume  --json <path|->           Resume a stopped agent.
-  stop    <id> [--cc-session-id ID] Stop an agent. Matches crew's agent_stop MCP tool.
-  agent-send <id> <text>            Send keystrokes to an agent's screen.
+  version                                  Print crew-tools version.
+  launch  --json <path|->                  Launch a fresh agent. JSON opts fed to Orchestrator.launchAgent().
+                                           Use '-' to read from stdin (preferred for secrets like AGENT_PRIVATE_KEY).
+  resume  --json <path|->                  Resume a stopped agent.
+  stop    <id> [--cc-session-id ID]        Stop an agent. Matches crew's agent_stop MCP tool.
+  agent-send <id> <text>                   Send keystrokes to an agent's screen.
+  machine-register --json <path|->         Register a peer machine in this DB. JSON: {name, ssh_host, ssh_port?, notes?, skip_probe?}.
+                                           Used by reciprocal pairing — laptop SSHes mini and runs this to add itself.
+  hostname                                 Print the local hostname (for reciprocal-pairing fallback).
 
 Exit codes: 0 success, 1 usage, 2 orchestrator error.
 `;
@@ -138,6 +141,43 @@ export async function runCli(argv: string[]): Promise<CliResult> {
       } catch (e) {
         return { exit: 2, stderr: `agent-send failed: ${(e as Error).message}\n` };
       }
+    }
+
+    case "machine-register": {
+      const flags = parseFlags(rest);
+      if (!flags.json) {
+        return { exit: 1, stderr: "machine-register requires --json <path-or-'-'>\n" };
+      }
+      let opts: Record<string, unknown>;
+      try {
+        opts = await readJsonArg(flags.json) as Record<string, unknown>;
+      } catch (e) {
+        return { exit: 1, stderr: `invalid JSON: ${(e as Error).message}\n` };
+      }
+      if (!opts.name || typeof opts.name !== "string") {
+        return { exit: 1, stderr: "machine-register JSON must include 'name'\n" };
+      }
+      if (!opts.ssh_host || typeof opts.ssh_host !== "string") {
+        return { exit: 1, stderr: "machine-register JSON must include 'ssh_host'\n" };
+      }
+      try {
+        const orch = new Orchestrator(await createBackend());
+        const m = await orch.registerMachine({
+          name: opts.name,
+          sshHost: opts.ssh_host,
+          sshPort: typeof opts.ssh_port === "number" ? opts.ssh_port : undefined,
+          notes: typeof opts.notes === "string" ? opts.notes : undefined,
+          skipProbe: Boolean(opts.skip_probe),
+        });
+        return { exit: 0, stdout: `${JSON.stringify(m)}\n` };
+      } catch (e) {
+        return { exit: 2, stderr: `machine-register failed: ${(e as Error).message}\n` };
+      }
+    }
+
+    case "hostname": {
+      const { hostname } = await import("os");
+      return { exit: 0, stdout: `${hostname().toLowerCase()}\n` };
     }
 
     default:

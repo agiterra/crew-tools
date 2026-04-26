@@ -1196,7 +1196,20 @@ export class Orchestrator {
     sshPort?: number;
     notes?: string;
     skipProbe?: boolean;
-  }): Promise<Machine> {
+    /**
+     * If true, after registering the destination locally, SSH to it and
+     * register the LOCAL machine in its DB too. Best-effort — SSH failure
+     * during reciprocal step is logged but does not undo the local
+     * registration.
+     *
+     * The local machine's reachable address from the destination's POV
+     * is `${USER}@${hostname}.local` by default; override via
+     * `localAddress`.
+     */
+    reciprocal?: boolean;
+    /** Override the local machine's reachable SSH address for the reciprocal call. */
+    localAddress?: string;
+  }): Promise<Machine & { reciprocal?: { ok: boolean; remote_record?: unknown; error?: string } }> {
     const existing = this.store.getMachine(opts.name);
     if (existing) {
       throw new Error(
@@ -1227,7 +1240,57 @@ export class Orchestrator {
     if (crewVersion) {
       this.store.updateMachineProbe(opts.name, { last_seen: Date.now(), crew_version: crewVersion });
     }
-    return this.store.getMachine(opts.name) ?? row;
+    const finalRow = this.store.getMachine(opts.name) ?? row;
+
+    // Reciprocal step: SSH the destination and run `crew machine-register`
+    // with our identity, so the destination's crew DB knows about us.
+    // Best-effort — failure here is logged but doesn't undo the local row.
+    if (opts.reciprocal) {
+      const localAddress = opts.localAddress ?? `${process.env.USER ?? "tim"}@${this.store.localMachineName()}.local`;
+      const reciprocal = await this.reciprocalRegister(
+        opts.sshHost,
+        opts.sshPort,
+        { name: this.store.localMachineName(), ssh_host: localAddress },
+      );
+      return { ...finalRow, reciprocal };
+    }
+
+    return finalRow;
+  }
+
+  /**
+   * SSH the destination and run `crew machine-register --json -` with
+   * our identity as the body. Used by reciprocal pairing. Returns a
+   * structured outcome — never throws.
+   */
+  private async reciprocalRegister(
+    sshHost: string,
+    sshPort: number | undefined,
+    selfRow: { name: string; ssh_host: string; ssh_port?: number; notes?: string },
+  ): Promise<{ ok: boolean; remote_record?: unknown; error?: string }> {
+    try {
+      const portArg = sshPort ? ["-p", String(sshPort)] : [];
+      // Send the JSON via stdin so it doesn't show in the SSH audit log.
+      const proc = Bun.spawn(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ...portArg, sshHost, "crew machine-register --json -"],
+        { stdin: "pipe", stdout: "pipe", stderr: "pipe" },
+      );
+      const stdin = (proc as unknown as { stdin: { write: (s: string) => void; end: () => void } }).stdin;
+      stdin.write(JSON.stringify(selfRow));
+      stdin.end();
+      const exitCode = await proc.exited;
+      const stdout = (await new Response(proc.stdout).text()).trim();
+      const stderr = (await new Response(proc.stderr).text()).trim();
+      if (exitCode !== 0) {
+        return { ok: false, error: stderr || `exit ${exitCode}` };
+      }
+      let remote_record: unknown = stdout;
+      try { remote_record = JSON.parse(stdout); } catch { /* keep as raw */ }
+      return { ok: true, remote_record };
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { ok: false, error: msg };
+    }
   }
 
   listMachines(): Machine[] {

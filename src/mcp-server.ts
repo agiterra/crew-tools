@@ -580,7 +580,8 @@ export async function startServer(): Promise<void> {
           ssh_port: { type: "number", description: "Optional SSH port. Default: 22." },
           notes: { type: "string", description: "Free-form notes." },
           skip_probe: { type: "boolean", description: "Skip the SSH reachability check at register time (default false)." },
-          reciprocal: { type: "boolean", description: "If true, SSH to the destination and register the local machine there too. (Best-effort; failure is non-fatal.)" },
+          reciprocal: { type: "boolean", description: "If true, after registering the destination, SSH to it and register the LOCAL machine in its DB. Best-effort — SSH failure during reciprocal step does not undo the local row." },
+          local_address: { type: "string", description: "Override the SSH-reachable address of the local machine for the reciprocal call. Defaults to '${USER}@${hostname}.local'." },
         },
         required: ["name", "ssh_host"],
       },
@@ -819,23 +820,15 @@ export async function startServer(): Promise<void> {
           result = { report: await orchestrator.reconcile() };
           break;
         case "machine_register": {
-          const m = await orchestrator.registerMachine({
+          result = await orchestrator.registerMachine({
             name: a.name as string,
             sshHost: a.ssh_host as string,
             sshPort: a.ssh_port as number | undefined,
             notes: a.notes as string | undefined,
             skipProbe: Boolean(a.skip_probe),
+            reciprocal: Boolean(a.reciprocal),
+            localAddress: a.local_address as string | undefined,
           });
-          // Best-effort reciprocal: SSH to the destination and run
-          // `claude -p` / equivalent to invoke its own machine_register
-          // pointing back at us. For now we only note the intent; the
-          // reciprocal wiring lands with crew-fleet (#50) where we have
-          // a clean remote-MCP-invoke primitive.
-          if (a.reciprocal) {
-            result = { ...m, reciprocal_note: "reciprocal registration deferred to crew-fleet; register on the remote side manually for now" };
-          } else {
-            result = m;
-          }
           break;
         }
         case "machine_list":
