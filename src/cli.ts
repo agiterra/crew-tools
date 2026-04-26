@@ -26,9 +26,10 @@ const USAGE = `Usage: crew <command> [args]
 
 Commands:
   version                           Print crew-tools version.
-  resume --json <path|->            Resume an agent. JSON opts fed to Orchestrator.resumeAgent().
-                                    Use '-' to read from stdin (preferred for secrets).
-  stop <id> [--cc-session-id ID]    Stop an agent. Matches crew's agent_stop MCP tool.
+  launch  --json <path|->           Launch a fresh agent. JSON opts fed to Orchestrator.launchAgent().
+                                    Use '-' to read from stdin (preferred for secrets like AGENT_PRIVATE_KEY).
+  resume  --json <path|->           Resume a stopped agent.
+  stop    <id> [--cc-session-id ID] Stop an agent. Matches crew's agent_stop MCP tool.
   agent-send <id> <text>            Send keystrokes to an agent's screen.
 
 Exit codes: 0 success, 1 usage, 2 orchestrator error.
@@ -63,6 +64,30 @@ export async function runCli(argv: string[]): Promise<CliResult> {
   switch (cmd) {
     case "version":
       return { exit: 0, stdout: `${pkg.version}\n` };
+
+    case "launch": {
+      const flags = parseFlags(rest);
+      if (!flags.json) {
+        return { exit: 1, stderr: "launch requires --json <path-or-'-'>\n" };
+      }
+      let opts: Record<string, unknown>;
+      try {
+        opts = await readJsonArg(flags.json) as Record<string, unknown>;
+      } catch (e) {
+        return { exit: 1, stderr: `invalid JSON: ${(e as Error).message}\n` };
+      }
+      const env = opts.env as Record<string, string> | undefined;
+      if (!env || typeof env !== "object" || !env.AGENT_ID) {
+        return { exit: 1, stderr: "launch JSON must include 'env' object with at least AGENT_ID\n" };
+      }
+      try {
+        const orch = new Orchestrator(await createBackend());
+        const agent = await orch.launchAgent(opts as Parameters<Orchestrator["launchAgent"]>[0]);
+        return { exit: 0, stdout: `${JSON.stringify(agent)}\n` };
+      } catch (e) {
+        return { exit: 2, stderr: `launch failed: ${(e as Error).message}\n` };
+      }
+    }
 
     case "resume": {
       const flags = parseFlags(rest);

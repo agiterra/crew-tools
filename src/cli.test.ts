@@ -53,6 +53,20 @@ describe("crew CLI", () => {
     expect(r.stderr).toMatch(/unknown command: bogus/);
   });
 
+  test("launch without --json exits 1", async () => {
+    const r = await runCli(["launch"]);
+    expect(r.exit).toBe(1);
+    expect(r.stderr).toMatch(/requires --json/);
+  });
+
+  test("launch with JSON missing 'env.AGENT_ID' exits 1", async () => {
+    const p = join(tmpDir, "launch-bad.json");
+    writeFileSync(p, JSON.stringify({ env: { FOO: "bar" } }));
+    const r = await runCli(["launch", "--json", p]);
+    expect(r.exit).toBe(1);
+    expect(r.stderr).toMatch(/AGENT_ID/);
+  });
+
   test("resume without --json exits 1", async () => {
     const r = await runCli(["resume"]);
     expect(r.exit).toBe(1);
