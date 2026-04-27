@@ -12,7 +12,7 @@
  *   ${PROJECT_DIR}  — Working directory for the agent
  */
 
-import { existsSync, readFileSync } from "fs";
+import { existsSync, readFileSync, statSync } from "fs";
 import { join } from "path";
 
 export type RuntimeConfig = {
@@ -33,13 +33,24 @@ const DEFAULTS: Record<string, RuntimeConfig> = {
 
 const CONFIG_PATH = join(process.env.HOME ?? "/tmp", ".wire", "runtimes.json");
 
-let _cache: Record<string, RuntimeConfig> | null = null;
+let _cache: { runtimes: Record<string, RuntimeConfig>; mtimeMs: number } | null = null;
 
 /**
  * Load runtime registry: defaults merged with user config.
+ *
+ * Cache is invalidated when ~/.wire/runtimes.json's mtime changes, so
+ * edits are picked up without restarting the host process. Without this,
+ * a long-lived crew MCP would never see runtime overrides written after
+ * its own startup — which silently broke a Beignet codex spawn on
+ * 2026-04-27 (orchestrator launched plain `codex` instead of the
+ * `~/.wire/codex-launch.sh` override defined after the MCP started).
  */
 export function loadRuntimes(): Record<string, RuntimeConfig> {
-  if (_cache) return _cache;
+  let currentMtimeMs = 0;
+  if (existsSync(CONFIG_PATH)) {
+    try { currentMtimeMs = statSync(CONFIG_PATH).mtimeMs; } catch { /* fall through */ }
+  }
+  if (_cache && _cache.mtimeMs === currentMtimeMs) return _cache.runtimes;
 
   const runtimes = { ...DEFAULTS };
 
@@ -58,7 +69,7 @@ export function loadRuntimes(): Record<string, RuntimeConfig> {
     }
   }
 
-  _cache = runtimes;
+  _cache = { runtimes, mtimeMs: currentMtimeMs };
   return runtimes;
 }
 
