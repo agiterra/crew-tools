@@ -33,14 +33,19 @@ const DEFAULTS: Record<string, RuntimeConfig> = {
 
 const CONFIG_PATH = join(process.env.HOME ?? "/tmp", ".wire", "runtimes.json");
 
-let _cache: Record<string, RuntimeConfig> | null = null;
-
 /**
  * Load runtime registry: defaults merged with user config.
+ *
+ * Re-reads ~/.wire/runtimes.json on every call. The file is tiny and
+ * agent_launch is rare; the previous module-level cache silently ignored
+ * runtimes.json edits made after process startup. That bit four codex
+ * spawns across 2026-04-27 / 04-28 / 04-29 (Beignet, Madeleine, Cruller,
+ * Strudel) — each agent ran the default `codex` command bypassing the
+ * `~/.wire/codex-launch.sh` override, even after CC restarts. Read-fresh
+ * removes the bug class entirely; no race between restart, MCP child
+ * orphaning, and edits to runtimes.json.
  */
 export function loadRuntimes(): Record<string, RuntimeConfig> {
-  if (_cache) return _cache;
-
   const runtimes = { ...DEFAULTS };
 
   if (existsSync(CONFIG_PATH)) {
@@ -58,7 +63,6 @@ export function loadRuntimes(): Record<string, RuntimeConfig> {
     }
   }
 
-  _cache = runtimes;
   return runtimes;
 }
 
