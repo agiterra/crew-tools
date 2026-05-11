@@ -124,8 +124,37 @@ export async function detachSession(name: string): Promise<void> {
 
 /**
  * Send keystrokes to a screen session (works even when detached).
+ *
+ * If the text ends in `\r` or `\n` (and has a prefix), the call is split
+ * into two `stuff` invocations with a brief settle delay between:
+ *
+ *   1. stuff prefix    — types the visible text
+ *   2. sleep ~100ms    — lets the receiving REPL settle
+ *   3. stuff submit    — fires the Enter key
+ *
+ * Why: when screen stuffs `"text\r"` in a single event, the receiving
+ * application sometimes sees the CR before the prefix has fully landed
+ * in its input buffer. The lingering CR then has to be cleared by the
+ * caller with a manual backspace + retry. Splitting into two events
+ * with a settle gap mirrors what a human types and avoids the
+ * race entirely.
+ *
+ * Affects CC slash commands (e.g. `/exit\r`), codex REPL submissions,
+ * and any agent_send/pane_send caller that appends a submit key.
+ * (orchestrator.closeAgent already does this manually; auto-splitting
+ * here means callers no longer have to remember to.)
  */
 export async function sendKeys(name: string, text: string): Promise<void> {
+  if (text.length > 1) {
+    const last = text[text.length - 1];
+    if (last === "\r" || last === "\n") {
+      const prefix = text.slice(0, -1);
+      await $`${SCREEN} -S ${name} -X stuff ${prefix}`.quiet();
+      await new Promise((r) => setTimeout(r, 100));
+      await $`${SCREEN} -S ${name} -X stuff ${last}`.quiet();
+      return;
+    }
+  }
   await $`${SCREEN} -S ${name} -X stuff ${text}`.quiet();
 }
 
