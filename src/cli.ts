@@ -29,7 +29,8 @@ Commands:
   launch  --json <path|->                  Launch a fresh agent. JSON opts fed to Orchestrator.launchAgent().
                                            Use '-' to read from stdin (preferred for secrets like AGENT_PRIVATE_KEY).
   resume  --json <path|->                  Resume a stopped agent.
-  stop    <id> [--cc-session-id ID]        Stop an agent. Matches crew's agent_stop MCP tool.
+  close   <id> [--cc-session-id ID]        Gracefully close an agent (sends /exit + Enter, falls back to kill after 10s). Preferred over stop. Matches crew's agent_close MCP tool.
+  stop    <id> [--cc-session-id ID]        Hard-stop an agent (kills the screen session). Use only when the runtime is unresponsive. Matches crew's agent_stop MCP tool.
   agent-send <id> <text>                   Send keystrokes to an agent's screen.
   machine-register --json <path|->         Register a peer machine in this DB. JSON: {name, ssh_host, ssh_port?, notes?, skip_probe?}.
                                            Used by reciprocal pairing — laptop SSHes mini and runs this to add itself.
@@ -112,6 +113,19 @@ export async function runCli(argv: string[]): Promise<CliResult> {
         return { exit: 0, stdout: `${JSON.stringify(agent)}\n` };
       } catch (e) {
         return { exit: 2, stderr: `resume failed: ${(e as Error).message}\n` };
+      }
+    }
+
+    case "close": {
+      const id = rest[0];
+      if (!id) return { exit: 1, stderr: "close requires <id>\n" };
+      const flags = parseFlags(rest.slice(1));
+      try {
+        const orch = new Orchestrator(await createBackend());
+        await orch.closeAgent(id, flags["cc-session-id"] || undefined);
+        return { exit: 0, stdout: `${JSON.stringify({ closed: id })}\n` };
+      } catch (e) {
+        return { exit: 2, stderr: `close failed: ${(e as Error).message}\n` };
       }
     }
 

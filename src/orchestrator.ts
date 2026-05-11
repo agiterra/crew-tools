@@ -455,6 +455,67 @@ export class Orchestrator {
   }
 
   /**
+   * Close an agent gracefully.
+   *
+   * Sends `/exit` + Enter to the agent's screen session. The runtime (Claude
+   * Code, Codex, etc.) handles the slash command and exits cleanly, which
+   * fires its own SessionEnd hooks — including any wire-disconnect cleanup
+   * that lets server-side state machines hard-delete ephemerals immediately
+   * instead of waiting on the reaper grace.
+   *
+   * Falls back to killing the screen if the runtime hasn't exited within
+   * `timeoutMs` (default 10s). Caller gets the same end-state either way:
+   * pane badge cleared, agent tombstoned, screen gone.
+   *
+   * Prefer this over stopAgent for normal lifecycle. stopAgent is for cases
+   * where the runtime is unresponsive or you specifically want a hard kill.
+   */
+  async closeAgent(id: string, ccSessionId?: string, timeoutMs = 10_000): Promise<void> {
+    let agent: Agent | null;
+    if (ccSessionId) {
+      agent = this.store.getAgentBySession(ccSessionId);
+      if (!agent) throw new Error(`no agent with cc_session_id '${ccSessionId}'`);
+    } else {
+      agent = this.store.getAgent(id);
+      if (!agent) throw new Error(`agent '${id}' not found`);
+    }
+
+    if (agent.pane) {
+      const pane = this.store.getPane(agent.pane);
+      if (pane?.iterm_id) {
+        try { await this.terminal.setBadge(pane.iterm_id, ""); } catch {}
+      }
+    }
+
+    // Two sendKeys: type the slash command first, then press Enter. Splitting
+    // the keystrokes mirrors what a human types and avoids any runtime that
+    // might buffer-and-discard before the newline arrives.
+    try {
+      await screen.sendKeys(agent.screen_name, "/exit");
+      await new Promise((r) => setTimeout(r, 100));
+      await screen.sendKeys(agent.screen_name, "\n");
+    } catch (e) {
+      // Screen session may already be gone — fall through to cleanup.
+      console.error(`[crew] closeAgent: sendKeys failed for '${agent.id}': ${e}`);
+    }
+
+    // Wait for the runtime to exit on its own. Polls every 250ms.
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!(await screen.isAlive(agent.screen_name))) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+
+    if (await screen.isAlive(agent.screen_name)) {
+      console.error(`[crew] closeAgent: '${agent.id}' did not exit within ${timeoutMs}ms — hard-killing screen`);
+      await screen.killSession(agent.screen_name);
+    }
+
+    this.store.tombstoneAgent(agent);
+    this.store.deleteAgentByScreen(agent.screen_name);
+  }
+
+  /**
    * Stop an agent — kills the screen session.
    * Accepts optional ccSessionId to target a specific instance during handoff.
    */
