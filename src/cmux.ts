@@ -130,7 +130,11 @@ export class CmuxBackend implements TerminalBackend {
 
   async createTab(_profileName?: string): Promise<string> {
     // profileName is iTerm2-only (dynamic profiles) — cmux ignores it.
-    const output = await cmux("new-workspace");
+    // --focus true is required: cmux 0.64+ lazy-instantiates terminals,
+    // so the workspace's initial surface has no backing PTY until focused.
+    // Without this, attaching screen to the surface fails with
+    // "Surface is not a terminal" / "Terminal surface not found".
+    const output = await cmux("new-workspace", "--focus", "true");
     // Output: "OK workspace:N"
     // We need the surface ref of the new workspace's initial surface.
     // List panes in the new workspace to get it.

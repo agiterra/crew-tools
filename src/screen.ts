@@ -8,13 +8,23 @@
  */
 
 import { $ } from "bun";
+import { existsSync } from "node:fs";
 import { join } from "path";
 
-// Resolve screen binary: prefer homebrew 5.x (color support) over macOS built-in 4.0
+// Resolve screen binary: prefer homebrew 5.x (color support) over macOS built-in 4.0.
+// macOS screen 4.0 and homebrew screen 5.x use DIFFERENT default socket directories
+// (`/var/folders/.../T/.screen` vs `~/.screen`), so if PATH resolution differs across
+// bun MCP instances, one instance may create sessions invisible to another instance's
+// `screen -ls`. The reconciler then treats live agents as dead and deletes their DB
+// rows. Pinning a known path eliminates that drift.
 async function findScreen(): Promise<string> {
+  const preferred = ["/opt/homebrew/bin/screen", "/usr/local/bin/screen"];
+  for (const path of preferred) {
+    if (existsSync(path)) return path;
+  }
   try {
     const result = await $`command -v screen`.quiet();
-    return result.stdout.toString().trim();
+    return result.stdout.toString().trim() || "screen";
   } catch {
     return "screen";
   }
@@ -39,7 +49,12 @@ export async function createSession(
   // Bun's $ escapes interpolated values, but screen passes remaining args
   // as argv to the child — so "zsh -lc 'cd /a && cmd'" gets split at &&.
   const shell = process.env.SHELL ?? "/bin/zsh";
-  const screenrc = join(process.env.HOME ?? "/tmp", ".wire", "screenrc");
+  const wireDir = join(process.env.HOME ?? "/tmp", ".wire");
+  const screenrc = join(wireDir, "screenrc");
+  // Defensive: `screen -c <missing-file>` fails silently. Ensure the screenrc
+  // exists (empty is fine) so a fresh install — where the wire installer
+  // hasn't yet written this file — doesn't break agent launches.
+  await $`mkdir -p ${wireDir} && touch -a ${screenrc}`.quiet().nothrow();
   const scriptFile = `/tmp/crew-launch-${name}-${Date.now()}.sh`;
   await Bun.write(scriptFile, `#!/usr/bin/env -S ${shell} -l\nrm -f '${scriptFile}'\n${command}\n`);
   await $`chmod +x ${scriptFile}`.quiet();
