@@ -177,10 +177,13 @@ export class Orchestrator {
     // Create screen session
     const session = await screen.createSession(screenName, fullCommand);
 
-    // Auto-confirm the dev channels prompt (sends Enter after a delay)
+    // Auto-confirm the dev channels prompt (sends Enter after a delay).
+    // Send CR (\r), not LF (\n) — Claude's dev-channel prompt only dismisses
+    // on a carriage return. Verified empirically; the previous \n was a
+    // no-op and left agents stuck on the prompt.
     setTimeout(async () => {
       try {
-        await screen.sendKeys(screenName, "\n");
+        await screen.sendKeys(screenName, "\r");
       } catch (e) {
         console.error(`[crew] failed to auto-confirm dev-channel prompt for ${id}:`, e);
       }
@@ -403,9 +406,10 @@ export class Orchestrator {
     const session = await screen.createSession(screenName, fullCommand);
 
     // Auto-confirm dev-channel prompt (same cadence as launchAgent).
+    // CR not LF — see launchAgent for the empirical confirmation.
     setTimeout(async () => {
       try {
-        await screen.sendKeys(screenName, "\n");
+        await screen.sendKeys(screenName, "\r");
       } catch (e) {
         console.error(`[crew] failed to auto-confirm dev-channel prompt for resumed '${opts.id}':`, e);
       }
