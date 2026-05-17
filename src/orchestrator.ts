@@ -13,6 +13,7 @@ import { getLaunchCommand } from "./runtimes.js";
 import { reconcile, formatReport } from "./reconciler.js";
 import { pickName, backgroundImagePath, loadTheme, updateTheme, listThemes } from "./themes.js";
 import { getClaudeCodeSessionId } from "./claude-session.js";
+import { readSponsorFromEnv, sponsorChild } from "./autosponsor.js";
 
 const DEFAULT_DB = join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
 const SCREEN_PREFIX = "wire-";
@@ -138,6 +139,27 @@ export class Orchestrator {
     const id = opts.env.AGENT_ID;
     if (!id) throw new Error("env.AGENT_ID is required");
     const displayName = opts.env.AGENT_NAME ?? id;
+
+    // Auto-sponsor: if the caller didn't supply a Wire private key in env,
+    // try to register a fresh keypair for the child using the crew MCP's
+    // own Wire identity as sponsor. No-op when crew has no identity in
+    // its own env — child launches headless (current behavior).
+    //
+    // Inject under CREW_PRIVATE_KEY since that's what wire-tools' MCP
+    // actually reads. AGENT_PRIVATE_KEY is recognized by the orchestrator
+    // (stripped from manifest) but ignored by wire-tools — historic
+    // naming drift, documented separately.
+    const callerSuppliedKey =
+      opts.env.CREW_PRIVATE_KEY ?? opts.env.WIRE_PRIVATE_KEY ?? opts.env.AGENT_PRIVATE_KEY;
+    if (!callerSuppliedKey) {
+      const sponsor = await readSponsorFromEnv();
+      if (sponsor && sponsor.agentId !== id) {
+        const child = await sponsorChild(sponsor, id, displayName);
+        if (child) {
+          opts.env = { ...opts.env, CREW_PRIVATE_KEY: child.privateKeyB64 };
+        }
+      }
+    }
 
     const runtime = opts.runtime ?? "claude-code";
     let screenName = `${SCREEN_PREFIX}${id}`;
