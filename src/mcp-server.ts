@@ -186,6 +186,19 @@ export async function startServer(): Promise<void> {
             description:
               "Optional idle TTL in minutes. If set, crew's reaper stops the agent once it has been idle (no agent_send / agent_attach / status update) for longer than this. Use for ephemeral spawns (e.g. indexing sidecars) that should self-clean rather than run forever.",
           },
+          split_in_caller_workspace: {
+            type: "object",
+            description:
+              "If set, after the agent's screen session is up, split the caller's terminal surface and attach the agent's screen into the new sibling pane. Best-effort UX sugar — failures (no caller surface, backend doesn't support it, split refused) leave the agent headless. Today only the cmux backend implements this; iTerm2 silently ignores it. The new surface is NOT registered as a crew pane.",
+            properties: {
+              direction: {
+                type: "string",
+                enum: ["right", "down"],
+                description: "Which side of the caller's surface to put the new pane on.",
+              },
+            },
+            required: ["direction"],
+          },
         },
         required: ["env"],
       },
@@ -657,6 +670,7 @@ export async function startServer(): Promise<void> {
             prompt: a.prompt as string | undefined,
             badge: a.badge as string | undefined,
             ttlIdleMinutes: a.ttl_idle_minutes as number | undefined,
+            splitInCallerWorkspace: a.split_in_caller_workspace as { direction: "right" | "down" } | undefined,
           });
           break;
         }

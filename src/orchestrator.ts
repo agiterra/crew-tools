@@ -50,11 +50,33 @@ export type SpawnManifest = {
   ttl_idle_minutes?: number;
   /** Only populated for resume-style spawns. */
   channels?: string[];
+  /**
+   * Auxiliary terminal surface created via splitInCallerWorkspace. Remembered
+   * so closeAgent / stopAgent can also tear the pane down. Best-effort —
+   * if cleanup fails, the agent's lifecycle still completes.
+   */
+  aux_surface?: string;
 };
 
 /** Escape a string for use in a shell command. */
 function shellEscape(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Extract the recorded aux_surface (caller-workspace split) id from a
+ * persisted spawn manifest, if any. Returns undefined when the manifest
+ * is missing, malformed, or has no aux surface — caller treats those
+ * identically (nothing to clean up).
+ */
+function readAuxSurface(spawnManifest: string | null): string | undefined {
+  if (!spawnManifest) return undefined;
+  try {
+    const m = JSON.parse(spawnManifest) as SpawnManifest;
+    return m.aux_surface;
+  } catch {
+    return undefined;
+  }
 }
 
 export class Orchestrator {
@@ -100,6 +122,18 @@ export class Orchestrator {
      * status update, so the timer restarts on real activity.
      */
     ttlIdleMinutes?: number;
+    /**
+     * If set, after the agent's headless screen session is up, split the
+     * caller's terminal surface and attach the agent's screen into the new
+     * sibling pane. Best-effort: failures (no caller surface, backend
+     * doesn't support per-caller splits, cmux refuses) leave the agent
+     * headless and are logged, not raised.
+     *
+     * Only honored by backends that implement
+     * {@link TerminalBackend.splitFromCallerForAgent} (cmux today;
+     * iTerm2 leaves it undefined and the orchestrator skips this step).
+     */
+    splitInCallerWorkspace?: { direction: "right" | "down" };
   }): Promise<Agent> {
     const id = opts.env.AGENT_ID;
     if (!id) throw new Error("env.AGENT_ID is required");
@@ -152,9 +186,56 @@ export class Orchestrator {
       }
     }, 3000);
 
+    // Best-effort: if the caller asked to be split next to the new agent,
+    // and the backend supports per-caller splits (cmux today, iTerm2
+    // never), split the caller's surface and attach the agent's screen
+    // into the new sibling pane. Failures are logged, not raised — the
+    // agent's headless screen session is the source of truth; this is
+    // pure UX sugar.
+    //
+    // We intentionally do NOT register the new surface as a crew pane.
+    // The crew pane model is tab-rooted (panes belong to a named tab in
+    // the DB) and we have no reliable tab handle for an ad-hoc caller-
+    // workspace split. Treating it as a transient view keeps the DB
+    // honest: agent.pane stays null (headless from crew's POV) even
+    // while the user sees a live screen attached.
+    //
+    // We DO remember the surface id in the spawn manifest so closeAgent /
+    // stopAgent can tear the pane down alongside the agent. Otherwise the
+    // pane lingers showing an exited screen session after the agent dies.
+    let auxSurface: string | undefined;
+    if (opts.splitInCallerWorkspace && this.terminal.splitFromCallerForAgent) {
+      try {
+        const callerId = await this.terminal.currentSessionId();
+        if (callerId) {
+          const newSurface = await this.terminal.splitFromCallerForAgent(
+            callerId,
+            opts.splitInCallerWorkspace.direction,
+          );
+          if (newSurface) {
+            auxSurface = newSurface;
+            // Attach the agent's screen to the new visible pane. We use a
+            // small delay so the freshly-created surface has time to spawn
+            // its shell PTY before we shove a screen -r command at it.
+            await new Promise((r) => setTimeout(r, 300));
+            await this.terminal.writeToSession(newSurface, `screen -r ${screenName}\n`);
+          } else {
+            console.error(`[crew] split_in_caller_failed: backend returned null for agent '${id}'`);
+          }
+        } else {
+          console.error(`[crew] split_in_caller_failed: no caller surface detected for agent '${id}'`);
+        }
+      } catch (e) {
+        console.error(`[crew] split_in_caller_failed for agent '${id}':`, e);
+      }
+    }
+
     // Persist a sanitized manifest alongside the agent row so agent_resume
     // can reconstruct the spawn later. AGENT_PRIVATE_KEY is stripped — the
     // caller re-provisions identity via register_agent on resume.
+    // aux_surface is recorded last because it's only known after the split
+    // block ran; closeAgent / stopAgent use it to clean the caller-workspace
+    // pane alongside the agent.
     const manifest: SpawnManifest = {
       env: sanitizeEnv(opts.env),
       runtime,
@@ -164,6 +245,7 @@ export class Orchestrator {
       badge: opts.badge,
       display_name: displayName,
       ttl_idle_minutes: opts.ttlIdleMinutes,
+      aux_surface: auxSurface,
     };
 
     // Record in DB
@@ -487,6 +569,8 @@ export class Orchestrator {
       }
     }
 
+    const auxSurface = readAuxSurface(agent.spawn_manifest);
+
     // Two sendKeys: type the slash command first, then press Enter. Splitting
     // the keystrokes mirrors what a human types and avoids any runtime that
     // might buffer-and-discard before the newline arrives.
@@ -510,6 +594,8 @@ export class Orchestrator {
       console.error(`[crew] closeAgent: '${agent.id}' did not exit within ${timeoutMs}ms — hard-killing screen`);
       await screen.killSession(agent.screen_name);
     }
+
+    await this.cleanupAuxSurface(agent.id, auxSurface);
 
     this.store.tombstoneAgent(agent);
     this.store.deleteAgentByScreen(agent.screen_name);
@@ -540,10 +626,30 @@ export class Orchestrator {
       }
     }
 
+    const auxSurface = readAuxSurface(agent.spawn_manifest);
+
     await screen.killSession(agent.screen_name);
+    await this.cleanupAuxSurface(agent.id, auxSurface);
     // Leave a tombstone so agent_resume can reconstruct the spawn later.
     this.store.tombstoneAgent(agent);
     this.store.deleteAgentByScreen(agent.screen_name);
+  }
+
+  /**
+   * Close the caller-workspace pane that was created via
+   * splitInCallerWorkspace at launch time, if any. Best-effort — a missing
+   * or already-closed surface is normal (operator closed the pane manually,
+   * cmux restarted, etc.). Failures are logged, never raised: the agent's
+   * tombstone path is the source of truth and must not be blocked by UX
+   * cleanup. iTerm2 never records an aux_surface so this is a no-op there.
+   */
+  private async cleanupAuxSurface(agentId: string, auxSurface: string | undefined): Promise<void> {
+    if (!auxSurface) return;
+    try {
+      await this.terminal.closeSession(auxSurface);
+    } catch (e) {
+      console.error(`[crew] cleanupAuxSurface: failed to close '${auxSurface}' for agent '${agentId}': ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   /**

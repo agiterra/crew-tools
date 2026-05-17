@@ -147,6 +147,24 @@ export interface TerminalBackend {
     url: string,
     direction: "horizontal" | "vertical",
   ): Promise<string>;
+
+  // --- Caller-workspace split (optional, cmux-only today) ---
+
+  /**
+   * Split a caller's surface in the caller's workspace, returning the new
+   * surface ref. Used when launching a headless agent that should
+   * immediately become visible as a sibling pane next to the caller.
+   *
+   * Optional: backends that have no equivalent (iTerm2 — agents are
+   * launched detached in screen sessions and attached separately) MUST
+   * leave this undefined. The orchestrator checks for presence before
+   * calling. Returning null signals best-effort failure (caller-side
+   * split unavailable; agent stays headless).
+   */
+  splitFromCallerForAgent?(
+    callerSurfaceId: string,
+    direction: "right" | "down",
+  ): Promise<string | null>;
 }
 
 /** Supported terminal backend types. */

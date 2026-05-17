@@ -268,4 +268,27 @@ export class CmuxBackend implements TerminalBackend {
     if (match) return match[0];
     throw new Error(`cmux browser split failed: ${output}`);
   }
+
+  /**
+   * Split the caller's surface in the caller's workspace and return the
+   * new surface ref. Used by orchestrator.launchAgent when the caller
+   * wants the new agent to appear right next to them.
+   *
+   * Returns the new surface ref on success, null on failure (caller
+   * surface invalid, cmux split refused, etc.). The orchestrator treats
+   * a null return as "best-effort failed — keep the agent headless."
+   */
+  async splitFromCallerForAgent(
+    callerSurfaceId: string,
+    direction: "right" | "down",
+  ): Promise<string | null> {
+    try {
+      const cmuxDir = direction === "right" ? "right" : "down";
+      const output = await cmux("new-split", cmuxDir, "--surface", callerSurfaceId);
+      const match = output.match(/surface:\d+/);
+      return match ? match[0] : null;
+    } catch {
+      return null;
+    }
+  }
 }
