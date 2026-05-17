@@ -181,11 +181,29 @@ export function updateTheme(
 
 /**
  * Validate and normalize a raw theme.json object.
+ *
+ * Accepts two shapes for back-compat:
+ *   1. Nested:  { background: { blend, mode, images }, badgeColors, ... }
+ *   2. Flat:    { blend, mode, images, badgeColors, ... }  ← crew-theme-peaks shipped this
+ * Top-level fields win when both are present.
  */
 function validateTheme(raw: any, fallbackName: string): ThemeConfig {
   const name = raw.name ?? fallbackName;
   const pool = Array.isArray(raw.pool) ? raw.pool : (POOLS[name] ?? []);
   const bg = raw.background ?? {};
+
+  const blend =
+    typeof raw.blend === "number" ? raw.blend
+    : typeof bg.blend === "number" ? bg.blend
+    : 0.5;
+  const mode =
+    typeof raw.mode === "number" ? raw.mode
+    : typeof bg.mode === "number" ? bg.mode
+    : 2;
+  const images =
+    (typeof raw.images === "object" && raw.images !== null) ? raw.images
+    : (typeof bg.images === "object" && bg.images !== null) ? bg.images
+    : {};
 
   return {
     name,
@@ -193,11 +211,9 @@ function validateTheme(raw: any, fallbackName: string): ThemeConfig {
     author: raw.author,
     version: raw.version,
     pool,
-    background: {
-      blend: typeof bg.blend === "number" ? bg.blend : 0.5,
-      mode: typeof bg.mode === "number" ? bg.mode : 2,
-      images: (typeof bg.images === "object" && bg.images !== null) ? bg.images : {},
-    },
+    background: { blend, mode, images },
+    badgeColors: raw.badgeColors ?? bg.badgeColors,
+    defaultBadgeColor: raw.defaultBadgeColor ?? bg.defaultBadgeColor,
   };
 }
 

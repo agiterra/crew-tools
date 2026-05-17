@@ -41,8 +41,61 @@ function parseSurfaceRef(output: string): string {
   return match[0];
 }
 
+/**
+ * Map cmux blend (0..1, 1=opaque) and mode (0=tile, 1=stretch, 2=scale-to-fill)
+ * onto cmux's surface.set_background RPC params (opacity, fit, repeat).
+ *
+ * The RPC accepts `fit: "cover" | "contain"`, `position`, `opacity`, `repeat`.
+ * iTerm's "mode" doesn't map cleanly; we pick the closest sensible default.
+ */
+function mapProfileToRpcParams(
+  surface: string,
+  image: string,
+  blend: number | undefined,
+  mode: number | undefined,
+): Record<string, unknown> {
+  const opacity = typeof blend === "number" ? Math.max(0, Math.min(1, blend)) : 0.5;
+  // 0 = tile → repeat=true, fit=contain
+  // 1 = stretch → fit=cover (closest in cmux), no repeat
+  // 2 = scale-to-fill → fit=cover, no repeat
+  let fit: "cover" | "contain" = "cover";
+  let repeat = false;
+  if (mode === 0) { fit = "contain"; repeat = true; }
+  else if (mode === 1) { fit = "cover"; }
+  return { surface, image, opacity, fit, position: "center", repeat };
+}
+
 export class CmuxBackend implements TerminalBackend {
   readonly name = "cmux" as const;
+
+  /**
+   * In-memory profile store. iTerm2 persists profiles to disk; cmux has no
+   * dynamic-profile concept, so we stash PaneProfile objects under synthetic
+   * names and resolve them when setProfile() / splitWithProfile() fire.
+   */
+  private profileStore = new Map<string, PaneProfile>();
+  private profileSeq = 0;
+
+  /**
+   * Apply a stored profile's background to a surface via cmux's RPC.
+   * Best-effort — failures (cmux down, surface gone, malformed image path)
+   * are logged but never thrown. Matches the rest of this class's policy.
+   */
+  private async applyProfileToSurface(sessionId: string, profileName: string): Promise<void> {
+    const profile = this.profileStore.get(profileName);
+    if (!profile || !profile.backgroundImage) return;
+    const params = mapProfileToRpcParams(
+      sessionId,
+      profile.backgroundImage,
+      profile.blend,
+      profile.mode,
+    );
+    try {
+      await cmux("rpc", "surface.set_background", JSON.stringify(params));
+    } catch (e) {
+      console.error(`[crew] cmux set-background failed for ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
 
   async currentSessionId(): Promise<string> {
     // Prefer env var (set automatically by cmux for child processes)
@@ -128,8 +181,7 @@ export class CmuxBackend implements TerminalBackend {
     }
   }
 
-  async createTab(_profileName?: string): Promise<string> {
-    // profileName is iTerm2-only (dynamic profiles) — cmux ignores it.
+  async createTab(profileName?: string): Promise<string> {
     // --focus true is required: cmux 0.64+ lazy-instantiates terminals,
     // so the workspace's initial surface has no backing PTY until focused.
     // Without this, attaching screen to the surface fails with
@@ -144,16 +196,20 @@ export class CmuxBackend implements TerminalBackend {
 
     // Get the tree to find the surface in this workspace
     const tree = await cmuxJson("tree");
+    let surfaceRef: string | null = null;
     for (const win of tree.windows ?? []) {
       for (const ws of win.workspaces ?? []) {
         if (ws.ref === wsRef) {
           const firstSurface = ws.panes?.[0]?.surfaces?.[0];
-          if (firstSurface) return firstSurface.ref;
+          if (firstSurface) surfaceRef = firstSurface.ref;
         }
       }
     }
-    // Fall back to workspace ref if we can't find the surface
-    return wsRef;
+    const result = surfaceRef ?? wsRef;
+    if (profileName && surfaceRef) {
+      await this.applyProfileToSurface(surfaceRef, profileName);
+    }
+    return result;
   }
 
   async setSessionName(sessionId: string, name: string): Promise<void> {
@@ -211,34 +267,41 @@ export class CmuxBackend implements TerminalBackend {
     }
   }
 
-  writePaneProfile(_profile: PaneProfile): string {
-    // cmux doesn't use dynamic profiles — return a dummy name.
-    return "cmux-default";
+  writePaneProfile(profile: PaneProfile): string {
+    // cmux has no on-disk dynamic-profile concept — stash in memory and
+    // apply when the new surface exists (in setProfile / splitWithProfile).
+    const name = `cmux-profile-${this.profileSeq++}-${profile.paneName}`;
+    this.profileStore.set(name, profile);
+    return name;
   }
 
   writeEmptyPaneProfile(): string {
-    return "cmux-default";
+    // Empty profile means "no background" — represented as a name with no
+    // entry in the store, so applyProfileToSurface no-ops on lookup.
+    return "cmux-empty";
   }
 
-  async setProfile(_sessionId: string, _profileName: string): Promise<void> {
-    // cmux has no dynamic-profile concept — background images live in theme.json
-    // sidebar metadata, not per-session profiles. No-op.
+  async setProfile(sessionId: string, profileName: string): Promise<void> {
+    await this.applyProfileToSurface(sessionId, profileName);
   }
 
   async splitPaneWithProfile(
     direction: "horizontal" | "vertical",
-    _profileName: string,
+    profileName: string,
   ): Promise<string> {
-    // cmux ignores profiles — just do a normal split
-    return this.splitPane(direction);
+    const sessionId = await this.splitPane(direction);
+    await this.applyProfileToSurface(sessionId, profileName);
+    return sessionId;
   }
 
   async splitSessionWithProfile(
     sessionId: string,
     direction: "horizontal" | "vertical",
-    _profileName: string,
+    profileName: string,
   ): Promise<string> {
-    return this.splitSession(sessionId, direction);
+    const newSessionId = await this.splitSession(sessionId, direction);
+    await this.applyProfileToSurface(newSessionId, profileName);
+    return newSessionId;
   }
 
   async splitWebBrowser(
