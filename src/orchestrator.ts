@@ -80,6 +80,35 @@ function readAuxSurface(spawnManifest: string | null): string | undefined {
   }
 }
 
+/**
+ * Auto-confirm Claude's dev-channel prompt by polling the screen buffer
+ * for the prompt marker, then sending CR. Fire-and-forget; bounded by a
+ * 30s deadline. Replaces the prior fixed-3s setTimeout which raced
+ * Claude's startup time (the typical case on cold caches: claude takes
+ * >3s to render the prompt, the CR lands in a still-starting shell, and
+ * the agent stays stuck on the prompt forever).
+ */
+async function autoConfirmDevChannel(screenName: string, label: string): Promise<void> {
+  const marker = "Enter to confirm";
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      const buf = await screen.readOutput(screenName);
+      if (buf.includes(marker)) {
+        await screen.sendKeys(screenName, "\r");
+        return;
+      }
+    } catch {
+      // screen may be momentarily unavailable during startup; retry
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  console.warn(
+    `[crew] dev-channel auto-confirm timed out for ${label} ` +
+    `(marker '${marker}' not seen in 30s)`,
+  );
+}
+
 export class Orchestrator {
   readonly store: CrewStore;
   readonly terminal: TerminalBackend;
@@ -199,17 +228,10 @@ export class Orchestrator {
     // Create screen session
     const session = await screen.createSession(screenName, fullCommand);
 
-    // Auto-confirm the dev channels prompt (sends Enter after a delay).
-    // Send CR (\r), not LF (\n) — Claude's dev-channel prompt only dismisses
-    // on a carriage return. Verified empirically; the previous \n was a
-    // no-op and left agents stuck on the prompt.
-    setTimeout(async () => {
-      try {
-        await screen.sendKeys(screenName, "\r");
-      } catch (e) {
-        console.error(`[crew] failed to auto-confirm dev-channel prompt for ${id}:`, e);
-      }
-    }, 3000);
+    // Auto-confirm the dev-channel prompt. Fire-and-forget — helper polls
+    // the screen buffer until the prompt marker appears, then sends CR.
+    // See autoConfirmDevChannel comment for why polling beats setTimeout.
+    void autoConfirmDevChannel(screenName, id);
 
     // Best-effort: if the caller asked to be split next to the new agent,
     // and the backend supports per-caller splits (cmux today, iTerm2
@@ -427,15 +449,8 @@ export class Orchestrator {
 
     const session = await screen.createSession(screenName, fullCommand);
 
-    // Auto-confirm dev-channel prompt (same cadence as launchAgent).
-    // CR not LF — see launchAgent for the empirical confirmation.
-    setTimeout(async () => {
-      try {
-        await screen.sendKeys(screenName, "\r");
-      } catch (e) {
-        console.error(`[crew] failed to auto-confirm dev-channel prompt for resumed '${opts.id}':`, e);
-      }
-    }, 3000);
+    // Auto-confirm dev-channel prompt — same polling helper as launchAgent.
+    void autoConfirmDevChannel(screenName, `resumed ${opts.id}`);
 
     // Write a fresh manifest for the resumed agent so it can be resumed
     // again later. Channels flow into the manifest only here (launchAgent
