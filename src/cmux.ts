@@ -77,13 +77,56 @@ export class CmuxBackend implements TerminalBackend {
   private profileSeq = 0;
 
   /**
+   * Poll until a surface has an allocated PTY (tty field is non-null) or the
+   * timeout elapses. cmux lazy-instantiates terminal surfaces, and
+   * surface.set_background errors with `surface_unavailable` against a cold
+   * surface — the RPC return is silent (caught below) and the bg never
+   * renders. Waiting briefly catches the common case where a freshly-split
+   * surface materialises within a few hundred ms of the user/UI visiting it.
+   *
+   * For fully-headless creation (workspace never focused), the surface may
+   * stay cold past the timeout. The RPC then errors and we log; the bg will
+   * apply on the user's first activation of that pane if upstream code
+   * re-fires it (see splitWithProfile / setProfile callers).
+   *
+   * TODO(cmux): a proper fix is to make v2SurfaceSetBackground in
+   * TerminalController+BackgroundImage.swift pre-instantiate the surface
+   * rather than erroring on a cold liveSurface. Then this poll is redundant.
+   */
+  private async waitForPty(sessionId: string, timeoutMs = 1000): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const tree = await cmuxJson("tree");
+        for (const win of tree.windows ?? []) {
+          for (const ws of win.workspaces ?? []) {
+            for (const pane of ws.panes ?? []) {
+              for (const surface of pane.surfaces ?? []) {
+                if (surface.ref === sessionId && surface.tty) return true;
+              }
+            }
+          }
+        }
+      } catch {
+        // tree query failed — keep polling until timeout
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return false;
+  }
+
+  /**
    * Apply a stored profile's background to a surface via cmux's RPC.
    * Best-effort — failures (cmux down, surface gone, malformed image path)
    * are logged but never thrown. Matches the rest of this class's policy.
+   *
+   * Polls briefly for PTY allocation before firing the RPC. See waitForPty
+   * for why.
    */
   private async applyProfileToSurface(sessionId: string, profileName: string): Promise<void> {
     const profile = this.profileStore.get(profileName);
     if (!profile || !profile.backgroundImage) return;
+    await this.waitForPty(sessionId);
     const params = mapProfileToRpcParams(
       sessionId,
       profile.backgroundImage,
