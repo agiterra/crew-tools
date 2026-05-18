@@ -80,32 +80,75 @@ function readAuxSurface(spawnManifest: string | null): string | undefined {
 }
 
 /**
+ * Pre-accept Claude Code's workspace-trust dialog for the given project
+ * directory by writing `projects[cwd].hasTrustDialogAccepted = true` into
+ * ~/.claude.json before the agent starts. Without this, every newly-cd'd
+ * ephemeral hits a separate confirmation dialog that bypassPermissions
+ * doesn't bypass.
+ *
+ * Best-effort: errors are logged and swallowed. The agent will still spawn
+ * and the user can manually accept the dialog as a fallback.
+ */
+async function preAcceptWorkspaceTrust(projectDir: string): Promise<void> {
+  const cfgPath = `${process.env.HOME ?? ""}/.claude.json`;
+  try {
+    const fs = await import("fs/promises");
+    let cfg: { projects?: Record<string, Record<string, unknown>> } = {};
+    try {
+      cfg = JSON.parse(await fs.readFile(cfgPath, "utf8"));
+    } catch {
+      // File doesn't exist yet; we'll create it.
+    }
+    cfg.projects ??= {};
+    cfg.projects[projectDir] ??= {};
+    cfg.projects[projectDir].hasTrustDialogAccepted = true;
+    cfg.projects[projectDir].hasCompletedProjectOnboarding = true;
+    await fs.writeFile(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
+  } catch (e) {
+    console.error(`[crew] preAcceptWorkspaceTrust failed for ${projectDir}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
  * Auto-confirm Claude's dev-channel prompt by polling the screen buffer
  * for the prompt marker, then sending CR. Fire-and-forget; bounded by a
  * 30s deadline. Replaces the prior fixed-3s setTimeout which raced
  * Claude's startup time (the typical case on cold caches: claude takes
  * >3s to render the prompt, the CR lands in a still-starting shell, and
  * the agent stays stuck on the prompt forever).
+ *
+ * Handles BOTH consecutive prompts that may appear (dev-channels + an
+ * occasional secondary confirm) by sending CR each time the marker is
+ * still in the buffer. preAcceptWorkspaceTrust above eliminates the
+ * trust-dialog as a separate concern; this remains the fallback.
  */
 async function autoConfirmDevChannel(screenName: string, label: string): Promise<void> {
   const marker = "Enter to confirm";
   const deadline = Date.now() + 30_000;
+  let confirmsSent = 0;
   while (Date.now() < deadline) {
     try {
       const buf = await screen.readOutput(screenName);
       if (buf.includes(marker)) {
         await screen.sendKeys(screenName, "\r");
-        return;
+        confirmsSent++;
+        // Give the prompt a tick to redraw; if a second prompt is next, loop.
+        await new Promise((r) => setTimeout(r, 400));
+        if (confirmsSent >= 2) return;
+        continue;
       }
+      if (confirmsSent > 0) return; // sent at least one and marker is gone
     } catch {
       // screen may be momentarily unavailable during startup; retry
     }
     await new Promise((r) => setTimeout(r, 250));
   }
-  console.warn(
-    `[crew] dev-channel auto-confirm timed out for ${label} ` +
-    `(marker '${marker}' not seen in 30s)`,
-  );
+  if (confirmsSent === 0) {
+    console.warn(
+      `[crew] dev-channel auto-confirm timed out for ${label} ` +
+      `(marker '${marker}' not seen in 30s)`,
+    );
+  }
 }
 
 export class Orchestrator {
@@ -196,6 +239,9 @@ export class Orchestrator {
 
     // Build launch command. Template variables expand from env + PROJECT_DIR.
     const projectDir = opts.projectDir ?? process.cwd();
+    // Pre-accept Claude Code's workspace-trust dialog so CC ephemerals start
+    // straight into their prompt instead of stalling on a confirmation.
+    await preAcceptWorkspaceTrust(projectDir);
     const templateVars = { ...opts.env, PROJECT_DIR: projectDir };
     let command = getLaunchCommand(runtime, templateVars);
     if (opts.prompt) {
@@ -396,6 +442,8 @@ export class Orchestrator {
         `Pass project_dir explicitly.`,
       );
     }
+    // Same workspace-trust pre-accept as launchAgent.
+    await preAcceptWorkspaceTrust(projectDir);
 
     const runtime = opts.runtime ?? tomb?.runtime ?? manifest?.runtime ?? "claude-code";
     if (runtime !== "claude-code") {
