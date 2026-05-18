@@ -1254,13 +1254,15 @@ export class Orchestrator {
     const theme = targetTab.theme ? loadTheme(targetTab.theme) : null;
     const bgPath = targetTab.theme ? backgroundImagePath(targetTab.theme, paneName, theme) : null;
     if (bgPath) {
-      this.terminal.writePaneProfile({
+      const profileName = this.terminal.writePaneProfile({
         paneName,
         backgroundImage: bgPath,
         blend: theme?.background.blend,
         mode: theme?.background.mode,
         badgeColor: theme?.badgeColors?.[paneName] ?? theme?.defaultBadgeColor,
       });
+      // Apply to the already-existing session — splitWithProfile wasn't used.
+      await this.terminal.setProfile(sessionId, profileName);
     }
 
     // Register in DB
