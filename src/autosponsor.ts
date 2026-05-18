@@ -3,22 +3,21 @@
  *
  * When crew.agent_launch spawns a new agent without an explicit private key
  * in env, we check whether the crew MCP process itself has a Wire identity
- * (CREW_PRIVATE_KEY / WIRE_PRIVATE_KEY + AGENT_ID in its own env). If it
- * does, we generate a fresh Ed25519 keypair for the child, pre-register the
- * pubkey on Wire under the child's AGENT_ID using the parent as sponsor,
- * and inject the new private key into the child's spawn env as
- * CREW_PRIVATE_KEY — the name wire-tools' MCP actually reads.
+ * (AGENT_PRIVATE_KEY + AGENT_ID in its own env). If it does, we generate a
+ * fresh Ed25519 keypair for the child, pre-register the pubkey on Wire
+ * under the child's AGENT_ID using the parent as sponsor, and inject the
+ * new private key into the child's spawn env as AGENT_PRIVATE_KEY — the
+ * canonical name wire-tools' MCP reads (journal:51 cutover, 2026-04-15).
  *
  * If no parent identity is available or registration fails, this module
  * returns null and the caller spawns the child without a Wire identity.
  * That matches today's behavior (the child's wire-tools MCP exits at
  * startup, screen-hardcopy IPC only) — no regression surface.
  *
- * Why CREW_PRIVATE_KEY and not AGENT_PRIVATE_KEY: wire-tools/mcp-server.ts
- * reads `process.env.CREW_PRIVATE_KEY ?? process.env.WIRE_PRIVATE_KEY`.
- * Setting AGENT_PRIVATE_KEY (as the orchestrator docs historically suggest)
- * results in wire-tools exiting with no_private_key. Inject under the name
- * that actually works.
+ * No legacy env-name fallbacks (CREW_PRIVATE_KEY, WIRE_PRIVATE_KEY) — per
+ * .knowledge/feedback-no-fallback-in-code.md, env-var migrations land at
+ * the data layer (each personai's spawn-*.sh / .env), not in code. Code
+ * reads only the canonical name.
  */
 
 // Crypto-only subpath: pulls in nothing past Web Crypto. Importing the
@@ -77,7 +76,7 @@ export type SponsorIdentity = {
 export async function readSponsorFromEnv(
   env: Record<string, string | undefined> = process.env,
 ): Promise<SponsorIdentity | null> {
-  const rawKey = env.CREW_PRIVATE_KEY ?? env.WIRE_PRIVATE_KEY ?? env.AGENT_PRIVATE_KEY;
+  const rawKey = env.AGENT_PRIVATE_KEY;
   const agentId = env.AGENT_ID;
   if (!rawKey || !agentId) return null;
   try {
@@ -97,7 +96,7 @@ export async function readSponsorFromEnv(
  * Generate a fresh Ed25519 keypair for `newAgentId`, register its pubkey
  * on Wire under that id sponsored by `sponsor`, and return the new
  * private key as base64 PKCS8 (ready to drop into the child's env as
- * CREW_PRIVATE_KEY).
+ * AGENT_PRIVATE_KEY).
  *
  * Returns null on any failure — registration rejected, wire down,
  * network error — so the caller can fall through to launching headless.

@@ -1,6 +1,6 @@
 {
   "name": "@agiterra/crew-tools",
-  "version": "2.9.0",
+  "version": "2.9.1",
   "description": "Agent crew orchestration primitives \u2014 screen sessions, iTerm2 panes, SQLite state, runtime-agnostic.",
   "type": "module",
   "main": "./src/index.ts",
@@ -19,6 +19,7 @@
   "license": "MIT",
   "author": "Tim Garthwaite <https://github.com/mividtim>",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@agiterra/wire-tools": "agiterra/wire-tools#v2.6.3"
   }
 }

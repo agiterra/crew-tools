@@ -3,7 +3,7 @@ import { readSponsorFromEnv, sponsorChild } from "./autosponsor";
 import { generateKeyPair, exportPrivateKey } from "@agiterra/wire-tools/crypto";
 
 describe("readSponsorFromEnv", () => {
-  test("returns null when no key is present", async () => {
+  test("returns null when no AGENT_PRIVATE_KEY is present", async () => {
     const id = await readSponsorFromEnv({ AGENT_ID: "x" });
     expect(id).toBeNull();
   });
@@ -11,55 +11,48 @@ describe("readSponsorFromEnv", () => {
   test("returns null when no AGENT_ID is present", async () => {
     const { privateKey } = await generateKeyPair();
     const b64 = await exportPrivateKey(privateKey);
-    const id = await readSponsorFromEnv({ CREW_PRIVATE_KEY: b64 });
+    const id = await readSponsorFromEnv({ AGENT_PRIVATE_KEY: b64 });
     expect(id).toBeNull();
   });
 
   test("returns null on garbage key, no throw", async () => {
     const id = await readSponsorFromEnv({
       AGENT_ID: "x",
-      CREW_PRIVATE_KEY: "not-base64-pkcs8",
+      AGENT_PRIVATE_KEY: "not-base64-pkcs8",
     });
     expect(id).toBeNull();
   });
 
-  test("reads CREW_PRIVATE_KEY first, then WIRE_PRIVATE_KEY, then AGENT_PRIVATE_KEY", async () => {
+  test("returns null on legacy CREW_PRIVATE_KEY or WIRE_PRIVATE_KEY (no fallback)", async () => {
+    // Per .knowledge/feedback-no-fallback-in-code.md: env-var migrations
+    // happen at the data layer, not in code. We deliberately do NOT fall
+    // back to legacy names — operators must migrate their spawn scripts.
+    const { privateKey } = await generateKeyPair();
+    const b64 = await exportPrivateKey(privateKey);
+    const crewOnly = await readSponsorFromEnv({ AGENT_ID: "x", CREW_PRIVATE_KEY: b64 });
+    expect(crewOnly).toBeNull();
+    const wireOnly = await readSponsorFromEnv({ AGENT_ID: "x", WIRE_PRIVATE_KEY: b64 });
+    expect(wireOnly).toBeNull();
+  });
+
+  test("reads AGENT_PRIVATE_KEY", async () => {
     const { privateKey } = await generateKeyPair();
     const good = await exportPrivateKey(privateKey);
-
-    // CREW wins over the other two.
-    const a = await readSponsorFromEnv({
+    const s = await readSponsorFromEnv({
       AGENT_ID: "a",
-      CREW_PRIVATE_KEY: good,
-      WIRE_PRIVATE_KEY: "garbage",
-      AGENT_PRIVATE_KEY: "garbage",
-    });
-    expect(a?.agentId).toBe("a");
-
-    // WIRE wins when CREW absent.
-    const b = await readSponsorFromEnv({
-      AGENT_ID: "b",
-      WIRE_PRIVATE_KEY: good,
-      AGENT_PRIVATE_KEY: "garbage",
-    });
-    expect(b?.agentId).toBe("b");
-
-    // AGENT used as last resort.
-    const c = await readSponsorFromEnv({
-      AGENT_ID: "c",
       AGENT_PRIVATE_KEY: good,
     });
-    expect(c?.agentId).toBe("c");
+    expect(s?.agentId).toBe("a");
   });
 
   test("defaults wireUrl to localhost:9800 and respects WIRE_URL override", async () => {
     const { privateKey } = await generateKeyPair();
     const b64 = await exportPrivateKey(privateKey);
-    const def = await readSponsorFromEnv({ AGENT_ID: "x", CREW_PRIVATE_KEY: b64 });
+    const def = await readSponsorFromEnv({ AGENT_ID: "x", AGENT_PRIVATE_KEY: b64 });
     expect(def?.wireUrl).toBe("http://localhost:9800");
     const custom = await readSponsorFromEnv({
       AGENT_ID: "x",
-      CREW_PRIVATE_KEY: b64,
+      AGENT_PRIVATE_KEY: b64,
       WIRE_URL: "http://wire.internal:7000",
     });
     expect(custom?.wireUrl).toBe("http://wire.internal:7000");
@@ -79,7 +72,7 @@ describe("sponsorChild", () => {
   test("POSTs /agents/register with sponsor JWT and returns child key b64", async () => {
     const { privateKey } = await generateKeyPair();
     const sponsorKeyB64 = await exportPrivateKey(privateKey);
-    const sponsor = await readSponsorFromEnv({ AGENT_ID: "sponsor-a", CREW_PRIVATE_KEY: sponsorKeyB64 });
+    const sponsor = await readSponsorFromEnv({ AGENT_ID: "sponsor-a", AGENT_PRIVATE_KEY: sponsorKeyB64 });
     expect(sponsor).not.toBeNull();
 
     let capturedUrl = "";
@@ -108,7 +101,7 @@ describe("sponsorChild", () => {
   test("returns null when wire rejects the registration", async () => {
     const { privateKey } = await generateKeyPair();
     const sponsorKeyB64 = await exportPrivateKey(privateKey);
-    const sponsor = await readSponsorFromEnv({ AGENT_ID: "sponsor-b", CREW_PRIVATE_KEY: sponsorKeyB64 });
+    const sponsor = await readSponsorFromEnv({ AGENT_ID: "sponsor-b", AGENT_PRIVATE_KEY: sponsorKeyB64 });
 
     globalThis.fetch = mock(async () => new Response("nope", { status: 401 })) as unknown as typeof globalThis.fetch;
 
@@ -119,7 +112,7 @@ describe("sponsorChild", () => {
   test("returns null when fetch throws (wire daemon down)", async () => {
     const { privateKey } = await generateKeyPair();
     const sponsorKeyB64 = await exportPrivateKey(privateKey);
-    const sponsor = await readSponsorFromEnv({ AGENT_ID: "sponsor-c", CREW_PRIVATE_KEY: sponsorKeyB64 });
+    const sponsor = await readSponsorFromEnv({ AGENT_ID: "sponsor-c", AGENT_PRIVATE_KEY: sponsorKeyB64 });
 
     globalThis.fetch = mock(async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof globalThis.fetch;
 

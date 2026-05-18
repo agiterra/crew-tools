@@ -174,18 +174,18 @@ export class Orchestrator {
     // own Wire identity as sponsor. No-op when crew has no identity in
     // its own env — child launches headless (current behavior).
     //
-    // Inject under CREW_PRIVATE_KEY since that's what wire-tools' MCP
-    // actually reads. AGENT_PRIVATE_KEY is recognized by the orchestrator
-    // (stripped from manifest) but ignored by wire-tools — historic
-    // naming drift, documented separately.
-    const callerSuppliedKey =
-      opts.env.CREW_PRIVATE_KEY ?? opts.env.WIRE_PRIVATE_KEY ?? opts.env.AGENT_PRIVATE_KEY;
+    // Inject under AGENT_PRIVATE_KEY — the canonical name post the
+    // 2026-04-15 ecosystem cutover (journal:51). wire-tools'
+    // src/mcp-server.ts reads `process.env.AGENT_PRIVATE_KEY`
+    // exclusively. Setting CREW_PRIVATE_KEY or WIRE_PRIVATE_KEY here
+    // would silently break the spawned child's wire MCP boot.
+    const callerSuppliedKey = opts.env.AGENT_PRIVATE_KEY;
     if (!callerSuppliedKey) {
       const sponsor = await readSponsorFromEnv();
       if (sponsor && sponsor.agentId !== id) {
         const child = await sponsorChild(sponsor, id, displayName);
         if (child) {
-          opts.env = { ...opts.env, CREW_PRIVATE_KEY: child.privateKeyB64 };
+          opts.env = { ...opts.env, AGENT_PRIVATE_KEY: child.privateKeyB64 };
         }
       }
     }
