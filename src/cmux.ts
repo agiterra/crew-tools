@@ -77,6 +77,45 @@ export class CmuxBackend implements TerminalBackend {
   private profileSeq = 0;
 
   /**
+   * Look up the workspace ref that contains a given surface. cmux's per-surface
+   * commands (send, new-split, close-surface, rpc target_id resolution) default
+   * `--workspace` to the CALLER's $CMUX_WORKSPACE_ID, not the surface's actual
+   * workspace. When crew orchestrates surfaces across workspaces (which is
+   * always the case from an MCP server running in a different workspace than
+   * the targeted panes), the lookup fails with "Surface not found" or
+   * "Surface is not a terminal". Every call site that takes --surface must
+   * also pass --workspace from this lookup.
+   */
+  private async workspaceForSurface(sessionId: string): Promise<string | null> {
+    try {
+      const tree = await cmuxJson("tree");
+      for (const win of tree.windows ?? []) {
+        for (const ws of win.workspaces ?? []) {
+          for (const pane of ws.panes ?? []) {
+            for (const surface of pane.surfaces ?? []) {
+              if (surface.ref === sessionId) return ws.ref;
+            }
+          }
+        }
+      }
+    } catch {
+      // Tree query failed — caller falls back to default workspace context
+    }
+    return null;
+  }
+
+  /**
+   * Build `["--surface", sessionId]` plus, if we can resolve it, `["--workspace", wsRef]`.
+   * Centralises the workspace-lookup pattern every per-surface CLI invocation needs.
+   */
+  private async surfaceArgs(sessionId: string): Promise<string[]> {
+    const wsRef = await this.workspaceForSurface(sessionId);
+    return wsRef
+      ? ["--surface", sessionId, "--workspace", wsRef]
+      : ["--surface", sessionId];
+  }
+
+  /**
    * Poll until a surface has an allocated PTY (tty field is non-null) or the
    * timeout elapses. cmux lazy-instantiates terminal surfaces, and
    * surface.set_background errors with `surface_unavailable` against a cold
@@ -185,17 +224,20 @@ export class CmuxBackend implements TerminalBackend {
     direction: "horizontal" | "vertical",
   ): Promise<string> {
     const cmuxDir = direction === "horizontal" ? "down" : "right";
-    const output = await cmux("new-split", cmuxDir, "--surface", sessionId);
+    const args = await this.surfaceArgs(sessionId);
+    const output = await cmux("new-split", cmuxDir, ...args);
     return parseSurfaceRef(output);
   }
 
   async writeToSession(sessionId: string, text: string): Promise<void> {
-    await cmux("send", "--surface", sessionId, text);
+    const args = await this.surfaceArgs(sessionId);
+    await cmux("send", ...args, text);
   }
 
   async closeSession(sessionId: string): Promise<void> {
     try {
-      await cmux("close-surface", "--surface", sessionId);
+      const args = await this.surfaceArgs(sessionId);
+      await cmux("close-surface", ...args);
     } catch {
       // If close-surface fails, try sending exit
       try {
@@ -257,7 +299,8 @@ export class CmuxBackend implements TerminalBackend {
 
   async setSessionName(sessionId: string, name: string): Promise<void> {
     try {
-      await cmux("rename-tab", "--surface", sessionId, name);
+      const args = await this.surfaceArgs(sessionId);
+      await cmux("rename-tab", ...args, name);
     } catch {
       // Non-fatal — tab renaming may not always work
     }
@@ -265,7 +308,8 @@ export class CmuxBackend implements TerminalBackend {
 
   async setBadge(sessionId: string, text: string): Promise<void> {
     try {
-      await cmux("notify", "--title", text, "--surface", sessionId);
+      const args = await this.surfaceArgs(sessionId);
+      await cmux("notify", "--title", text, ...args);
     } catch {
       // Non-fatal
     }
@@ -273,7 +317,8 @@ export class CmuxBackend implements TerminalBackend {
 
   async flashSession(sessionId: string): Promise<void> {
     try {
-      await cmux("trigger-flash", "--surface", sessionId);
+      const args = await this.surfaceArgs(sessionId);
+      await cmux("trigger-flash", ...args);
     } catch {
       // Non-fatal
     }
@@ -281,7 +326,8 @@ export class CmuxBackend implements TerminalBackend {
 
   async notifySession(sessionId: string, title: string, body?: string): Promise<void> {
     try {
-      const args = ["notify", "--title", title, "--surface", sessionId];
+      const surfaceArgs = await this.surfaceArgs(sessionId);
+      const args = ["notify", "--title", title, ...surfaceArgs];
       if (body) args.push("--body", body);
       await cmux(...args);
     } catch {
@@ -390,7 +436,8 @@ export class CmuxBackend implements TerminalBackend {
   ): Promise<string | null> {
     try {
       const cmuxDir = direction === "right" ? "right" : "down";
-      const output = await cmux("new-split", cmuxDir, "--surface", callerSurfaceId);
+      const args = await this.surfaceArgs(callerSurfaceId);
+      const output = await cmux("new-split", cmuxDir, ...args);
       const match = output.match(/surface:\d+/);
       return match ? match[0] : null;
     } catch {
