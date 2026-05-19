@@ -31,6 +31,16 @@ export class ItermBackend implements TerminalBackend {
     return iterm.writeToSession(sessionId, text);
   }
 
+  attachScreen(
+    sessionId: string,
+    screenName: string,
+    mode: "r" | "x" = "r",
+  ): Promise<void> {
+    // AppleScript's `write text` auto-appends a newline, so the attach
+    // command commits without an explicit trailing \n.
+    return iterm.writeToSession(sessionId, `screen -${mode} ${screenName}`);
+  }
+
   closeSession(sessionId: string): Promise<void> {
     return iterm.closeSession(sessionId);
   }

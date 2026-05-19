@@ -277,6 +277,27 @@ export class CmuxBackend implements TerminalBackend {
     await cmux("send", ...args, text);
   }
 
+  /**
+   * Attach a screen session and commit with a deterministic enter key.
+   *
+   * `cmux send <text>` sends the literal string with no auto-newline (unlike
+   * iTerm2's AppleScript `write text`). Composing send + send-key separates
+   * "type the command" from "press enter", so the attach always commits even
+   * if `screenName` ever picked up an unexpected trailing character.
+   *
+   * This eliminates the bridge.spawn-drops-\r class of bug, where a freshly
+   * split pane sat at an unsubmitted `screen -x wire-<id>` prompt.
+   */
+  async attachScreen(
+    sessionId: string,
+    screenName: string,
+    mode: "r" | "x" = "r",
+  ): Promise<void> {
+    const args = await this.surfaceArgs(sessionId);
+    await cmux("send", ...args, `screen -${mode} ${screenName}`);
+    await cmux("send-key", ...args, "enter");
+  }
+
   async closeSession(sessionId: string): Promise<void> {
     try {
       const args = await this.surfaceArgs(sessionId);
@@ -341,11 +362,22 @@ export class CmuxBackend implements TerminalBackend {
   }
 
   async setBadge(sessionId: string, text: string): Promise<void> {
+    // cmux exposes per-workspace sidebar status pills (set-status / clear-status).
+    // These are the closest analogue to iTerm2's per-session badge: they
+    // persist, they're visible at a glance, and they're tagged by a key so
+    // multiple agents can coexist. We key by sessionId so each pane gets its
+    // own pill in its workspace's sidebar. Empty text clears the pill.
     try {
-      const args = await this.surfaceArgs(sessionId);
-      await cmux("notify", "--title", text, ...args);
+      const wsRef = await this.workspaceForSurface(sessionId);
+      const wsFlag = wsRef ? ["--workspace", wsRef] : [];
+      const key = `crew.${sessionId}`;
+      if (text === "") {
+        await cmux("clear-status", key, ...wsFlag);
+      } else {
+        await cmux("set-status", key, text, ...wsFlag);
+      }
     } catch {
-      // Non-fatal
+      // Non-fatal — sidebar metadata is decorative, not load-bearing.
     }
   }
 

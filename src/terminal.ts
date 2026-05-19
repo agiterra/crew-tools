@@ -49,6 +49,24 @@ export interface TerminalBackend {
   /** Write/send text to a specific session/surface. */
   writeToSession(sessionId: string, text: string): Promise<void>;
 
+  /**
+   * Attach a GNU screen session to a terminal pane and commit the command.
+   *
+   * Both backends must commit the attach with a newline/enter. iTerm2's
+   * writeToSession auto-appends a newline via AppleScript's `write text`;
+   * cmux's `send` does not. Without this abstraction, callers had to know
+   * the backend-specific newline convention, which silently broke cmux
+   * (pane sits at unsubmitted `screen -x …` until a human hits enter).
+   *
+   * mode: "r" = reattach (default), "x" = multi-display (use when the
+   *       session may already be attached elsewhere).
+   */
+  attachScreen(
+    sessionId: string,
+    screenName: string,
+    mode?: "r" | "x",
+  ): Promise<void>;
+
   /** Close a session/surface. */
   closeSession(sessionId: string): Promise<void>;
 
