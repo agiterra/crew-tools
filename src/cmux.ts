@@ -105,14 +105,65 @@ export class CmuxBackend implements TerminalBackend {
   }
 
   /**
-   * Build `["--surface", sessionId]` plus, if we can resolve it, `["--workspace", wsRef]`.
-   * Centralises the workspace-lookup pattern every per-surface CLI invocation needs.
+   * Resolve a caller-supplied surface identifier (short ref or UUID) to the
+   * canonical short ref recognized by the CURRENT cmux daemon.
+   *
+   * UUIDs from $CMUX_SURFACE_ID are stable per-process but go stale across
+   * cmux daemon restarts (which happen frequently during app dev rebuilds).
+   * Short refs (`surface:N`) are always current. cmux's CLI documents UUID
+   * and ref as interchangeable inputs, but in practice only short refs
+   * round-trip across daemon restarts — passing a stale UUID to `new-split`
+   * / `close-surface` returns `not_found: Workspace not found`.
+   *
+   * Strategy:
+   *   1. Already a short ref (surface:N, pane:N) → return as-is.
+   *   2. UUID present in current tree (--id-format both) → translate to short ref.
+   *   3. UUID matches caller's $CMUX_SURFACE_ID but is stale → fall back to
+   *      `cmux identify`.focused.surface_ref. The env var represents the
+   *      caller's own surface, which IS the focused surface from the caller's
+   *      process perspective, so identify always reflects the right ref.
+   *   4. Otherwise → null (UUID belongs to a vanished non-focused surface).
+   */
+  private async resolveSurfaceRef(input: string): Promise<string | null> {
+    if (/^(surface|pane):\d+$/.test(input)) return input;
+    try {
+      const tree = await cmuxJson("tree", "--id-format", "both");
+      for (const win of tree.windows ?? []) {
+        for (const ws of win.workspaces ?? []) {
+          for (const pane of ws.panes ?? []) {
+            for (const surface of pane.surfaces ?? []) {
+              if (surface.id === input) return surface.ref;
+            }
+          }
+        }
+      }
+    } catch {
+      // Tree query failed — fall through to identify fallback below.
+    }
+    if (input === process.env.CMUX_SURFACE_ID) {
+      try {
+        const info = await cmuxJson("identify");
+        const ref = info.focused?.surface_ref ?? info.focused?.surfaceRef;
+        return typeof ref === "string" ? ref : null;
+      } catch {
+        // identify failed — give up.
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Build `["--surface", ref]` plus, if we can resolve it, `["--workspace", wsRef]`.
+   * Centralises the workspace-lookup pattern every per-surface CLI invocation
+   * needs. Resolves UUID inputs to current short refs first so commands
+   * survive cmux daemon restarts.
    */
   private async surfaceArgs(sessionId: string): Promise<string[]> {
-    const wsRef = await this.workspaceForSurface(sessionId);
+    const resolved = (await this.resolveSurfaceRef(sessionId)) ?? sessionId;
+    const wsRef = await this.workspaceForSurface(resolved);
     return wsRef
-      ? ["--surface", sessionId, "--workspace", wsRef]
-      : ["--surface", sessionId];
+      ? ["--surface", resolved, "--workspace", wsRef]
+      : ["--surface", resolved];
   }
 
   /**
