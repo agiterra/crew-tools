@@ -174,7 +174,7 @@ export async function startServer(): Promise<void> {
               "Env vars exported into the spawned agent's environment. " +
               "MUST include AGENT_ID — crew uses it as the agent's primary identifier (screen session name, DB key). AGENT_NAME defaults to AGENT_ID. " +
               "All other vars are opaque to crew. " +
-              "For Wire-using agents include AGENT_PRIVATE_KEY: orchestrator generates the keypair, pre-registers the public key on Wire (sponsoring-agent register flow), and passes the base64 PKCS8 private key here.",
+              "For Wire-using agents, include AGENT_PRIVATE_KEY. The orchestrator is responsible for provisioning the keypair BEFORE calling agent_launch — typically by calling `mcp__plugin_wire_wire__register_agent({ id })` (fresh mode mints a keypair and returns `private_key_b64`) and passing that string here as base64 PKCS8. Crew itself does NOT register, sponsor, or generate keys; it only forwards the env map verbatim to the spawned process. (The v2.9.x `autosponsor` shortcut was removed in v2.10.0 per the cross-refs rule — composite register+spawn workflows belong in a bundle plugin, not in crew-tools.)",
           },
           prompt: { type: "string", description: "Initial prompt — passed as positional arg to the runtime command." },
           runtime: { type: "string", description: "Runtime: claude-code, codex, etc. Default: claude-code" },
@@ -234,8 +234,9 @@ export async function startServer(): Promise<void> {
         "call — no re-supplying inputs.\n\n" +
         "Wire identity: AGENT_PRIVATE_KEY is stripped from the stored " +
         "manifest, so if the agent uses Wire, first call " +
-        "`register_agent` (from wire-ipc) to rotate the keypair on Wire, " +
-        "then pass the new key as `env.AGENT_PRIVATE_KEY` here. Wire's " +
+        "`mcp__plugin_wire_wire__register_agent({ id, force_rotate: true })` to mint a fresh keypair on Wire " +
+        "(the `register_agent` tool moved from wire-ipc to the wire plugin in wire-ipc v1.3.0), " +
+        "then pass the returned `private_key_b64` as `env.AGENT_PRIVATE_KEY` here. Wire's " +
         "/agents/register is UPSERT keyed on id, so the same agent id " +
         "continues to exist with a new pubkey.\n\n" +
         "Any explicit field overrides the tombstone's value (including " +
