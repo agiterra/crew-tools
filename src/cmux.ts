@@ -77,93 +77,85 @@ export class CmuxBackend implements TerminalBackend {
   private profileSeq = 0;
 
   /**
-   * Look up the workspace ref that contains a given surface. cmux's per-surface
-   * commands (send, new-split, close-surface, rpc target_id resolution) default
-   * `--workspace` to the CALLER's $CMUX_WORKSPACE_ID, not the surface's actual
-   * workspace. When crew orchestrates surfaces across workspaces (which is
-   * always the case from an MCP server running in a different workspace than
-   * the targeted panes), the lookup fails with "Surface not found" or
-   * "Surface is not a terminal". Every call site that takes --surface must
-   * also pass --workspace from this lookup.
-   */
-  private async workspaceForSurface(sessionId: string): Promise<string | null> {
-    try {
-      const tree = await cmuxJson("tree");
-      for (const win of tree.windows ?? []) {
-        for (const ws of win.workspaces ?? []) {
-          for (const pane of ws.panes ?? []) {
-            for (const surface of pane.surfaces ?? []) {
-              if (surface.ref === sessionId) return ws.ref;
-            }
-          }
-        }
-      }
-    } catch {
-      // Tree query failed — caller falls back to default workspace context
-    }
-    return null;
-  }
-
-  /**
-   * Resolve a caller-supplied surface identifier (short ref or UUID) to the
-   * canonical short ref recognized by the CURRENT cmux daemon.
+   * Resolve a caller-supplied surface identifier (short ref OR UUID) to the
+   * canonical {ref, workspace} recognized by the CURRENT cmux daemon.
    *
-   * UUIDs from $CMUX_SURFACE_ID are stable per-process but go stale across
-   * cmux daemon restarts (which happen frequently during app dev rebuilds).
-   * Short refs (`surface:N`) are always current. cmux's CLI documents UUID
-   * and ref as interchangeable inputs, but in practice only short refs
-   * round-trip across daemon restarts — passing a stale UUID to `new-split`
-   * / `close-surface` returns `not_found: Workspace not found`.
+   * BOTH input forms go stale across cmux daemon restarts:
+   *   - UUIDs from $CMUX_SURFACE_ID are stable per-process but the daemon
+   *     mints fresh UUIDs on restart.
+   *   - Short refs (`surface:N`) from caches like crew's pane→surface DB
+   *     point at a monotonic counter that resets on restart — the same
+   *     `surface:20` may now refer to a different pane or be missing
+   *     entirely. cmux's per-surface commands (send, new-split,
+   *     close-surface, rpc target_id resolution) default `--workspace` to
+   *     the CALLER's $CMUX_WORKSPACE_ID, not the surface's actual
+   *     workspace; without an explicit `--workspace`, cross-workspace
+   *     targets fail with "Surface not found".
+   *
+   * One tree lookup with `--id-format both` handles both input shapes
+   * uniformly: each surface in the tree carries `.id` (UUID) AND `.ref`
+   * (short ref), so a single pass matches either field AND captures the
+   * containing workspace.
    *
    * Strategy:
-   *   1. Already a short ref (surface:N, pane:N) → return as-is.
-   *   2. UUID present in current tree (--id-format both) → translate to short ref.
-   *   3. UUID matches caller's $CMUX_SURFACE_ID but is stale → fall back to
-   *      `cmux identify`.focused.surface_ref. The env var represents the
-   *      caller's own surface, which IS the focused surface from the caller's
-   *      process perspective, so identify always reflects the right ref.
-   *   4. Otherwise → null (UUID belongs to a vanished non-focused surface).
+   *   1. Lookup in current tree, matching input against surface.id OR
+   *      surface.ref → return {ref, ws.ref} if found.
+   *   2. Not in tree, but input === $CMUX_SURFACE_ID → fall back to
+   *      `cmux identify`.focused. The env var represents the caller's own
+   *      surface, so identify always reflects the right ref. (Short-ref
+   *      inputs can't take this fallback — env only ever holds UUIDs.)
+   *   3. Otherwise → null (surface belongs to a vanished pane or stale
+   *      cache entry; caller treats as "placement target gone" and falls
+   *      back to headless / re-resolution from a fresh source).
    */
-  private async resolveSurfaceRef(input: string): Promise<string | null> {
-    if (/^(surface|pane):\d+$/.test(input)) return input;
+  private async resolveSurface(input: string): Promise<{ ref: string; ws: string | null } | null> {
     try {
       const tree = await cmuxJson("tree", "--id-format", "both");
       for (const win of tree.windows ?? []) {
         for (const ws of win.workspaces ?? []) {
           for (const pane of ws.panes ?? []) {
             for (const surface of pane.surfaces ?? []) {
-              if (surface.id === input) return surface.ref;
+              if (surface.id === input || surface.ref === input) {
+                return { ref: surface.ref, ws: ws.ref ?? null };
+              }
             }
           }
         }
       }
     } catch {
-      // Tree query failed — fall through to identify fallback below.
+      // Tree query failed — fall through to env-match fallback.
     }
     if (input === process.env.CMUX_SURFACE_ID) {
       try {
         const info = await cmuxJson("identify");
         const ref = info.focused?.surface_ref ?? info.focused?.surfaceRef;
-        return typeof ref === "string" ? ref : null;
+        const ws = info.focused?.workspace_ref ?? info.focused?.workspaceRef;
+        if (typeof ref === "string") {
+          return { ref, ws: typeof ws === "string" ? ws : null };
+        }
       } catch {
-        // identify failed — give up.
+        // identify failed.
       }
     }
     return null;
   }
 
   /**
-   * Build `["--surface", ref]` plus, if we can resolve it, `["--workspace", wsRef]`.
+   * Build `["--surface", ref]` plus, if known, `["--workspace", wsRef]`.
    * Centralises the workspace-lookup pattern every per-surface CLI invocation
-   * needs. Resolves UUID inputs to current short refs first so commands
-   * survive cmux daemon restarts.
+   * needs. Validates input against current daemon state so commands survive
+   * cmux daemon restarts (which invalidate both UUIDs and monotonic short
+   * refs). Unresolvable inputs pass through; the downstream cmux call will
+   * surface "Surface not found" to the caller's existing try/catch.
    */
   private async surfaceArgs(sessionId: string): Promise<string[]> {
-    const resolved = (await this.resolveSurfaceRef(sessionId)) ?? sessionId;
-    const wsRef = await this.workspaceForSurface(resolved);
-    return wsRef
-      ? ["--surface", resolved, "--workspace", wsRef]
-      : ["--surface", resolved];
+    const resolved = await this.resolveSurface(sessionId);
+    if (!resolved) {
+      return ["--surface", sessionId];
+    }
+    return resolved.ws
+      ? ["--surface", resolved.ref, "--workspace", resolved.ws]
+      : ["--surface", resolved.ref];
   }
 
   /**
