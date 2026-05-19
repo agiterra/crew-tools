@@ -47,9 +47,14 @@ function parseSurfaceRef(output: string): string {
  *
  * The RPC accepts `fit: "cover" | "contain"`, `position`, `opacity`, `repeat`.
  * iTerm's "mode" doesn't map cleanly; we pick the closest sensible default.
+ *
+ * `surfaceId` must be the surface's UUID. cmux's surface.set_background RPC
+ * silently ignores `surface` / `target_id` / short-ref values and falls back
+ * to the caller's focused surface — a silent corruption mode. `surface_id`
+ * with a UUID is the only reliable target specifier.
  */
 function mapProfileToRpcParams(
-  surface: string,
+  surfaceId: string,
   image: string,
   blend: number | undefined,
   mode: number | undefined,
@@ -62,7 +67,7 @@ function mapProfileToRpcParams(
   let repeat = false;
   if (mode === 0) { fit = "contain"; repeat = true; }
   else if (mode === 1) { fit = "cover"; }
-  return { surface, image, opacity, fit, position: "center", repeat };
+  return { surface_id: surfaceId, image, opacity, fit, position: "center", repeat };
 }
 
 export class CmuxBackend implements TerminalBackend {
@@ -108,7 +113,7 @@ export class CmuxBackend implements TerminalBackend {
    *      cache entry; caller treats as "placement target gone" and falls
    *      back to headless / re-resolution from a fresh source).
    */
-  private async resolveSurface(input: string): Promise<{ ref: string; ws: string | null } | null> {
+  private async resolveSurface(input: string): Promise<{ ref: string; ws: string | null; id: string | null } | null> {
     try {
       const tree = await cmuxJson("tree", "--id-format", "both");
       for (const win of tree.windows ?? []) {
@@ -116,7 +121,7 @@ export class CmuxBackend implements TerminalBackend {
           for (const pane of ws.panes ?? []) {
             for (const surface of pane.surfaces ?? []) {
               if (surface.id === input || surface.ref === input) {
-                return { ref: surface.ref, ws: ws.ref ?? null };
+                return { ref: surface.ref, ws: ws.ref ?? null, id: surface.id ?? null };
               }
             }
           }
@@ -130,8 +135,13 @@ export class CmuxBackend implements TerminalBackend {
         const info = await cmuxJson("identify");
         const ref = info.focused?.surface_ref ?? info.focused?.surfaceRef;
         const ws = info.focused?.workspace_ref ?? info.focused?.workspaceRef;
+        const id = info.focused?.surface_id ?? info.focused?.surfaceId;
         if (typeof ref === "string") {
-          return { ref, ws: typeof ws === "string" ? ws : null };
+          return {
+            ref,
+            ws: typeof ws === "string" ? ws : null,
+            id: typeof id === "string" ? id : (input.match(/^[0-9a-f-]{36}$/i) ? input : null),
+          };
         }
       } catch {
         // identify failed.
@@ -209,8 +219,13 @@ export class CmuxBackend implements TerminalBackend {
     const profile = this.profileStore.get(profileName);
     if (!profile || !profile.backgroundImage) return;
     await this.waitForPty(sessionId);
+    const resolved = await this.resolveSurface(sessionId);
+    if (!resolved?.id) {
+      console.error(`[crew] cmux set-background skipped: cannot resolve UUID for ${sessionId}`);
+      return;
+    }
     const params = mapProfileToRpcParams(
-      sessionId,
+      resolved.id,
       profile.backgroundImage,
       profile.blend,
       profile.mode,
@@ -218,7 +233,7 @@ export class CmuxBackend implements TerminalBackend {
     try {
       await cmux("rpc", "surface.set_background", JSON.stringify(params));
     } catch (e) {
-      console.error(`[crew] cmux set-background failed for ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
+      console.error(`[crew] cmux set-background failed for ${sessionId} (${resolved.id}): ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -390,7 +405,7 @@ export class CmuxBackend implements TerminalBackend {
     opts?: { level?: "info" | "progress" | "success" | "warning" | "error"; source?: string },
   ): Promise<void> {
     try {
-      const wsRef = await this.workspaceForSurface(sessionId);
+      const wsRef = (await this.resolveSurface(sessionId))?.ws ?? null;
       const wsFlag = wsRef ? ["--workspace", wsRef] : [];
       const levelFlag = opts?.level ? ["--level", opts.level] : [];
       const sourceFlag = ["--source", opts?.source ?? "crew"];
@@ -408,7 +423,7 @@ export class CmuxBackend implements TerminalBackend {
     // multiple agents can coexist. We key by sessionId so each pane gets its
     // own pill in its workspace's sidebar. Empty text clears the pill.
     try {
-      const wsRef = await this.workspaceForSurface(sessionId);
+      const wsRef = (await this.resolveSurface(sessionId))?.ws ?? null;
       const wsFlag = wsRef ? ["--workspace", wsRef] : [];
       const key = `crew.${sessionId}`;
       if (text === "") {
