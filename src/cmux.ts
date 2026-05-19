@@ -287,6 +287,11 @@ export class CmuxBackend implements TerminalBackend {
    *
    * This eliminates the bridge.spawn-drops-\r class of bug, where a freshly
    * split pane sat at an unsubmitted `screen -x wire-<id>` prompt.
+   *
+   * Also writes a surface.resume binding so cmux can re-run the attach
+   * after a daemon restart without crew involvement. The binding is
+   * decorative for cmux versions that don't support resume; failures
+   * here are non-fatal.
    */
   async attachScreen(
     sessionId: string,
@@ -296,6 +301,17 @@ export class CmuxBackend implements TerminalBackend {
     const args = await this.surfaceArgs(sessionId);
     await cmux("send", ...args, `screen -${mode} ${screenName}`);
     await cmux("send-key", ...args, "enter");
+    try {
+      await cmux(
+        "surface", "resume", "set",
+        ...args,
+        "--kind", "agent",
+        "--name", screenName,
+        "--shell", `screen -${mode} ${screenName}`,
+      );
+    } catch {
+      // Non-fatal — older cmux builds lack surface.resume; not load-bearing.
+    }
   }
 
   async closeSession(sessionId: string): Promise<void> {
@@ -358,6 +374,30 @@ export class CmuxBackend implements TerminalBackend {
       await cmux("rename-tab", ...args, name);
     } catch {
       // Non-fatal — tab renaming may not always work
+    }
+  }
+
+  /**
+   * Append a workspace-level log entry to cmux's sidebar log. Useful for
+   * surfacing agent lifecycle (attached, closed, stopped) where the operator
+   * can scan recent activity without opening any specific pane.
+   *
+   * iTerm2 backend leaves this undefined; orchestrator skips the call there.
+   */
+  async logWorkspace(
+    sessionId: string,
+    message: string,
+    opts?: { level?: "info" | "progress" | "success" | "warning" | "error"; source?: string },
+  ): Promise<void> {
+    try {
+      const wsRef = await this.workspaceForSurface(sessionId);
+      const wsFlag = wsRef ? ["--workspace", wsRef] : [];
+      const levelFlag = opts?.level ? ["--level", opts.level] : [];
+      const sourceFlag = ["--source", opts?.source ?? "crew"];
+      // cmux log puts the message after `--`, supporting messages that start with `-`.
+      await cmux("log", ...wsFlag, ...levelFlag, ...sourceFlag, "--", message);
+    } catch {
+      // Non-fatal — sidebar log is decorative.
     }
   }
 

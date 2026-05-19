@@ -166,6 +166,25 @@ export interface TerminalBackend {
     direction: "horizontal" | "vertical",
   ): Promise<string>;
 
+  // --- Sidebar log (optional, cmux-only today) ---
+
+  /**
+   * Append a workspace-level log entry to the sidebar. Used to surface
+   * agent lifecycle events (attached, closed, error) where the operator
+   * can see them at a glance without opening the pane.
+   *
+   * Optional: iTerm2 has no equivalent and leaves this undefined. The
+   * orchestrator checks for presence before calling. Failures are
+   * non-fatal — logging is decorative.
+   *
+   * level: cmux levels are "info" | "progress" | "success" | "warning" | "error".
+   */
+  logWorkspace?(
+    sessionId: string,
+    message: string,
+    opts?: { level?: "info" | "progress" | "success" | "warning" | "error"; source?: string },
+  ): Promise<void>;
+
   // --- Caller-workspace split (optional, cmux-only today) ---
 
   /**
