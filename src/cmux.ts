@@ -292,21 +292,12 @@ export class CmuxBackend implements TerminalBackend {
   }
 
   async isSessionAlive(sessionId: string): Promise<boolean> {
-    try {
-      const tree = await cmuxJson("tree");
-      for (const win of tree.windows ?? []) {
-        for (const ws of win.workspaces ?? []) {
-          for (const pane of ws.panes ?? []) {
-            for (const surface of pane.surfaces ?? []) {
-              if (surface.ref === sessionId) return true;
-            }
-          }
-        }
-      }
-      return false;
-    } catch {
-      return false;
-    }
+    // Reuse resolveSurface so UUID and short-ref inputs are both validated
+    // against the current cmux tree (with env-match fallback for the
+    // caller's own surface). Predates the v2 split — was checking only
+    // surface.ref, missing UUID inputs that callerSession() returns from
+    // CMUX_SURFACE_ID.
+    return (await this.resolveSurface(sessionId)) !== null;
   }
 
   async createTab(profileName?: string): Promise<string> {
