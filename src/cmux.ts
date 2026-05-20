@@ -324,8 +324,9 @@ export class CmuxBackend implements TerminalBackend {
         "--name", screenName,
         "--shell", `screen -${mode} ${screenName}`,
       );
-    } catch {
+    } catch (err) {
       // Non-fatal — older cmux builds lack surface.resume; not load-bearing.
+      console.warn(`[cmux] surface.resume.set failed for ${screenName}:`, err);
     }
   }
 
