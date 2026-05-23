@@ -136,8 +136,13 @@ export class ItermBackend implements TerminalBackend {
     await this.capability("notifications")?.notify(sessionId, title, body);
   }
 
+  /**
+   * @deprecated Phase 1 shim. iTerm2 doesn't register `workspaceControl`
+   * (tab naming is limited); callers should query `capability("workspaceControl")`
+   * and branch on null. Removed in v3.0.0.
+   */
   async renameWorkspace(_sessionId: string, _name: string): Promise<void> {
-    // iTerm2 tab naming is limited — see setTabName
+    // No-op; iTerm2 doesn't register WorkspaceControl.
   }
 
   splitWebBrowser(

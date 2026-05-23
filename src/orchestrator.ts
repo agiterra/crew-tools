@@ -1074,8 +1074,9 @@ export class Orchestrator {
       await this.terminal.setSessionName(sessionId, titleCase(paneName));
     }
 
-    // Name the workspace/tab (cmux: renames workspace; iTerm2: no-op)
-    await this.terminal.renameWorkspace(sessionId, name);
+    // Name the workspace/tab. Capability is cmux-only today — iTerm2
+    // doesn't register it (tab naming is too limited).
+    await this.terminal.capability("workspaceControl")?.rename(sessionId, name);
 
     return { ...tab, pane };
   }

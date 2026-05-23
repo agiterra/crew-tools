@@ -17,6 +17,7 @@ import type { TerminalBackend, PaneProfile } from "./terminal.js";
 import type { CapabilityMap, CapabilityRegistry } from "./capabilities/types.js";
 import { CmuxNotifications } from "./cmux-capabilities/notifications.js";
 import { CmuxSidebarLog } from "./cmux-capabilities/sidebar-log.js";
+import { CmuxWorkspaceControl } from "./cmux-capabilities/workspace-control.js";
 
 // Capability registration deferred to constructor (needs class-private
 // `surfaceArgs` / `resolveSurface` bindings). Fields declared, populated
@@ -97,6 +98,7 @@ export class CmuxBackend implements TerminalBackend {
         cmux,
         async (sid) => (await this.resolveSurface(sid))?.ws ?? null,
       ),
+      workspaceControl: new CmuxWorkspaceControl(cmux, cmuxJson),
     };
   }
 
@@ -485,25 +487,12 @@ export class CmuxBackend implements TerminalBackend {
     await this.capability("notifications")?.notify(sessionId, title, body);
   }
 
+  /**
+   * @deprecated Phase 1 shim. Use `capability("workspaceControl")?.rename(...)`.
+   * Removed in v3.0.0.
+   */
   async renameWorkspace(sessionId: string, name: string): Promise<void> {
-    try {
-      // Find which workspace this surface belongs to
-      const tree = await cmuxJson("tree");
-      for (const win of tree.windows ?? []) {
-        for (const ws of win.workspaces ?? []) {
-          for (const pane of ws.panes ?? []) {
-            for (const surface of pane.surfaces ?? []) {
-              if (surface.ref === sessionId) {
-                await cmux("rename-workspace", "--workspace", ws.ref, name);
-                return;
-              }
-            }
-          }
-        }
-      }
-    } catch {
-      // Non-fatal
-    }
+    await this.capability("workspaceControl")?.rename(sessionId, name);
   }
 
   writePaneProfile(profile: PaneProfile): string {
