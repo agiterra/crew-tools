@@ -62,7 +62,21 @@ export async function reconcile(
 
     knownScreenNames.add(agent.screen_name);
     const session = sessionByName.get(agent.screen_name);
+    // Two-step liveness check. `screen -ls` lists zombie sessions briefly
+    // after process death, until screen GCs the socket. Without the kill(pid,
+    // 0) cross-check, the reconciler touches a dead agent as alive and the
+    // stale row poisons downstream operations (agent_list, attach). Loom hit
+    // this 2026-05-23 with heddle after a 21h-idle screen death.
+    let isLive = false;
     if (session) {
+      try {
+        process.kill(session.pid, 0);
+        isLive = true;
+      } catch {
+        isLive = false;
+      }
+    }
+    if (isLive && session) {
       store.updateAgentPid(agent.id, session.pid);
       store.touchAgent(agent.id);
       alive.push(agent.id);

@@ -124,9 +124,22 @@ export async function isAttached(name: string): Promise<boolean> {
 
 /**
  * Check if a screen session is alive.
+ *
+ * Belt-and-suspenders: `screen -ls` will list a zombie session briefly after
+ * its process dies, until screen GCs the socket. Cross-check the pid with
+ * `kill(pid, 0)` so callers (attach, reconciler) don't trust a stale listing
+ * and end up operating on a dead session. Loom hit this 2026-05-23 — see
+ * `feedback-screen-zombie-listings` for the incident.
  */
 export async function isAlive(name: string): Promise<boolean> {
-  return (await getSessionPid(name)) !== null;
+  const pid = await getSessionPid(name);
+  if (pid === null) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
