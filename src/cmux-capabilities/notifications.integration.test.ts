@@ -12,12 +12,19 @@
 import { describe, test, expect } from "bun:test";
 import { existsSync } from "fs";
 
-const CMUX_BIN =
-  process.env.CMUX_BUNDLED_CLI_PATH ||
-  "/Applications/agiterra-overlay.app/Contents/Resources/bin/cmux";
+// Probe a few well-known cmux CLI locations on macOS. cmux's bundle id varies
+// across operator setups (agiterra.app, agiterra-overlay.app, cmux.app); the
+// CLI is always at <bundle>/Contents/Resources/bin/cmux. Falls back to PATH.
+const CANDIDATE_CMUX_BINS = [
+  process.env.CMUX_BUNDLED_CLI_PATH,
+  "/Applications/agiterra.app/Contents/Resources/bin/cmux",
+  "/Applications/agiterra-overlay.app/Contents/Resources/bin/cmux",
+  "/Applications/cmux.app/Contents/Resources/bin/cmux",
+].filter((p): p is string => Boolean(p));
 
 const cmuxAvailable =
-  existsSync(CMUX_BIN) && !process.env.CREW_SKIP_CMUX_INTEGRATION;
+  CANDIDATE_CMUX_BINS.some((p) => existsSync(p)) &&
+  !process.env.CREW_SKIP_CMUX_INTEGRATION;
 
 describe.if(cmuxAvailable)("cmux Notifications — live integration", () => {
   test("notify against the focused surface does not throw", async () => {
