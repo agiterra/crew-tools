@@ -30,11 +30,16 @@ const { Orchestrator } = await import("./orchestrator");
 // install behavior; default is empty (`capability("...")` returns null).
 const terminalCapabilities: Record<string, unknown> = {};
 
+// Mutable state for the terminal mock so tests can flip what currentTabId
+// reports without re-mocking the entire backend per case.
+const terminalState = { currentTabId: null as string | null };
+
 function makeTerminal(): TerminalBackend {
   return {
     name: "test",
     capability: ((name: string) => (terminalCapabilities[name] ?? null)) as TerminalBackend["capability"],
     currentSessionId: mock(async () => ""),
+    currentTabId: mock(async () => terminalState.currentTabId),
     sessionIdForTty: mock(async () => null),
     splitPane: mock(async () => ""),
     splitSession: mock(async () => ""),
@@ -541,6 +546,38 @@ describe("attachAgent screen-liveness guard", () => {
     } finally {
       screenState.isAliveResult = false;
     }
+  });
+});
+
+describe("activeTab introspection", () => {
+  test("returns the crew tab whose iterm_session_id matches the focused tab", async () => {
+    orch.store.createTab("eng", undefined, "workspace:3");
+    orch.store.createTab("ops", undefined, "workspace:4");
+    terminalState.currentTabId = "workspace:3";
+    try {
+      const active = await orch.activeTab();
+      expect(active?.name).toBe("eng");
+    } finally {
+      terminalState.currentTabId = null;
+    }
+  });
+
+  test("returns null when the focused tab is not crew-tracked", async () => {
+    orch.store.createTab("eng", undefined, "workspace:3");
+    terminalState.currentTabId = "workspace:99"; // some manually-opened cmux ws
+    try {
+      const active = await orch.activeTab();
+      expect(active).toBeNull();
+    } finally {
+      terminalState.currentTabId = null;
+    }
+  });
+
+  test("returns null when the backend can't resolve a focused tab", async () => {
+    orch.store.createTab("eng", undefined, "workspace:3");
+    terminalState.currentTabId = null; // backend returned null
+    const active = await orch.activeTab();
+    expect(active).toBeNull();
   });
 });
 

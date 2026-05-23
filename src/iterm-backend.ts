@@ -22,6 +22,18 @@ export class ItermBackend implements TerminalBackend {
     return iterm.currentSessionId();
   }
 
+  async currentTabId(): Promise<string | null> {
+    // iTerm2 tabs are not first-class — the closest stable identifier for
+    // "the tab the operator is looking at" is the id of the first session
+    // in the current tab, which matches what we store in
+    // tabs.iterm_session_id at crew tab creation time.
+    try {
+      return await iterm.currentTabFirstSessionId();
+    } catch {
+      return null;
+    }
+  }
+
   sessionIdForTty(ttyName: string): Promise<string | null> {
     return iterm.sessionIdForTty(ttyName);
   }

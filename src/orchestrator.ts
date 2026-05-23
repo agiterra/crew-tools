@@ -1089,6 +1089,30 @@ export class Orchestrator {
     return this.store.listTabs();
   }
 
+  /**
+   * Return the crew-tracked tab the operator is currently viewing, or null
+   * if no tracked tab matches the focused workspace/window. Used by
+   * placement-aware spawn flows: bridge.spawn can call this to land a new
+   * pane in the operator's current tab instead of creating an orphan tab
+   * they have to switch to manually.
+   *
+   * Returns null in three cases: (a) the terminal backend can't resolve a
+   * focused tab (no window in focus, AppleScript denied, etc.); (b) the
+   * focused tab is not crew-tracked (e.g., a shell tab the operator opened
+   * manually); (c) the backend's currentTabId returned a value that doesn't
+   * match any tab.iterm_session_id. Callers treating null as "place into a
+   * fresh tab" preserve the pre-fix behavior.
+   *
+   * See [[draft-crew-tools-papercuts-from-loom]] §2 for the surfacing
+   * incident (loom 2026-05-23 spawning heddle into a new tab while Brian
+   * watched a different tab).
+   */
+  async activeTab(): Promise<Tab | null> {
+    const tabId = await this.terminal.currentTabId();
+    if (!tabId) return null;
+    return this.store.listTabs().find((t) => t.iterm_session_id === tabId) ?? null;
+  }
+
   deleteTab(name: string): void {
     this.store.deleteTab(name);
   }

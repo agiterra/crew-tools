@@ -264,6 +264,20 @@ export class CmuxBackend implements TerminalBackend {
     return info.focused?.surface_ref ?? info.focused?.surfaceRef;
   }
 
+  async currentTabId(): Promise<string | null> {
+    // cmux 'identify' returns focused.workspace_ref — the workspace the
+    // operator is currently viewing. Crew tabs map 1:1 to cmux workspaces
+    // and store the workspace ref in tabs.iterm_session_id (legacy column
+    // name; semantics are backend-agnostic).
+    try {
+      const info = await cmuxJson("identify");
+      const ws = info.focused?.workspace_ref ?? info.focused?.workspaceRef;
+      return typeof ws === "string" ? ws : null;
+    } catch {
+      return null;
+    }
+  }
+
   async sessionIdForTty(ttyName: string): Promise<string | null> {
     try {
       // Use tree --json to find all surfaces and match by TTY
