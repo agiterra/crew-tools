@@ -18,6 +18,7 @@ import type { CapabilityMap, CapabilityRegistry } from "./capabilities/types.js"
 import { CmuxNotifications } from "./cmux-capabilities/notifications.js";
 import { CmuxSidebarLog } from "./cmux-capabilities/sidebar-log.js";
 import { CmuxWorkspaceControl } from "./cmux-capabilities/workspace-control.js";
+import { CmuxWorkspaceSplit } from "./cmux-capabilities/workspace-split.js";
 
 // Capability registration deferred to constructor (needs class-private
 // `surfaceArgs` / `resolveSurface` bindings). Fields declared, populated
@@ -99,6 +100,7 @@ export class CmuxBackend implements TerminalBackend {
         async (sid) => (await this.resolveSurface(sid))?.ws ?? null,
       ),
       workspaceControl: new CmuxWorkspaceControl(cmux, cmuxJson),
+      workspaceSplit: new CmuxWorkspaceSplit(cmux, (s) => this.resolveSurface(s)),
     };
   }
 
@@ -569,27 +571,14 @@ export class CmuxBackend implements TerminalBackend {
    * surface invalid, cmux split refused, etc.). The orchestrator treats
    * a null return as "best-effort failed — keep the agent headless."
    */
+  /**
+   * @deprecated Phase 1 shim. Use `capability("workspaceSplit")?.splitFromCaller(...)`.
+   * Removed in v3.0.0.
+   */
   async splitFromCallerForAgent(
     callerSurfaceId: string,
     direction: "right" | "down",
   ): Promise<string | null> {
-    // Strict resolve: placement next to caller only makes sense if caller's
-    // surface actually exists. Unlike per-surface ops on possibly-stale refs
-    // (which surfaceArgs lets through so cmux can return "Surface not found"),
-    // cmux new-split silently ignores an unknown --surface and creates an
-    // orphan surface in the focused workspace. Fail fast instead.
-    const resolved = await this.resolveSurface(callerSurfaceId);
-    if (!resolved) return null;
-    try {
-      const cmuxDir = direction === "right" ? "right" : "down";
-      const args = resolved.ws
-        ? ["--surface", resolved.ref, "--workspace", resolved.ws]
-        : ["--surface", resolved.ref];
-      const output = await cmux("new-split", cmuxDir, ...args);
-      const match = output.match(/surface:\d+/);
-      return match ? match[0] : null;
-    } catch {
-      return null;
-    }
+    return (await this.capability("workspaceSplit")?.splitFromCaller(callerSurfaceId, direction)) ?? null;
   }
 }

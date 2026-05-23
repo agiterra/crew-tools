@@ -238,11 +238,12 @@ export class Orchestrator {
     // stopAgent can tear the pane down alongside the agent. Otherwise the
     // pane lingers showing an exited screen session after the agent dies.
     let auxSurface: string | undefined;
-    if (opts.splitInCallerWorkspace && this.terminal.splitFromCallerForAgent) {
+    const workspaceSplit = this.terminal.capability("workspaceSplit");
+    if (opts.splitInCallerWorkspace && workspaceSplit) {
       try {
         const callerId = await this.terminal.currentSessionId();
         if (callerId) {
-          const newSurface = await this.terminal.splitFromCallerForAgent(
+          const newSurface = await workspaceSplit.splitFromCaller(
             callerId,
             opts.splitInCallerWorkspace.direction,
           );

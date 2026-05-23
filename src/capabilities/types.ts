@@ -20,6 +20,7 @@
 import type { NotificationsCapability } from "./notifications.js";
 import type { SidebarLogCapability } from "./sidebar-log.js";
 import type { WorkspaceControlCapability } from "./workspace-control.js";
+import type { WorkspaceSplitCapability } from "./workspace-split.js";
 
 /**
  * The canonical registry of capability names → implementation types.
@@ -35,6 +36,7 @@ export interface CapabilityMap {
   notifications: NotificationsCapability;
   sidebarLog: SidebarLogCapability;
   workspaceControl: WorkspaceControlCapability;
+  workspaceSplit: WorkspaceSplitCapability;
 }
 
 /**
