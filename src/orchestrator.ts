@@ -704,6 +704,18 @@ export class Orchestrator {
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`agent '${agentId}' not found`);
 
+    // Verify the screen session is actually alive. attachAgent used to
+    // silently no-op (screen.detachSession is .nothrow(), and screen -r
+    // against a dead session fails only inside the pane), so the API would
+    // claim success while the operator stared at a blank pane. Loom hit this
+    // 2026-05-23 attaching heddle whose screen had died during 21h of idle.
+    if (!(await screen.isAlive(agent.screen_name))) {
+      throw new Error(
+        `agent '${agentId}' screen session '${agent.screen_name}' is dead. ` +
+        `Run reconcile to prune the stale row, then re-spawn the agent.`,
+      );
+    }
+
     // Auto-swap to a themed pane if needed
     const resolvedPane = await this.ensureThemedPane(paneName);
 

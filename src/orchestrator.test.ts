@@ -45,6 +45,7 @@ function makeTerminal(): TerminalBackend {
     deletePaneProfile: mock(() => {}),
     setProfile: mock(async () => {}),
     sendText: mock(async () => {}),
+    attachScreen: mock(async () => {}),
   } as unknown as TerminalBackend;
 }
 
@@ -497,6 +498,43 @@ describe("resumeAgent", () => {
     expect(cmd).not.toContain("--resume");
     expect(cmd).toContain("cd '/tmp/nb'");
     expect(cmd).toContain("AGENT_ID='never-booted'");
+  });
+});
+
+describe("attachAgent screen-liveness guard", () => {
+  // Regression: pre-fix, attachAgent silently 'succeeded' against a dead
+  // screen session. Operator sees a blank pane and a green API response.
+  // Loom hit this 2026-05-23 — see feedback-screen-zombie-listings.
+  test("throws when the agent's screen session is dead", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "ghost", AGENT_NAME: "Ghost" } });
+    orch.store.createTab("eng");
+    const pane = orch.store.createPane("oak", "eng");
+    orch.store.setPaneItermId(pane.name, "iterm-session-123");
+
+    screenState.isAliveResult = false; // screen is dead
+    try {
+      await expect(orch.attachAgent("ghost", "oak"))
+        .rejects.toThrow(/screen session 'wire-ghost' is dead/);
+    } finally {
+      screenState.isAliveResult = false;
+    }
+  });
+
+  test("attaches normally when the screen session is alive", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "alive-agent", AGENT_NAME: "AliveAgent" } });
+    orch.store.createTab("eng");
+    const pane = orch.store.createPane("oak", "eng");
+    orch.store.setPaneItermId(pane.name, "iterm-session-456");
+
+    screenState.isAliveResult = true;
+    try {
+      await orch.attachAgent("alive-agent", "oak");
+      // Liveness guard should pass; pane assignment lands on the row.
+      const row = orch.store.getAgent("alive-agent");
+      expect(row?.pane).toBe("oak");
+    } finally {
+      screenState.isAliveResult = false;
+    }
   });
 });
 
