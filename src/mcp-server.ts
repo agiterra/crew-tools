@@ -447,6 +447,11 @@ export async function startServer(): Promise<void> {
       inputSchema: { type: "object" as const, properties: {} },
     },
     {
+      name: "tab_active",
+      description: "Return the crew-tracked tab the operator is currently viewing, or null if the focused tab is not crew-tracked or can't be determined. Use this before spawning a new pane to land it where the operator's eyes are, instead of creating a fresh tab they have to switch to.",
+      inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
       name: "tab_destroy",
       description: "Destroy a tab and all its panes. Agents in those panes are detached (keep running headless). NEVER destroy a tab containing a pane you are sitting in.",
       inputSchema: {
@@ -764,6 +769,9 @@ export async function startServer(): Promise<void> {
           break;
         case "tab_list":
           result = orchestrator.listTabs();
+          break;
+        case "tab_active":
+          result = { tab: await orchestrator.activeTab() };
           break;
         case "tab_destroy":
           orchestrator.deleteTab(a.name as string);

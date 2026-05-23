@@ -32,6 +32,20 @@ export interface TerminalBackend {
   /** Get the session/surface ID of the current (focused) terminal. */
   currentSessionId(): Promise<string>;
 
+  /**
+   * Get the tab/workspace ID of the focused tab — i.e. where the operator's
+   * eyes are. Matches the `iterm_session_id` column in `crews.db.tabs` for
+   * crew-tracked tabs.
+   *
+   * Returns null if the active tab can't be resolved (no focused window,
+   * AppleScript denied, cmux daemon unreachable, etc.). Callers should
+   * treat null as "unknown — fall back to default placement."
+   *
+   * cmux: returns the focused workspace's ref (e.g. "workspace:3").
+   * iTerm2: returns the id of the first session in the current tab.
+   */
+  currentTabId(): Promise<string | null>;
+
   /** Resolve a TTY device path to a session/surface ID. */
   sessionIdForTty(ttyName: string): Promise<string | null>;
 

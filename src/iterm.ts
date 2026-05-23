@@ -40,6 +40,23 @@ export async function currentSessionId(): Promise<string> {
 }
 
 /**
+ * Get the iTerm2 session ID of the FIRST session of the current tab. This is
+ * the stable identifier we use to match crew-tracked tabs (tabs.iterm_session_id
+ * is stamped from the initial pane's session id at create-tab time). The
+ * current session may be any pane in the tab; the first session anchors the
+ * tab identity.
+ */
+export async function currentTabFirstSessionId(): Promise<string> {
+  return osascript(`
+    tell application "iTerm2"
+      tell current tab of current window
+        return id of first session
+      end tell
+    end tell
+  `);
+}
+
+/**
  * Get the iTerm2 session ID for the session owning a specific TTY.
  * More reliable than ITERM_SESSION_ID env var which can go stale.
  */
