@@ -738,19 +738,25 @@ export class Orchestrator {
       // Non-fatal
     }
 
-    // Flash the tab and notify — agent is now visible.
-    // On cmux these are native; on iTerm2 flash is a no-op and notify
-    // falls back to setBadge, so the agent badge below must run AFTER
-    // to reclaim the badge slot.
-    try {
-      await this.terminal.flashSession(pane.iterm_id);
-      await this.terminal.notifySession(pane.iterm_id, `${agent.display_name} attached`, `→ pane ${resolvedPane}`);
-    } catch (e) {
-      console.error(`[crew] attach flash/notify failed for '${agentId}' on '${resolvedPane}':`, e);
+    // Flash the tab and notify — agent is now visible. Both cmux and iTerm2
+    // register the Notifications capability with real native implementations
+    // (cmux native OS notification + tab ring; iTerm2 OSC 9 banner + OSC
+    // 1337 RequestAttention). Backends without the capability skip silently.
+    const notifications = this.terminal.capability("notifications");
+    if (notifications) {
+      try {
+        await notifications.flash(pane.iterm_id);
+        await notifications.notify(
+          pane.iterm_id,
+          `${agent.display_name} attached`,
+          `→ pane ${resolvedPane}`,
+        );
+      } catch (e) {
+        console.error(`[crew] attach flash/notify failed for '${agentId}' on '${resolvedPane}':`, e);
+      }
     }
 
     // Apply the agent's badge to the pane (color from pane's profile, text from agent).
-    // Runs AFTER notifySession so it wins on iTerm2 (where notify falls back to setBadge).
     if (agent.badge) {
       try {
         await this.terminal.setBadge(pane.iterm_id, agent.badge);

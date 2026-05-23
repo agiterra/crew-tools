@@ -25,9 +25,15 @@ mock.module("./screen", () => ({
 
 const { Orchestrator } = await import("./orchestrator");
 
+// Mutable capability registry for the terminal mock. Individual tests can
+// set `terminalCapabilities.notifications = { notify: ..., flash: ... }` to
+// install behavior; default is empty (`capability("...")` returns null).
+const terminalCapabilities: Record<string, unknown> = {};
+
 function makeTerminal(): TerminalBackend {
   return {
     name: "test",
+    capability: ((name: string) => (terminalCapabilities[name] ?? null)) as TerminalBackend["capability"],
     currentSessionId: mock(async () => ""),
     sessionIdForTty: mock(async () => null),
     splitPane: mock(async () => ""),
