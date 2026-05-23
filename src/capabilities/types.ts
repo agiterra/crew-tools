@@ -18,6 +18,7 @@
  */
 
 import type { NotificationsCapability } from "./notifications.js";
+import type { SidebarLogCapability } from "./sidebar-log.js";
 
 /**
  * The canonical registry of capability names → implementation types.
@@ -31,6 +32,7 @@ import type { NotificationsCapability } from "./notifications.js";
  */
 export interface CapabilityMap {
   notifications: NotificationsCapability;
+  sidebarLog: SidebarLogCapability;
 }
 
 /**

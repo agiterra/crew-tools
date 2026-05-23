@@ -16,9 +16,11 @@ import { $ } from "bun";
 import type { TerminalBackend, PaneProfile } from "./terminal.js";
 import type { CapabilityMap, CapabilityRegistry } from "./capabilities/types.js";
 import { CmuxNotifications } from "./cmux-capabilities/notifications.js";
+import { CmuxSidebarLog } from "./cmux-capabilities/sidebar-log.js";
 
 // Capability registration deferred to constructor (needs class-private
-// `surfaceArgs` binding). Field declared, populated in constructor.
+// `surfaceArgs` / `resolveSurface` bindings). Fields declared, populated
+// in constructor.
 
 /**
  * Run a cmux CLI command and return trimmed stdout.
@@ -91,6 +93,10 @@ export class CmuxBackend implements TerminalBackend {
   constructor() {
     this._capabilities = {
       notifications: new CmuxNotifications(cmux, (sid) => this.surfaceArgs(sid)),
+      sidebarLog: new CmuxSidebarLog(
+        cmux,
+        async (sid) => (await this.resolveSurface(sid))?.ws ?? null,
+      ),
     };
   }
 
@@ -431,21 +437,16 @@ export class CmuxBackend implements TerminalBackend {
    *
    * iTerm2 backend leaves this undefined; orchestrator skips the call there.
    */
+  /**
+   * @deprecated Phase 1 shim. Use `capability("sidebarLog")?.append(...)`.
+   * Removed in v3.0.0.
+   */
   async logWorkspace(
     sessionId: string,
     message: string,
     opts?: { level?: "info" | "progress" | "success" | "warning" | "error"; source?: string },
   ): Promise<void> {
-    try {
-      const wsRef = (await this.resolveSurface(sessionId))?.ws ?? null;
-      const wsFlag = wsRef ? ["--workspace", wsRef] : [];
-      const levelFlag = opts?.level ? ["--level", opts.level] : [];
-      const sourceFlag = ["--source", opts?.source ?? "crew"];
-      // cmux log puts the message after `--`, supporting messages that start with `-`.
-      await cmux("log", ...wsFlag, ...levelFlag, ...sourceFlag, "--", message);
-    } catch {
-      // Non-fatal — sidebar log is decorative.
-    }
+    await this.capability("sidebarLog")?.append(sessionId, message, opts);
   }
 
   async setBadge(sessionId: string, text: string): Promise<void> {

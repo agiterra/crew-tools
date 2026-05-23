@@ -595,7 +595,7 @@ export class Orchestrator {
       if (pane?.iterm_id) {
         try { await this.terminal.setBadge(pane.iterm_id, ""); } catch {}
         try {
-          await this.terminal.logWorkspace?.(
+          await this.terminal.capability("sidebarLog")?.append(
             pane.iterm_id,
             `${agent.display_name} closed`,
             { level: "info", source: "crew" },
@@ -659,7 +659,7 @@ export class Orchestrator {
       if (pane?.iterm_id) {
         try { await this.terminal.setBadge(pane.iterm_id, ""); } catch {}
         try {
-          await this.terminal.logWorkspace?.(
+          await this.terminal.capability("sidebarLog")?.append(
             pane.iterm_id,
             `${agent.display_name} stopped (hard-kill)`,
             { level: "warning", source: "crew" },
@@ -738,10 +738,10 @@ export class Orchestrator {
     await this.terminal.attachScreen(pane.iterm_id, agent.screen_name, "x");
     this.store.updateAgentPane(agentId, resolvedPane);
 
-    // Surface the attach in the workspace sidebar log. cmux-only — iTerm2
-    // leaves logWorkspace undefined.
+    // Surface the attach in the workspace sidebar log. Capability is
+    // cmux-only today — iTerm2 backend doesn't register it.
     try {
-      await this.terminal.logWorkspace?.(
+      await this.terminal.capability("sidebarLog")?.append(
         pane.iterm_id,
         `${agent.display_name} attached → ${resolvedPane}`,
         { level: "success", source: "crew" },
