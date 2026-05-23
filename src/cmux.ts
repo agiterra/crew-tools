@@ -19,6 +19,7 @@ import { CmuxNotifications } from "./cmux-capabilities/notifications.js";
 import { CmuxSidebarLog } from "./cmux-capabilities/sidebar-log.js";
 import { CmuxWorkspaceControl } from "./cmux-capabilities/workspace-control.js";
 import { CmuxWorkspaceSplit } from "./cmux-capabilities/workspace-split.js";
+import { CmuxProfiles } from "./cmux-capabilities/profiles.js";
 
 // Capability registration deferred to constructor (needs class-private
 // `surfaceArgs` / `resolveSurface` bindings). Fields declared, populated
@@ -82,14 +83,6 @@ function mapProfileToRpcParams(
 export class CmuxBackend implements TerminalBackend {
   readonly name = "cmux" as const;
 
-  /**
-   * In-memory profile store. iTerm2 persists profiles to disk; cmux has no
-   * dynamic-profile concept, so we stash PaneProfile objects under synthetic
-   * names and resolve them when setProfile() / splitWithProfile() fire.
-   */
-  private profileStore = new Map<string, PaneProfile>();
-  private profileSeq = 0;
-
   private readonly _capabilities: CapabilityRegistry;
 
   constructor() {
@@ -101,6 +94,31 @@ export class CmuxBackend implements TerminalBackend {
       ),
       workspaceControl: new CmuxWorkspaceControl(cmux, cmuxJson),
       workspaceSplit: new CmuxWorkspaceSplit(cmux, (s) => this.resolveSurface(s)),
+      profiles: new CmuxProfiles({
+        splitPane: (d) => this.splitPane(d),
+        splitSession: (sid, d) => this.splitSession(sid, d),
+        applyToSurface: async (sid, profile) => {
+          // Use cmux's RPC pipeline: wait for PTY, resolve UUID, fire.
+          if (!profile.backgroundImage) return;
+          await this.waitForPty(sid);
+          const resolved = await this.resolveSurface(sid);
+          if (!resolved?.id) {
+            console.error(`[crew] cmux set-background skipped: cannot resolve UUID for ${sid}`);
+            return;
+          }
+          const params = mapProfileToRpcParams(
+            resolved.id,
+            profile.backgroundImage,
+            profile.blend,
+            profile.mode,
+          );
+          try {
+            await cmux("rpc", "surface.set_background", JSON.stringify(params));
+          } catch (e) {
+            console.error(`[crew] cmux set-background failed for ${sid} (${resolved.id}): ${e instanceof Error ? e.message : String(e)}`);
+          }
+        },
+      }),
     };
   }
 
@@ -232,36 +250,6 @@ export class CmuxBackend implements TerminalBackend {
       await new Promise((r) => setTimeout(r, 50));
     }
     return false;
-  }
-
-  /**
-   * Apply a stored profile's background to a surface via cmux's RPC.
-   * Best-effort — failures (cmux down, surface gone, malformed image path)
-   * are logged but never thrown. Matches the rest of this class's policy.
-   *
-   * Polls briefly for PTY allocation before firing the RPC. See waitForPty
-   * for why.
-   */
-  private async applyProfileToSurface(sessionId: string, profileName: string): Promise<void> {
-    const profile = this.profileStore.get(profileName);
-    if (!profile || !profile.backgroundImage) return;
-    await this.waitForPty(sessionId);
-    const resolved = await this.resolveSurface(sessionId);
-    if (!resolved?.id) {
-      console.error(`[crew] cmux set-background skipped: cannot resolve UUID for ${sessionId}`);
-      return;
-    }
-    const params = mapProfileToRpcParams(
-      resolved.id,
-      profile.backgroundImage,
-      profile.blend,
-      profile.mode,
-    );
-    try {
-      await cmux("rpc", "surface.set_background", JSON.stringify(params));
-    } catch (e) {
-      console.error(`[crew] cmux set-background failed for ${sessionId} (${resolved.id}): ${e instanceof Error ? e.message : String(e)}`);
-    }
   }
 
   async currentSessionId(): Promise<string> {
@@ -420,7 +408,7 @@ export class CmuxBackend implements TerminalBackend {
     }
     const result = surfaceRef ?? wsRef;
     if (profileName && surfaceRef) {
-      await this.applyProfileToSurface(surfaceRef, profileName);
+      await this.capability("profiles")!.setProfile(surfaceRef, profileName);
     }
     return result;
   }
@@ -497,41 +485,36 @@ export class CmuxBackend implements TerminalBackend {
     await this.capability("workspaceControl")?.rename(sessionId, name);
   }
 
+  /** @deprecated Phase 1 shim. Use `capability("profiles")?.writePane(...)`. Removed in v3.0.0. */
   writePaneProfile(profile: PaneProfile): string {
-    // cmux has no on-disk dynamic-profile concept — stash in memory and
-    // apply when the new surface exists (in setProfile / splitWithProfile).
-    const name = `cmux-profile-${this.profileSeq++}-${profile.paneName}`;
-    this.profileStore.set(name, profile);
-    return name;
+    return this.capability("profiles")!.writePane(profile);
   }
 
+  /** @deprecated Phase 1 shim. Use `capability("profiles")?.writeEmpty()`. Removed in v3.0.0. */
   writeEmptyPaneProfile(): string {
-    // Empty profile means "no background" — represented as a name with no
-    // entry in the store, so applyProfileToSurface no-ops on lookup.
-    return "cmux-empty";
+    return this.capability("profiles")!.writeEmpty();
   }
 
+  /** @deprecated Phase 1 shim. Use `capability("profiles")?.setProfile(...)`. Removed in v3.0.0. */
   async setProfile(sessionId: string, profileName: string): Promise<void> {
-    await this.applyProfileToSurface(sessionId, profileName);
+    await this.capability("profiles")!.setProfile(sessionId, profileName);
   }
 
+  /** @deprecated Phase 1 shim. Use `capability("profiles")?.splitPaneWithProfile(...)`. Removed in v3.0.0. */
   async splitPaneWithProfile(
     direction: "horizontal" | "vertical",
     profileName: string,
   ): Promise<string> {
-    const sessionId = await this.splitPane(direction);
-    await this.applyProfileToSurface(sessionId, profileName);
-    return sessionId;
+    return this.capability("profiles")!.splitPaneWithProfile(direction, profileName);
   }
 
+  /** @deprecated Phase 1 shim. Use `capability("profiles")?.splitSessionWithProfile(...)`. Removed in v3.0.0. */
   async splitSessionWithProfile(
     sessionId: string,
     direction: "horizontal" | "vertical",
     profileName: string,
   ): Promise<string> {
-    const newSessionId = await this.splitSession(sessionId, direction);
-    await this.applyProfileToSurface(newSessionId, profileName);
-    return newSessionId;
+    return this.capability("profiles")!.splitSessionWithProfile(sessionId, direction, profileName);
   }
 
   async splitWebBrowser(

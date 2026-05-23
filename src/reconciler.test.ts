@@ -26,9 +26,26 @@ function makeTerminal(aliveSessionIds: string[]): TerminalBackend & { calls: Ter
     writePaneProfile: [],
     setProfile: [],
   };
+  // Profiles capability — mirrors what cmux/iterm register, but records
+  // calls into the shared `calls` bag for assertion compatibility with the
+  // pre-capability tests.
+  const profilesCap = {
+    writePane: mock((profile: { paneName: string; backgroundImage?: string }) => {
+      calls.writePaneProfile.push({ paneName: profile.paneName, backgroundImage: profile.backgroundImage });
+      return `Crew ${profile.paneName}`;
+    }),
+    writeEmpty: mock(() => "Crew Empty Pane"),
+    setProfile: mock(async (sessionId: string, profileName: string) => {
+      calls.setProfile.push({ sessionId, profileName });
+    }),
+    splitPaneWithProfile: mock(async () => ""),
+    splitSessionWithProfile: mock(async () => ""),
+  };
+  const capabilities: Record<string, unknown> = { profiles: profilesCap };
   const t: TerminalBackend & { calls: TerminalCalls } = {
     name: "test",
     calls,
+    capability: ((name: string) => capabilities[name] ?? null) as TerminalBackend["capability"],
     currentSessionId: mock(async () => ""),
     sessionIdForTty: mock(async () => null),
     splitPane: mock(async () => ""),

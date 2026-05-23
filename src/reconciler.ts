@@ -193,18 +193,23 @@ export async function reconcile(
         }
       }
 
-      // Build the themed profile and apply it to the live session.
+      // Build the themed profile and apply it to the live session. Both
+      // cmux and iTerm2 register the Profiles capability (different
+      // mechanisms: iTerm dynamic profiles + OSC 1337; cmux in-memory map
+      // + surface.set_background RPC). Skip if a backend doesn't register.
+      const profiles = terminal.capability("profiles");
+      if (!profiles) continue;
       const bgPath = backgroundImagePath(original.theme, workingName, themeConfig);
       const badgeColor = themeConfig?.badgeColors?.[workingName] ?? themeConfig?.defaultBadgeColor;
       try {
-        const profileName = terminal.writePaneProfile({
+        const profileName = profiles.writePane({
           paneName: workingName,
           backgroundImage: bgPath ?? undefined,
           blend: themeConfig?.background.blend,
           mode: themeConfig?.background.mode,
           badgeColor,
         });
-        await terminal.setProfile(original.iterm_id, profileName);
+        await profiles.setProfile(original.iterm_id, profileName);
         // SetProfile switches profile attributes but leaves the session title untouched.
         // Always set the session name so live iTerm UI matches the DB pane name.
         await terminal.setSessionName(original.iterm_id, titleCase(workingName));

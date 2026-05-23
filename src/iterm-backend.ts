@@ -6,12 +6,20 @@ import type { TerminalBackend, PaneProfile } from "./terminal.js";
 import type { CapabilityMap, CapabilityRegistry } from "./capabilities/types.js";
 import * as iterm from "./iterm.js";
 import { ItermNotifications } from "./iterm-capabilities/notifications.js";
+import { ItermProfiles } from "./iterm-capabilities/profiles.js";
 
 export class ItermBackend implements TerminalBackend {
   readonly name = "iterm" as const;
 
   private readonly _capabilities: CapabilityRegistry = {
     notifications: new ItermNotifications(iterm.writeEscapeToSession),
+    profiles: new ItermProfiles({
+      writePaneProfile: iterm.writePaneProfile,
+      writeEmptyPaneProfile: iterm.writeEmptyPaneProfile,
+      writeEscapeToSession: iterm.writeEscapeToSession,
+      splitPaneWithProfile: iterm.splitPaneWithProfile,
+      splitSessionWithProfile: iterm.splitSessionWithProfile,
+    }),
   };
 
   capability<K extends keyof CapabilityMap>(name: K): CapabilityMap[K] | null {
@@ -83,41 +91,36 @@ export class ItermBackend implements TerminalBackend {
     return iterm.setBadge(sessionId, text);
   }
 
+  /** @deprecated Phase 1 shim. Use `capability("profiles")?.writePane(...)`. Removed in v3.0.0. */
   writePaneProfile(profile: PaneProfile): string {
-    if (!profile.backgroundImage) {
-      iterm.writeEmptyPaneProfile();
-      return "Crew Empty Pane";
-    }
-    return iterm.writePaneProfile(profile.paneName, profile.backgroundImage, {
-      blend: profile.blend,
-      mode: profile.mode,
-      badgeColor: profile.badgeColor,
-    });
+    return this.capability("profiles")!.writePane(profile);
   }
 
+  /** @deprecated Phase 1 shim. Use `capability("profiles")?.writeEmpty()`. Removed in v3.0.0. */
   writeEmptyPaneProfile(): string {
-    iterm.writeEmptyPaneProfile();
-    return "Crew Empty Pane";
+    return this.capability("profiles")!.writeEmpty();
   }
 
+  /** @deprecated Phase 1 shim. Use `capability("profiles")?.setProfile(...)`. Removed in v3.0.0. */
   async setProfile(sessionId: string, profileName: string): Promise<void> {
-    // OSC 1337 SetProfile= switches the session to a named (dynamic) profile.
-    await iterm.writeEscapeToSession(sessionId, `\x1b]1337;SetProfile=${profileName}\x07`);
+    await this.capability("profiles")!.setProfile(sessionId, profileName);
   }
 
+  /** @deprecated Phase 1 shim. Use `capability("profiles")?.splitPaneWithProfile(...)`. Removed in v3.0.0. */
   splitPaneWithProfile(
     direction: "horizontal" | "vertical",
     profileName: string,
   ): Promise<string> {
-    return iterm.splitPaneWithProfile(direction, profileName);
+    return this.capability("profiles")!.splitPaneWithProfile(direction, profileName);
   }
 
+  /** @deprecated Phase 1 shim. Use `capability("profiles")?.splitSessionWithProfile(...)`. Removed in v3.0.0. */
   splitSessionWithProfile(
     sessionId: string,
     direction: "horizontal" | "vertical",
     profileName: string,
   ): Promise<string> {
-    return iterm.splitSessionWithProfile(sessionId, direction, profileName);
+    return this.capability("profiles")!.splitSessionWithProfile(sessionId, direction, profileName);
   }
 
   /**

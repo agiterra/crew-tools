@@ -1041,6 +1041,7 @@ export class Orchestrator {
     // On cmux, writePaneProfile is a no-op and createTab ignores profileName.
     let profileName: string | undefined;
     let paneName: string | undefined;
+    const profiles = this.terminal.capability("profiles");
     if (resolvedTheme) {
       const themeConfig = loadTheme(resolvedTheme);
       const usedNames = this.store.listPanes().map((p) => p.name);
@@ -1048,8 +1049,8 @@ export class Orchestrator {
       if (picked && themeConfig) {
         paneName = picked;
         const bgPath = backgroundImagePath(resolvedTheme, picked, themeConfig);
-        if (bgPath) {
-          profileName = this.terminal.writePaneProfile({
+        if (bgPath && profiles) {
+          profileName = profiles.writePane({
             paneName: picked,
             backgroundImage: bgPath,
             blend: themeConfig.background.blend,
@@ -1197,19 +1198,24 @@ export class Orchestrator {
       ? "vertical"
       : "horizontal";
 
-    // Resolve background image and choose the right profile
+    // Resolve background image and choose the right profile. Profiles
+    // capability is registered by both backends with native implementations
+    // (iTerm dynamic profiles + OSC; cmux in-memory map + surface RPC).
     const tabRow = this.store.getTab(tab);
     const theme = tabRow?.theme ? loadTheme(tabRow.theme) : null;
     const bgPath = tabRow?.theme ? backgroundImagePath(tabRow.theme, paneName, theme) : null;
-    const profileName = bgPath
-      ? this.terminal.writePaneProfile({
-          paneName,
-          backgroundImage: bgPath,
-          blend: theme?.background.blend,
-          mode: theme?.background.mode,
-          badgeColor: theme?.badgeColors?.[paneName] ?? theme?.defaultBadgeColor,
-        })
-      : this.terminal.writeEmptyPaneProfile();
+    const profilesCap = this.terminal.capability("profiles");
+    const profileName = profilesCap
+      ? (bgPath
+          ? profilesCap.writePane({
+              paneName,
+              backgroundImage: bgPath,
+              blend: theme?.background.blend,
+              mode: theme?.background.mode,
+              badgeColor: theme?.badgeColors?.[paneName] ?? theme?.defaultBadgeColor,
+            })
+          : profilesCap.writeEmpty())
+      : undefined;
 
     // Brief delay for iTerm2 to pick up the dynamic profile (cmux doesn't need this but it's harmless)
     if (this.terminal.name === "iterm") {
@@ -1245,7 +1251,9 @@ export class Orchestrator {
         `Re-register the pane or tab, or specify a different relative_to.`
       );
     }
-    sessionId = await this.terminal.splitSessionWithProfile(resolvedId, direction, profileName);
+    sessionId = profilesCap && profileName
+      ? await profilesCap.splitSessionWithProfile(resolvedId, direction, profileName)
+      : await this.terminal.splitSession(resolvedId, direction);
 
     const pane = this.store.createPane(paneName, tab, position, tabRow?.theme ?? undefined);
     this.store.setPaneItermId(paneName, sessionId);
@@ -1310,8 +1318,9 @@ export class Orchestrator {
     // Write themed profile
     const theme = targetTab.theme ? loadTheme(targetTab.theme) : null;
     const bgPath = targetTab.theme ? backgroundImagePath(targetTab.theme, paneName, theme) : null;
-    if (bgPath) {
-      const profileName = this.terminal.writePaneProfile({
+    const themeProfiles = this.terminal.capability("profiles");
+    if (bgPath && themeProfiles) {
+      const profileName = themeProfiles.writePane({
         paneName,
         backgroundImage: bgPath,
         blend: theme?.background.blend,
@@ -1319,7 +1328,7 @@ export class Orchestrator {
         badgeColor: theme?.badgeColors?.[paneName] ?? theme?.defaultBadgeColor,
       });
       // Apply to the already-existing session — splitWithProfile wasn't used.
-      await this.terminal.setProfile(sessionId, profileName);
+      await themeProfiles.setProfile(sessionId, profileName);
     }
 
     // Register in DB
