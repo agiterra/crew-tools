@@ -3,35 +3,13 @@
  */
 
 import type { TerminalBackend, PaneProfile } from "./terminal.js";
-import type { CapabilityMap, CapabilityRegistry } from "./capabilities/types.js";
 import * as iterm from "./iterm.js";
-import { ItermNotifications } from "./iterm-capabilities/notifications.js";
 
 export class ItermBackend implements TerminalBackend {
   readonly name = "iterm" as const;
 
-  private readonly _capabilities: CapabilityRegistry = {
-    notifications: new ItermNotifications(iterm.writeEscapeToSession),
-  };
-
-  capability<K extends keyof CapabilityMap>(name: K): CapabilityMap[K] | null {
-    return (this._capabilities[name] as CapabilityMap[K] | undefined) ?? null;
-  }
-
   currentSessionId(): Promise<string> {
     return iterm.currentSessionId();
-  }
-
-  async currentTabId(): Promise<string | null> {
-    // iTerm2 tabs are not first-class — the closest stable identifier for
-    // "the tab the operator is looking at" is the id of the first session
-    // in the current tab, which matches what we store in
-    // tabs.iterm_session_id at crew tab creation time.
-    try {
-      return await iterm.currentTabFirstSessionId();
-    } catch {
-      return null;
-    }
   }
 
   sessionIdForTty(ttyName: string): Promise<string | null> {
@@ -120,20 +98,15 @@ export class ItermBackend implements TerminalBackend {
     return iterm.splitSessionWithProfile(sessionId, direction, profileName);
   }
 
-  /**
-   * @deprecated Phase 1 shim. Use `capability("notifications")?.flash(sessionId)`.
-   * Removed in v3.0.0.
-   */
   async flashSession(sessionId: string): Promise<void> {
-    await this.capability("notifications")?.flash(sessionId);
+    // Bounce the dock icon via OSC 1337 RequestAttention
+    await iterm.writeEscapeToSession(sessionId, "\x1b]1337;RequestAttention=fireworks\x07");
   }
 
-  /**
-   * @deprecated Phase 1 shim. Use `capability("notifications")?.notify(...)`.
-   * Removed in v3.0.0.
-   */
   async notifySession(sessionId: string, title: string, body?: string): Promise<void> {
-    await this.capability("notifications")?.notify(sessionId, title, body);
+    // macOS notification banner via OSC 9
+    const msg = body ? `${title}: ${body}` : title;
+    await iterm.writeEscapeToSession(sessionId, `\x1b]9;${msg}\x07`);
   }
 
   async renameWorkspace(_sessionId: string, _name: string): Promise<void> {

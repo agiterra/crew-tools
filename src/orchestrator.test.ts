@@ -25,21 +25,10 @@ mock.module("./screen", () => ({
 
 const { Orchestrator } = await import("./orchestrator");
 
-// Mutable capability registry for the terminal mock. Individual tests can
-// set `terminalCapabilities.notifications = { notify: ..., flash: ... }` to
-// install behavior; default is empty (`capability("...")` returns null).
-const terminalCapabilities: Record<string, unknown> = {};
-
-// Mutable state for the terminal mock so tests can flip what currentTabId
-// reports without re-mocking the entire backend per case.
-const terminalState = { currentTabId: null as string | null };
-
 function makeTerminal(): TerminalBackend {
   return {
     name: "test",
-    capability: ((name: string) => (terminalCapabilities[name] ?? null)) as TerminalBackend["capability"],
     currentSessionId: mock(async () => ""),
-    currentTabId: mock(async () => terminalState.currentTabId),
     sessionIdForTty: mock(async () => null),
     splitPane: mock(async () => ""),
     splitSession: mock(async () => ""),
@@ -56,7 +45,6 @@ function makeTerminal(): TerminalBackend {
     deletePaneProfile: mock(() => {}),
     setProfile: mock(async () => {}),
     sendText: mock(async () => {}),
-    attachScreen: mock(async () => {}),
   } as unknown as TerminalBackend;
 }
 
@@ -509,75 +497,6 @@ describe("resumeAgent", () => {
     expect(cmd).not.toContain("--resume");
     expect(cmd).toContain("cd '/tmp/nb'");
     expect(cmd).toContain("AGENT_ID='never-booted'");
-  });
-});
-
-describe("attachAgent screen-liveness guard", () => {
-  // Regression: pre-fix, attachAgent silently 'succeeded' against a dead
-  // screen session. Operator sees a blank pane and a green API response.
-  // Loom hit this 2026-05-23 — see feedback-screen-zombie-listings.
-  test("throws when the agent's screen session is dead", async () => {
-    await orch.launchAgent({ env: { AGENT_ID: "ghost", AGENT_NAME: "Ghost" } });
-    orch.store.createTab("eng");
-    const pane = orch.store.createPane("oak", "eng");
-    orch.store.setPaneItermId(pane.name, "iterm-session-123");
-
-    screenState.isAliveResult = false; // screen is dead
-    try {
-      await expect(orch.attachAgent("ghost", "oak"))
-        .rejects.toThrow(/screen session 'wire-ghost' is dead/);
-    } finally {
-      screenState.isAliveResult = false;
-    }
-  });
-
-  test("attaches normally when the screen session is alive", async () => {
-    await orch.launchAgent({ env: { AGENT_ID: "alive-agent", AGENT_NAME: "AliveAgent" } });
-    orch.store.createTab("eng");
-    const pane = orch.store.createPane("oak", "eng");
-    orch.store.setPaneItermId(pane.name, "iterm-session-456");
-
-    screenState.isAliveResult = true;
-    try {
-      await orch.attachAgent("alive-agent", "oak");
-      // Liveness guard should pass; pane assignment lands on the row.
-      const row = orch.store.getAgent("alive-agent");
-      expect(row?.pane).toBe("oak");
-    } finally {
-      screenState.isAliveResult = false;
-    }
-  });
-});
-
-describe("activeTab introspection", () => {
-  test("returns the crew tab whose iterm_session_id matches the focused tab", async () => {
-    orch.store.createTab("eng", undefined, "workspace:3");
-    orch.store.createTab("ops", undefined, "workspace:4");
-    terminalState.currentTabId = "workspace:3";
-    try {
-      const active = await orch.activeTab();
-      expect(active?.name).toBe("eng");
-    } finally {
-      terminalState.currentTabId = null;
-    }
-  });
-
-  test("returns null when the focused tab is not crew-tracked", async () => {
-    orch.store.createTab("eng", undefined, "workspace:3");
-    terminalState.currentTabId = "workspace:99"; // some manually-opened cmux ws
-    try {
-      const active = await orch.activeTab();
-      expect(active).toBeNull();
-    } finally {
-      terminalState.currentTabId = null;
-    }
-  });
-
-  test("returns null when the backend can't resolve a focused tab", async () => {
-    orch.store.createTab("eng", undefined, "workspace:3");
-    terminalState.currentTabId = null; // backend returned null
-    const active = await orch.activeTab();
-    expect(active).toBeNull();
   });
 });
 

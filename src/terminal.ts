@@ -5,8 +5,6 @@
  * so the orchestrator and MCP server are terminal-agnostic.
  */
 
-import type { CapabilityMap } from "./capabilities/types.js";
-
 /**
  * Profile info for creating themed panes.
  * iTerm2 uses dynamic profiles with background images.
@@ -24,51 +22,15 @@ export interface PaneProfile {
 /**
  * Common interface for terminal backends.
  * Both iTerm2 and cmux implement this.
- *
- * Methods marked `@deprecated` are part of Phase 1 of the capability split
- * migration ([[plan-terminal-capabilities-split]]). They remain as thin
- * shims that delegate to the corresponding capability on backends that
- * register it; new callers should use `terminal.capability("name")?.op(...)`
- * directly. Phase 2 (next major) drops the shims.
  */
 export interface TerminalBackend {
   /** Human-readable backend name (for logs/errors). */
   readonly name: string;
 
-  /**
-   * Look up an optional capability by name. Returns the implementation if
-   * the backend registered it, or `null` if it didn't. Use this to test
-   * for and access features that don't apply to every backend (themed
-   * profiles on iTerm2, sidebar log on cmux, etc.).
-   *
-   *   const notif = terminal.capability("notifications");
-   *   if (notif) await notif.notify(sessionId, "Agent attached");
-   *
-   * Callers that want a fallback when the capability is absent should
-   * write the branch explicitly at the call site rather than expecting the
-   * backend to fake the operation. See `src/capabilities/types.ts` for the
-   * full registry and the design rationale.
-   */
-  capability<K extends keyof CapabilityMap>(name: K): CapabilityMap[K] | null;
-
   // --- Identity ---
 
   /** Get the session/surface ID of the current (focused) terminal. */
   currentSessionId(): Promise<string>;
-
-  /**
-   * Get the tab/workspace ID of the focused tab — i.e. where the operator's
-   * eyes are. Matches the `iterm_session_id` column in `crews.db.tabs` for
-   * crew-tracked tabs.
-   *
-   * Returns null if the active tab can't be resolved (no focused window,
-   * AppleScript denied, cmux daemon unreachable, etc.). Callers should
-   * treat null as "unknown — fall back to default placement."
-   *
-   * cmux: returns the focused workspace's ref (e.g. "workspace:3").
-   * iTerm2: returns the id of the first session in the current tab.
-   */
-  currentTabId(): Promise<string | null>;
 
   /** Resolve a TTY device path to a session/surface ID. */
   sessionIdForTty(ttyName: string): Promise<string | null>;

@@ -704,18 +704,6 @@ export class Orchestrator {
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new Error(`agent '${agentId}' not found`);
 
-    // Verify the screen session is actually alive. attachAgent used to
-    // silently no-op (screen.detachSession is .nothrow(), and screen -r
-    // against a dead session fails only inside the pane), so the API would
-    // claim success while the operator stared at a blank pane. Loom hit this
-    // 2026-05-23 attaching heddle whose screen had died during 21h of idle.
-    if (!(await screen.isAlive(agent.screen_name))) {
-      throw new Error(
-        `agent '${agentId}' screen session '${agent.screen_name}' is dead. ` +
-        `Run reconcile to prune the stale row, then re-spawn the agent.`,
-      );
-    }
-
     // Auto-swap to a themed pane if needed
     const resolvedPane = await this.ensureThemedPane(paneName);
 
@@ -750,25 +738,19 @@ export class Orchestrator {
       // Non-fatal
     }
 
-    // Flash the tab and notify — agent is now visible. Both cmux and iTerm2
-    // register the Notifications capability with real native implementations
-    // (cmux native OS notification + tab ring; iTerm2 OSC 9 banner + OSC
-    // 1337 RequestAttention). Backends without the capability skip silently.
-    const notifications = this.terminal.capability("notifications");
-    if (notifications) {
-      try {
-        await notifications.flash(pane.iterm_id);
-        await notifications.notify(
-          pane.iterm_id,
-          `${agent.display_name} attached`,
-          `→ pane ${resolvedPane}`,
-        );
-      } catch (e) {
-        console.error(`[crew] attach flash/notify failed for '${agentId}' on '${resolvedPane}':`, e);
-      }
+    // Flash the tab and notify — agent is now visible.
+    // On cmux these are native; on iTerm2 flash is a no-op and notify
+    // falls back to setBadge, so the agent badge below must run AFTER
+    // to reclaim the badge slot.
+    try {
+      await this.terminal.flashSession(pane.iterm_id);
+      await this.terminal.notifySession(pane.iterm_id, `${agent.display_name} attached`, `→ pane ${resolvedPane}`);
+    } catch (e) {
+      console.error(`[crew] attach flash/notify failed for '${agentId}' on '${resolvedPane}':`, e);
     }
 
     // Apply the agent's badge to the pane (color from pane's profile, text from agent).
+    // Runs AFTER notifySession so it wins on iTerm2 (where notify falls back to setBadge).
     if (agent.badge) {
       try {
         await this.terminal.setBadge(pane.iterm_id, agent.badge);
@@ -1087,30 +1069,6 @@ export class Orchestrator {
 
   listTabs(): Tab[] {
     return this.store.listTabs();
-  }
-
-  /**
-   * Return the crew-tracked tab the operator is currently viewing, or null
-   * if no tracked tab matches the focused workspace/window. Used by
-   * placement-aware spawn flows: bridge.spawn can call this to land a new
-   * pane in the operator's current tab instead of creating an orphan tab
-   * they have to switch to manually.
-   *
-   * Returns null in three cases: (a) the terminal backend can't resolve a
-   * focused tab (no window in focus, AppleScript denied, etc.); (b) the
-   * focused tab is not crew-tracked (e.g., a shell tab the operator opened
-   * manually); (c) the backend's currentTabId returned a value that doesn't
-   * match any tab.iterm_session_id. Callers treating null as "place into a
-   * fresh tab" preserve the pre-fix behavior.
-   *
-   * See [[draft-crew-tools-papercuts-from-loom]] §2 for the surfacing
-   * incident (loom 2026-05-23 spawning heddle into a new tab while Brian
-   * watched a different tab).
-   */
-  async activeTab(): Promise<Tab | null> {
-    const tabId = await this.terminal.currentTabId();
-    if (!tabId) return null;
-    return this.store.listTabs().find((t) => t.iterm_session_id === tabId) ?? null;
   }
 
   deleteTab(name: string): void {

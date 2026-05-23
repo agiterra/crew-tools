@@ -14,11 +14,6 @@
 
 import { $ } from "bun";
 import type { TerminalBackend, PaneProfile } from "./terminal.js";
-import type { CapabilityMap, CapabilityRegistry } from "./capabilities/types.js";
-import { CmuxNotifications } from "./cmux-capabilities/notifications.js";
-
-// Capability registration deferred to constructor (needs class-private
-// `surfaceArgs` binding). Field declared, populated in constructor.
 
 /**
  * Run a cmux CLI command and return trimmed stdout.
@@ -85,18 +80,6 @@ export class CmuxBackend implements TerminalBackend {
    */
   private profileStore = new Map<string, PaneProfile>();
   private profileSeq = 0;
-
-  private readonly _capabilities: CapabilityRegistry;
-
-  constructor() {
-    this._capabilities = {
-      notifications: new CmuxNotifications(cmux, (sid) => this.surfaceArgs(sid)),
-    };
-  }
-
-  capability<K extends keyof CapabilityMap>(name: K): CapabilityMap[K] | null {
-    return (this._capabilities[name] as CapabilityMap[K] | undefined) ?? null;
-  }
 
   /**
    * Resolve a caller-supplied surface identifier (short ref OR UUID) to the
@@ -262,20 +245,6 @@ export class CmuxBackend implements TerminalBackend {
     // Fall back to identify command
     const info = await cmuxJson("identify");
     return info.focused?.surface_ref ?? info.focused?.surfaceRef;
-  }
-
-  async currentTabId(): Promise<string | null> {
-    // cmux 'identify' returns focused.workspace_ref — the workspace the
-    // operator is currently viewing. Crew tabs map 1:1 to cmux workspaces
-    // and store the workspace ref in tabs.iterm_session_id (legacy column
-    // name; semantics are backend-agnostic).
-    try {
-      const info = await cmuxJson("identify");
-      const ws = info.focused?.workspace_ref ?? info.focused?.workspaceRef;
-      return typeof ws === "string" ? ws : null;
-    } catch {
-      return null;
-    }
   }
 
   async sessionIdForTty(ttyName: string): Promise<string | null> {
@@ -468,20 +437,24 @@ export class CmuxBackend implements TerminalBackend {
     }
   }
 
-  /**
-   * @deprecated Phase 1 shim. Use `capability("notifications")?.flash(sessionId)`.
-   * Removed in v3.0.0.
-   */
   async flashSession(sessionId: string): Promise<void> {
-    await this.capability("notifications")?.flash(sessionId);
+    try {
+      const args = await this.surfaceArgs(sessionId);
+      await cmux("trigger-flash", ...args);
+    } catch {
+      // Non-fatal
+    }
   }
 
-  /**
-   * @deprecated Phase 1 shim. Use `capability("notifications")?.notify(...)`.
-   * Removed in v3.0.0.
-   */
   async notifySession(sessionId: string, title: string, body?: string): Promise<void> {
-    await this.capability("notifications")?.notify(sessionId, title, body);
+    try {
+      const surfaceArgs = await this.surfaceArgs(sessionId);
+      const args = ["notify", "--title", title, ...surfaceArgs];
+      if (body) args.push("--body", body);
+      await cmux(...args);
+    } catch {
+      // Non-fatal
+    }
   }
 
   async renameWorkspace(sessionId: string, name: string): Promise<void> {
