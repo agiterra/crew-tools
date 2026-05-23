@@ -16,14 +16,9 @@ import { $ } from "bun";
 import type { TerminalBackend, PaneProfile } from "./terminal.js";
 import type { CapabilityMap, CapabilityRegistry } from "./capabilities/types.js";
 import { CmuxNotifications } from "./cmux-capabilities/notifications.js";
-import { CmuxSidebarLog } from "./cmux-capabilities/sidebar-log.js";
-import { CmuxWorkspaceControl } from "./cmux-capabilities/workspace-control.js";
-import { CmuxWorkspaceSplit } from "./cmux-capabilities/workspace-split.js";
-import { CmuxProfiles } from "./cmux-capabilities/profiles.js";
 
 // Capability registration deferred to constructor (needs class-private
-// `surfaceArgs` / `resolveSurface` bindings). Fields declared, populated
-// in constructor.
+// `surfaceArgs` binding). Field declared, populated in constructor.
 
 /**
  * Run a cmux CLI command and return trimmed stdout.
@@ -83,42 +78,19 @@ function mapProfileToRpcParams(
 export class CmuxBackend implements TerminalBackend {
   readonly name = "cmux" as const;
 
+  /**
+   * In-memory profile store. iTerm2 persists profiles to disk; cmux has no
+   * dynamic-profile concept, so we stash PaneProfile objects under synthetic
+   * names and resolve them when setProfile() / splitWithProfile() fire.
+   */
+  private profileStore = new Map<string, PaneProfile>();
+  private profileSeq = 0;
+
   private readonly _capabilities: CapabilityRegistry;
 
   constructor() {
     this._capabilities = {
       notifications: new CmuxNotifications(cmux, (sid) => this.surfaceArgs(sid)),
-      sidebarLog: new CmuxSidebarLog(
-        cmux,
-        async (sid) => (await this.resolveSurface(sid))?.ws ?? null,
-      ),
-      workspaceControl: new CmuxWorkspaceControl(cmux, cmuxJson),
-      workspaceSplit: new CmuxWorkspaceSplit(cmux, (s) => this.resolveSurface(s)),
-      profiles: new CmuxProfiles({
-        splitPane: (d) => this.splitPane(d),
-        splitSession: (sid, d) => this.splitSession(sid, d),
-        applyToSurface: async (sid, profile) => {
-          // Use cmux's RPC pipeline: wait for PTY, resolve UUID, fire.
-          if (!profile.backgroundImage) return;
-          await this.waitForPty(sid);
-          const resolved = await this.resolveSurface(sid);
-          if (!resolved?.id) {
-            console.error(`[crew] cmux set-background skipped: cannot resolve UUID for ${sid}`);
-            return;
-          }
-          const params = mapProfileToRpcParams(
-            resolved.id,
-            profile.backgroundImage,
-            profile.blend,
-            profile.mode,
-          );
-          try {
-            await cmux("rpc", "surface.set_background", JSON.stringify(params));
-          } catch (e) {
-            console.error(`[crew] cmux set-background failed for ${sid} (${resolved.id}): ${e instanceof Error ? e.message : String(e)}`);
-          }
-        },
-      }),
     };
   }
 
@@ -250,6 +222,36 @@ export class CmuxBackend implements TerminalBackend {
       await new Promise((r) => setTimeout(r, 50));
     }
     return false;
+  }
+
+  /**
+   * Apply a stored profile's background to a surface via cmux's RPC.
+   * Best-effort — failures (cmux down, surface gone, malformed image path)
+   * are logged but never thrown. Matches the rest of this class's policy.
+   *
+   * Polls briefly for PTY allocation before firing the RPC. See waitForPty
+   * for why.
+   */
+  private async applyProfileToSurface(sessionId: string, profileName: string): Promise<void> {
+    const profile = this.profileStore.get(profileName);
+    if (!profile || !profile.backgroundImage) return;
+    await this.waitForPty(sessionId);
+    const resolved = await this.resolveSurface(sessionId);
+    if (!resolved?.id) {
+      console.error(`[crew] cmux set-background skipped: cannot resolve UUID for ${sessionId}`);
+      return;
+    }
+    const params = mapProfileToRpcParams(
+      resolved.id,
+      profile.backgroundImage,
+      profile.blend,
+      profile.mode,
+    );
+    try {
+      await cmux("rpc", "surface.set_background", JSON.stringify(params));
+    } catch (e) {
+      console.error(`[crew] cmux set-background failed for ${sessionId} (${resolved.id}): ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   async currentSessionId(): Promise<string> {
@@ -408,7 +410,7 @@ export class CmuxBackend implements TerminalBackend {
     }
     const result = surfaceRef ?? wsRef;
     if (profileName && surfaceRef) {
-      await this.capability("profiles")!.setProfile(surfaceRef, profileName);
+      await this.applyProfileToSurface(surfaceRef, profileName);
     }
     return result;
   }
@@ -429,16 +431,21 @@ export class CmuxBackend implements TerminalBackend {
    *
    * iTerm2 backend leaves this undefined; orchestrator skips the call there.
    */
-  /**
-   * @deprecated Phase 1 shim. Use `capability("sidebarLog")?.append(...)`.
-   * Removed in v3.0.0.
-   */
   async logWorkspace(
     sessionId: string,
     message: string,
     opts?: { level?: "info" | "progress" | "success" | "warning" | "error"; source?: string },
   ): Promise<void> {
-    await this.capability("sidebarLog")?.append(sessionId, message, opts);
+    try {
+      const wsRef = (await this.resolveSurface(sessionId))?.ws ?? null;
+      const wsFlag = wsRef ? ["--workspace", wsRef] : [];
+      const levelFlag = opts?.level ? ["--level", opts.level] : [];
+      const sourceFlag = ["--source", opts?.source ?? "crew"];
+      // cmux log puts the message after `--`, supporting messages that start with `-`.
+      await cmux("log", ...wsFlag, ...levelFlag, ...sourceFlag, "--", message);
+    } catch {
+      // Non-fatal — sidebar log is decorative.
+    }
   }
 
   async setBadge(sessionId: string, text: string): Promise<void> {
@@ -477,44 +484,62 @@ export class CmuxBackend implements TerminalBackend {
     await this.capability("notifications")?.notify(sessionId, title, body);
   }
 
-  /**
-   * @deprecated Phase 1 shim. Use `capability("workspaceControl")?.rename(...)`.
-   * Removed in v3.0.0.
-   */
   async renameWorkspace(sessionId: string, name: string): Promise<void> {
-    await this.capability("workspaceControl")?.rename(sessionId, name);
+    try {
+      // Find which workspace this surface belongs to
+      const tree = await cmuxJson("tree");
+      for (const win of tree.windows ?? []) {
+        for (const ws of win.workspaces ?? []) {
+          for (const pane of ws.panes ?? []) {
+            for (const surface of pane.surfaces ?? []) {
+              if (surface.ref === sessionId) {
+                await cmux("rename-workspace", "--workspace", ws.ref, name);
+                return;
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
   }
 
-  /** @deprecated Phase 1 shim. Use `capability("profiles")?.writePane(...)`. Removed in v3.0.0. */
   writePaneProfile(profile: PaneProfile): string {
-    return this.capability("profiles")!.writePane(profile);
+    // cmux has no on-disk dynamic-profile concept — stash in memory and
+    // apply when the new surface exists (in setProfile / splitWithProfile).
+    const name = `cmux-profile-${this.profileSeq++}-${profile.paneName}`;
+    this.profileStore.set(name, profile);
+    return name;
   }
 
-  /** @deprecated Phase 1 shim. Use `capability("profiles")?.writeEmpty()`. Removed in v3.0.0. */
   writeEmptyPaneProfile(): string {
-    return this.capability("profiles")!.writeEmpty();
+    // Empty profile means "no background" — represented as a name with no
+    // entry in the store, so applyProfileToSurface no-ops on lookup.
+    return "cmux-empty";
   }
 
-  /** @deprecated Phase 1 shim. Use `capability("profiles")?.setProfile(...)`. Removed in v3.0.0. */
   async setProfile(sessionId: string, profileName: string): Promise<void> {
-    await this.capability("profiles")!.setProfile(sessionId, profileName);
+    await this.applyProfileToSurface(sessionId, profileName);
   }
 
-  /** @deprecated Phase 1 shim. Use `capability("profiles")?.splitPaneWithProfile(...)`. Removed in v3.0.0. */
   async splitPaneWithProfile(
     direction: "horizontal" | "vertical",
     profileName: string,
   ): Promise<string> {
-    return this.capability("profiles")!.splitPaneWithProfile(direction, profileName);
+    const sessionId = await this.splitPane(direction);
+    await this.applyProfileToSurface(sessionId, profileName);
+    return sessionId;
   }
 
-  /** @deprecated Phase 1 shim. Use `capability("profiles")?.splitSessionWithProfile(...)`. Removed in v3.0.0. */
   async splitSessionWithProfile(
     sessionId: string,
     direction: "horizontal" | "vertical",
     profileName: string,
   ): Promise<string> {
-    return this.capability("profiles")!.splitSessionWithProfile(sessionId, direction, profileName);
+    const newSessionId = await this.splitSession(sessionId, direction);
+    await this.applyProfileToSurface(newSessionId, profileName);
+    return newSessionId;
   }
 
   async splitWebBrowser(
@@ -554,14 +579,27 @@ export class CmuxBackend implements TerminalBackend {
    * surface invalid, cmux split refused, etc.). The orchestrator treats
    * a null return as "best-effort failed — keep the agent headless."
    */
-  /**
-   * @deprecated Phase 1 shim. Use `capability("workspaceSplit")?.splitFromCaller(...)`.
-   * Removed in v3.0.0.
-   */
   async splitFromCallerForAgent(
     callerSurfaceId: string,
     direction: "right" | "down",
   ): Promise<string | null> {
-    return (await this.capability("workspaceSplit")?.splitFromCaller(callerSurfaceId, direction)) ?? null;
+    // Strict resolve: placement next to caller only makes sense if caller's
+    // surface actually exists. Unlike per-surface ops on possibly-stale refs
+    // (which surfaceArgs lets through so cmux can return "Surface not found"),
+    // cmux new-split silently ignores an unknown --surface and creates an
+    // orphan surface in the focused workspace. Fail fast instead.
+    const resolved = await this.resolveSurface(callerSurfaceId);
+    if (!resolved) return null;
+    try {
+      const cmuxDir = direction === "right" ? "right" : "down";
+      const args = resolved.ws
+        ? ["--surface", resolved.ref, "--workspace", resolved.ws]
+        : ["--surface", resolved.ref];
+      const output = await cmux("new-split", cmuxDir, ...args);
+      const match = output.match(/surface:\d+/);
+      return match ? match[0] : null;
+    } catch {
+      return null;
+    }
   }
 }

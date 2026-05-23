@@ -238,12 +238,11 @@ export class Orchestrator {
     // stopAgent can tear the pane down alongside the agent. Otherwise the
     // pane lingers showing an exited screen session after the agent dies.
     let auxSurface: string | undefined;
-    const workspaceSplit = this.terminal.capability("workspaceSplit");
-    if (opts.splitInCallerWorkspace && workspaceSplit) {
+    if (opts.splitInCallerWorkspace && this.terminal.splitFromCallerForAgent) {
       try {
         const callerId = await this.terminal.currentSessionId();
         if (callerId) {
-          const newSurface = await workspaceSplit.splitFromCaller(
+          const newSurface = await this.terminal.splitFromCallerForAgent(
             callerId,
             opts.splitInCallerWorkspace.direction,
           );
@@ -596,7 +595,7 @@ export class Orchestrator {
       if (pane?.iterm_id) {
         try { await this.terminal.setBadge(pane.iterm_id, ""); } catch {}
         try {
-          await this.terminal.capability("sidebarLog")?.append(
+          await this.terminal.logWorkspace?.(
             pane.iterm_id,
             `${agent.display_name} closed`,
             { level: "info", source: "crew" },
@@ -660,7 +659,7 @@ export class Orchestrator {
       if (pane?.iterm_id) {
         try { await this.terminal.setBadge(pane.iterm_id, ""); } catch {}
         try {
-          await this.terminal.capability("sidebarLog")?.append(
+          await this.terminal.logWorkspace?.(
             pane.iterm_id,
             `${agent.display_name} stopped (hard-kill)`,
             { level: "warning", source: "crew" },
@@ -739,10 +738,10 @@ export class Orchestrator {
     await this.terminal.attachScreen(pane.iterm_id, agent.screen_name, "x");
     this.store.updateAgentPane(agentId, resolvedPane);
 
-    // Surface the attach in the workspace sidebar log. Capability is
-    // cmux-only today — iTerm2 backend doesn't register it.
+    // Surface the attach in the workspace sidebar log. cmux-only — iTerm2
+    // leaves logWorkspace undefined.
     try {
-      await this.terminal.capability("sidebarLog")?.append(
+      await this.terminal.logWorkspace?.(
         pane.iterm_id,
         `${agent.display_name} attached → ${resolvedPane}`,
         { level: "success", source: "crew" },
@@ -1041,7 +1040,6 @@ export class Orchestrator {
     // On cmux, writePaneProfile is a no-op and createTab ignores profileName.
     let profileName: string | undefined;
     let paneName: string | undefined;
-    const profiles = this.terminal.capability("profiles");
     if (resolvedTheme) {
       const themeConfig = loadTheme(resolvedTheme);
       const usedNames = this.store.listPanes().map((p) => p.name);
@@ -1049,8 +1047,8 @@ export class Orchestrator {
       if (picked && themeConfig) {
         paneName = picked;
         const bgPath = backgroundImagePath(resolvedTheme, picked, themeConfig);
-        if (bgPath && profiles) {
-          profileName = profiles.writePane({
+        if (bgPath) {
+          profileName = this.terminal.writePaneProfile({
             paneName: picked,
             backgroundImage: bgPath,
             blend: themeConfig.background.blend,
@@ -1076,9 +1074,8 @@ export class Orchestrator {
       await this.terminal.setSessionName(sessionId, titleCase(paneName));
     }
 
-    // Name the workspace/tab. Capability is cmux-only today — iTerm2
-    // doesn't register it (tab naming is too limited).
-    await this.terminal.capability("workspaceControl")?.rename(sessionId, name);
+    // Name the workspace/tab (cmux: renames workspace; iTerm2: no-op)
+    await this.terminal.renameWorkspace(sessionId, name);
 
     return { ...tab, pane };
   }
@@ -1198,24 +1195,19 @@ export class Orchestrator {
       ? "vertical"
       : "horizontal";
 
-    // Resolve background image and choose the right profile. Profiles
-    // capability is registered by both backends with native implementations
-    // (iTerm dynamic profiles + OSC; cmux in-memory map + surface RPC).
+    // Resolve background image and choose the right profile
     const tabRow = this.store.getTab(tab);
     const theme = tabRow?.theme ? loadTheme(tabRow.theme) : null;
     const bgPath = tabRow?.theme ? backgroundImagePath(tabRow.theme, paneName, theme) : null;
-    const profilesCap = this.terminal.capability("profiles");
-    const profileName = profilesCap
-      ? (bgPath
-          ? profilesCap.writePane({
-              paneName,
-              backgroundImage: bgPath,
-              blend: theme?.background.blend,
-              mode: theme?.background.mode,
-              badgeColor: theme?.badgeColors?.[paneName] ?? theme?.defaultBadgeColor,
-            })
-          : profilesCap.writeEmpty())
-      : undefined;
+    const profileName = bgPath
+      ? this.terminal.writePaneProfile({
+          paneName,
+          backgroundImage: bgPath,
+          blend: theme?.background.blend,
+          mode: theme?.background.mode,
+          badgeColor: theme?.badgeColors?.[paneName] ?? theme?.defaultBadgeColor,
+        })
+      : this.terminal.writeEmptyPaneProfile();
 
     // Brief delay for iTerm2 to pick up the dynamic profile (cmux doesn't need this but it's harmless)
     if (this.terminal.name === "iterm") {
@@ -1251,9 +1243,7 @@ export class Orchestrator {
         `Re-register the pane or tab, or specify a different relative_to.`
       );
     }
-    sessionId = profilesCap && profileName
-      ? await profilesCap.splitSessionWithProfile(resolvedId, direction, profileName)
-      : await this.terminal.splitSession(resolvedId, direction);
+    sessionId = await this.terminal.splitSessionWithProfile(resolvedId, direction, profileName);
 
     const pane = this.store.createPane(paneName, tab, position, tabRow?.theme ?? undefined);
     this.store.setPaneItermId(paneName, sessionId);
@@ -1318,9 +1308,8 @@ export class Orchestrator {
     // Write themed profile
     const theme = targetTab.theme ? loadTheme(targetTab.theme) : null;
     const bgPath = targetTab.theme ? backgroundImagePath(targetTab.theme, paneName, theme) : null;
-    const themeProfiles = this.terminal.capability("profiles");
-    if (bgPath && themeProfiles) {
-      const profileName = themeProfiles.writePane({
+    if (bgPath) {
+      const profileName = this.terminal.writePaneProfile({
         paneName,
         backgroundImage: bgPath,
         blend: theme?.background.blend,
@@ -1328,7 +1317,7 @@ export class Orchestrator {
         badgeColor: theme?.badgeColors?.[paneName] ?? theme?.defaultBadgeColor,
       });
       // Apply to the already-existing session — splitWithProfile wasn't used.
-      await themeProfiles.setProfile(sessionId, profileName);
+      await this.terminal.setProfile(sessionId, profileName);
     }
 
     // Register in DB
