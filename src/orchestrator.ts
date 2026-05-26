@@ -238,6 +238,17 @@ export class Orchestrator {
     // stopAgent can tear the pane down alongside the agent. Otherwise the
     // pane lingers showing an exited screen session after the agent dies.
     let auxSurface: string | undefined;
+    if (opts.splitInCallerWorkspace && !this.terminal.splitFromCallerForAgent) {
+      // The caller asked for splitInCallerWorkspace but the active backend
+      // doesn't implement it (iTerm doesn't; cmux does). Earlier versions
+      // silently no-op'd here and the agent landed headless — exactly how
+      // bridge v0.4.0's `near` placement stranded eclair/beignet/profiterole
+      // on 2026-05-26. Surface it explicitly so the caller can route through
+      // createPane + attachAgent instead.
+      console.error(
+        `[crew] splitInCallerWorkspace requested but backend '${this.terminal.constructor.name}' does not implement splitFromCallerForAgent — agent '${id}' will run headless. Use createPane + attachAgent for cross-backend placement.`,
+      );
+    }
     if (opts.splitInCallerWorkspace && this.terminal.splitFromCallerForAgent) {
       try {
         const callerId = await this.terminal.currentSessionId();
