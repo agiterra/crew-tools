@@ -430,8 +430,21 @@ export async function startServer(): Promise<void> {
       },
     },
     {
+      name: "tab_register",
+      description: "Register an EXISTING terminal tab (the one you're already running in, or one the operator opened manually) without spawning a new iTerm tab via AppleScript. Use this when an agent boots in a manually-opened tab and wants crew to track it. Defaults iterm_session_id to the caller's current session.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string", description: "Tab name" },
+          theme: { type: "string", description: "Pane naming theme: trees, rivers, stones, peaks, spices, cities" },
+          iterm_session_id: { type: "string", description: "Terminal session uuid (default: caller's current session)" },
+        },
+        required: ["name"],
+      },
+    },
+    {
       name: "tab_create",
-      description: "Create a named tab (a container for panes). Optionally set a theme for auto-naming panes.",
+      description: "Create a named tab (a container for panes) by SPAWNING a new iTerm tab via AppleScript. To bind an existing iTerm tab, use tab_register instead. Optionally set a theme for auto-naming panes.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -759,6 +772,12 @@ export async function startServer(): Promise<void> {
         case "agent_read":
           result = { output: await orchestrator.readAgent(a.id as string, a.cc_session_id as string | undefined) };
           break;
+        case "tab_register": {
+          const sessionId = (a.iterm_session_id as string | undefined) ?? (await callerSession());
+          if (!sessionId) throw new Error(`cannot detect terminal session — pass iterm_session_id explicitly or run from inside ${terminalName}`);
+          result = await orchestrator.registerTab(a.name as string, sessionId, a.theme as string | undefined);
+          break;
+        }
         case "tab_create":
           result = await orchestrator.createTab(a.name as string, a.theme as string | undefined);
           break;

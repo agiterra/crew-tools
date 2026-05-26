@@ -1089,6 +1089,32 @@ export class Orchestrator {
   // --- Panes ---
 
   /**
+   * Register an EXISTING terminal tab (an iTerm tab the operator opened
+   * manually, or one that already hosts a running agent) without spawning
+   * a new iTerm tab via AppleScript. Mirror of {@link createTab} for the
+   * "I'm already here, just put a row in the DB" case.
+   *
+   * @param name tab name
+   * @param sessionId terminal session id (e.g. iTerm session uuid). The
+   *                  session must be alive.
+   * @param theme    optional theme for auto-naming panes
+   */
+  async registerTab(name: string, sessionId: string, theme?: string): Promise<Tab> {
+    const existing = this.store.getTab(name);
+    if (existing) {
+      // Idempotent: if the same iterm session is already bound, just
+      // refresh the row. If a different session is bound, refuse.
+      if (existing.iterm_session_id === sessionId) return existing;
+      throw new Error(
+        `tab '${name}' already registered to a different terminal session ${existing.iterm_session_id} (wanted ${sessionId})`,
+      );
+    }
+    const alive = await this.terminal.isSessionAlive(sessionId);
+    if (!alive) throw new Error(`terminal session ${sessionId} not found — session ID may be stale`);
+    return this.store.createTab(name, theme, sessionId);
+  }
+
+  /**
    * Register an existing terminal session as a named pane.
    * Use this so agents can register their own pane and split relative to it.
    */
