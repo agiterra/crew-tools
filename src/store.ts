@@ -252,14 +252,20 @@ export class CrewStore {
     // Add machine_name column to agents (v2.4.0). Default is the local
     // hostname so every pre-existing row gets a sensible value. The column
     // is NOT NULL in principle; we default in application code rather than
-    // DB-side DEFAULT because sqlite ALTER TABLE DEFAULT can't reference
-    // functions at migration time.
+    // Don't freeze hostname() as a literal DEFAULT — if it later drifts
+    // (rename, mDNS reconfig, fresh OS install) any insert that omits
+    // machine_name silently falls through to the stale literal and the
+    // reconciler skips the row as cross-machine. Empty-string default
+    // is loud-on-divergence: createAgent (v2.5.1+) explicit-inserts
+    // hostname().toLowerCase(); any other code path that omits it shows
+    // up as a visibly empty machine_name rather than ghosting through.
+    // Migration history: bundled crew-tools < v2.5.1 may have a literal
+    // DEFAULT — schema-rebuild fix lands when consumers repin past v2.5.1.
     const hasMachineName = this.db.prepare(
       "SELECT * FROM pragma_table_info('agents') WHERE name='machine_name'"
     ).get();
     if (!hasMachineName) {
-      const localName = hostname().toLowerCase();
-      this.db.exec(`ALTER TABLE agents ADD COLUMN machine_name TEXT NOT NULL DEFAULT '${localName.replace(/'/g, "''")}'`);
+      this.db.exec("ALTER TABLE agents ADD COLUMN machine_name TEXT NOT NULL DEFAULT ''");
     }
 
     // Machines table (v2.4.0) — cross-machine orchestration registry.
