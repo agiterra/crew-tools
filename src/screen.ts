@@ -8,7 +8,7 @@
  */
 
 import { $ } from "bun";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "path";
 
 // Resolve screen binary: prefer homebrew 5.x (color support) over macOS built-in 4.0.
@@ -180,6 +180,27 @@ export async function readOutput(name: string): Promise<string> {
   const tmpFile = `/tmp/screen-hardcopy-${name}-${Date.now()}`;
   try {
     await $`${SCREEN} -S ${name} -X hardcopy ${tmpFile}`.quiet();
+    // `screen -X hardcopy` is ASYNC: the -X command is queued to the screen
+    // server and returns before the server has written the file. Reading
+    // immediately races the write → intermittent ENOENT, or a truncated
+    // mid-write frame. Poll until the file exists AND its size has settled
+    // across two consecutive stats (or a 2s deadline). This is the fix for
+    // agent_read's ENOENT + partial-frame reads (Brioche 2026-06-02).
+    const deadline = Date.now() + 2000;
+    let prev = -1;
+    while (Date.now() < deadline) {
+      let size: number;
+      try {
+        size = statSync(tmpFile).size;
+      } catch {
+        // Not written yet (ENOENT) — keep polling.
+        await new Promise((r) => setTimeout(r, 25));
+        continue;
+      }
+      if (size === prev) break; // file exists and size has stabilized
+      prev = size;
+      await new Promise((r) => setTimeout(r, 25));
+    }
     const content = await Bun.file(tmpFile).text();
     await $`rm -f ${tmpFile}`.quiet();
     return content.trimEnd();
