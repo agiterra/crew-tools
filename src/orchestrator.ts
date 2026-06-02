@@ -909,10 +909,45 @@ export class Orchestrator {
    * Send keystrokes to an agent's screen session.
    * Accepts optional ccSessionId to target a specific instance during handoff.
    */
-  async sendToAgent(agentId: string, text: string, ccSessionId?: string): Promise<void> {
+  async sendToAgent(
+    agentId: string,
+    text: string,
+    ccSessionId?: string,
+  ): Promise<{ screen: string; landed: boolean | null }> {
     const agent = this.resolveAgent(agentId, ccSessionId);
     await screen.sendKeys(agent.screen_name, text);
     this.store.touchAgent(agent.id);
+
+    // Verify-after-send: never return a blind success. Read the screen back so
+    // callers can confirm delivery (the `screen -X stuff` -> sent:true path lied
+    // when input silently didn't land — Brioche burned a whole session on it,
+    // 2026-06-02). For sends that leave visible text in the input box (printable,
+    // no trailing submit key), poll until the text's tail actually appears
+    // (whitespace-normalized to survive terminal line-wrapping); for control /
+    // submit keys (\r, Esc, arrows) there's no stable visible text to match, so
+    // landed=null and the caller assesses from the returned screen.
+    const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+    const printable = text.replace(/[\x00-\x1f\x7f]/g, "");
+    const endsWithSubmit = /[\r\n]$/.test(text);
+    const verifiable = printable.trim().length >= 2 && !endsWithSubmit;
+
+    if (!verifiable) {
+      return { screen: await screen.readOutput(agent.screen_name), landed: null };
+    }
+
+    const needle = norm(printable).slice(-48);
+    const deadline = Date.now() + 1500;
+    let out = "";
+    let landed = false;
+    while (Date.now() < deadline) {
+      out = await screen.readOutput(agent.screen_name);
+      if (norm(out).includes(needle)) {
+        landed = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 80));
+    }
+    return { screen: out, landed };
   }
 
   /**

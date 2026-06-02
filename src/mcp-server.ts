@@ -393,7 +393,7 @@ export async function startServer(): Promise<void> {
     },
     {
       name: "agent_send",
-      description: "Send keystrokes to an agent's screen session. Works whether the agent is attached to a pane or running headless.",
+      description: "Send keystrokes to an agent's screen session (attached or headless). Returns { sent, landed, screen }: `landed` is true/false when the text is verifiable (printable, no trailing \\r/\\n) — confirming it actually appeared in the input — or null for control/submit keys (\\r, Esc, arrows) which leave no stable visible text. `screen` is the post-send hardcopy so you can confirm delivery rather than trust a blind sent:true. NOTE: AskUserQuestion menus ignore free text + digits as a SELECT — use arrows+Enter, or Esc to cancel then send the answer as a fresh prompt.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -765,10 +765,18 @@ export async function startServer(): Promise<void> {
           await orchestrator.swapAgents(a.id_a as string, a.id_b as string);
           result = { swapped: [a.id_a, a.id_b] };
           break;
-        case "agent_send":
-          await orchestrator.sendToAgent(a.id as string, a.text as string, a.cc_session_id as string | undefined);
-          result = { sent: true };
+        case "agent_send": {
+          const sendRes = await orchestrator.sendToAgent(
+            a.id as string,
+            a.text as string,
+            (a.cc_session_id as string | undefined) ?? (a.session as string | undefined),
+          );
+          // Never a blind sent:true — `landed` confirms verifiable text actually
+          // appeared (true/false), null for control/submit keys; `screen` is the
+          // post-send hardcopy for the caller to assess.
+          result = { sent: true, landed: sendRes.landed, screen: sendRes.screen };
           break;
+        }
         case "agent_read":
           result = { output: await orchestrator.readAgent(a.id as string, a.cc_session_id as string | undefined) };
           break;
