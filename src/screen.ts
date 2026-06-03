@@ -159,18 +159,33 @@ export async function detachSession(name: string): Promise<void> {
  * (orchestrator.closeAgent already does this manually; auto-splitting
  * here means callers no longer have to remember to.)
  */
+// `screen -X stuff` has a ~1KB per-command cap; a larger payload fails with
+// "Total length of the command to send too large" and lands NOTHING (found
+// 2026-06-02 relaying a 1.2KB engineer steer). Chunk into sub-cap pieces; the
+// bytes concatenate in the receiver's input buffer, so even multibyte chars
+// split across a boundary reassemble correctly. 256 chars ≈ ≤768 bytes worst
+// case (3-byte UTF-8), comfortably under the cap.
+const STUFF_CHUNK = 256;
+async function stuffChunked(name: string, s: string): Promise<void> {
+  if (s.length === 0) return;
+  for (let i = 0; i < s.length; i += STUFF_CHUNK) {
+    await $`${SCREEN} -S ${name} -X stuff ${s.slice(i, i + STUFF_CHUNK)}`.quiet();
+    if (i + STUFF_CHUNK < s.length) await new Promise((r) => setTimeout(r, 30));
+  }
+}
+
 export async function sendKeys(name: string, text: string): Promise<void> {
   if (text.length > 1) {
     const last = text[text.length - 1];
     if (last === "\r" || last === "\n") {
       const prefix = text.slice(0, -1);
-      await $`${SCREEN} -S ${name} -X stuff ${prefix}`.quiet();
+      await stuffChunked(name, prefix);
       await new Promise((r) => setTimeout(r, 100));
       await $`${SCREEN} -S ${name} -X stuff ${last}`.quiet();
       return;
     }
   }
-  await $`${SCREEN} -S ${name} -X stuff ${text}`.quiet();
+  await stuffChunked(name, text);
 }
 
 /**
