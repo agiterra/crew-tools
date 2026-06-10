@@ -8,7 +8,19 @@ import type { TerminalBackend } from "./terminal";
 // Capture the command passed to screen.createSession so we can assert on the
 // spawn-time env exports. Mock is installed before Orchestrator is imported.
 const createSessionCalls: Array<{ name: string; command: string }> = [];
-const screenState = { isAliveResult: false, isAttachedResult: false };
+const screenState = {
+  isAliveResult: false,
+  isAttachedResult: false,
+  // Scriptable screen content, KEYED BY SCREEN NAME so tests can't bleed
+  // into the background auto-confirm loops of agents launched by other
+  // tests (those poll their own wire-<id> screens, which stay blank).
+  // Reads pop the named queue, then fall back to the named default.
+  // sendKeys appends to the log and fires the optional hook so a test
+  // can flip screen content in reaction to a CR.
+  screens: {} as Record<string, { queue: string[]; fallback: string }>,
+  sendKeysLog: [] as Array<{ name: string; keys: string }>,
+  sendKeysHook: null as ((name: string, keys: string) => void) | null,
+};
 mock.module("./screen", () => ({
   createSession: async (name: string, command: string) => {
     createSessionCalls.push({ name, command });
@@ -19,12 +31,19 @@ mock.module("./screen", () => ({
   isAlive: async () => screenState.isAliveResult,
   isAttached: async () => screenState.isAttachedResult,
   detachSession: async () => {},
-  sendKeys: async () => {},
-  readOutput: async () => "",
+  sendKeys: async (name: string, keys: string) => {
+    screenState.sendKeysLog.push({ name, keys });
+    screenState.sendKeysHook?.(name, keys);
+  },
+  readOutput: async (name: string) => {
+    const s = screenState.screens[name];
+    if (!s) return "";
+    return s.queue.length > 0 ? s.queue.shift()! : s.fallback;
+  },
   killSession: async () => {},
 }));
 
-const { Orchestrator, SOURCE_NEAREST_ENV } = await import("./orchestrator");
+const { Orchestrator, SOURCE_NEAREST_ENV, autoConfirmDevChannel } = await import("./orchestrator");
 
 function makeTerminal(): TerminalBackend {
   return {
@@ -58,6 +77,9 @@ beforeEach(() => {
   dbPath = join(tmpDir, "test.db");
   orch = new Orchestrator(makeTerminal(), dbPath);
   createSessionCalls.length = 0;
+  screenState.screens = {};
+  screenState.sendKeysLog.length = 0;
+  screenState.sendKeysHook = null;
 });
 
 afterAll(() => {
@@ -586,5 +608,79 @@ describe("nearest-ancestor .env sourcing (cc-launch.sh fold)", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("autoConfirmDevChannel — verify-after-confirm", () => {
+  const MARKER_SCREEN = "Development channels can run arbitrary code.\n  Enter to confirm · Esc to reject";
+  const BOOTED_SCREEN = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ? for shortcuts";
+  const crs = () => screenState.sendKeysLog.filter((e) => e.name === "dvc" && e.keys === "\r").length;
+
+  test("confirms the prompt and verifies it cleared", async () => {
+    screenState.screens["dvc"] = { queue: ["starting claude…", MARKER_SCREEN], fallback: BOOTED_SCREEN };
+
+    const ok = await autoConfirmDevChannel("dvc", "t1", { appearMs: 2_000, clearMs: 1_000 });
+
+    expect(ok).toBe(true);
+    expect(crs()).toBe(1);
+  });
+
+  test("retries the CR when the prompt does not clear, then succeeds", async () => {
+    screenState.screens["dvc"] = { queue: [], fallback: MARKER_SCREEN };
+    screenState.sendKeysHook = (name, keys) => {
+      // First CR is "lost" (screen keeps showing the prompt); the second lands.
+      if (name === "dvc" && keys === "\r" && crs() >= 2) {
+        screenState.screens["dvc"]!.fallback = BOOTED_SCREEN;
+      }
+    };
+
+    const ok = await autoConfirmDevChannel("dvc", "t2", { appearMs: 2_000, clearMs: 400 });
+
+    expect(ok).toBe(true);
+    expect(crs()).toBe(2);
+  });
+
+  test("normal input UI with no prompt = nothing to confirm, no keys sent", async () => {
+    screenState.screens["dvc"] = { queue: [], fallback: BOOTED_SCREEN };
+
+    const ok = await autoConfirmDevChannel("dvc", "t3", { appearMs: 2_000 });
+
+    expect(ok).toBe(true);
+    expect(crs()).toBe(0);
+  });
+
+  test("nothing renders → false + loud status on the agent row", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "halfboot" } });
+    // "dvc" stays blank forever (no screens entry → reads return "").
+
+    const ok = await autoConfirmDevChannel("dvc", "halfboot", {
+      store: orch.store,
+      agentId: "halfboot",
+      appearMs: 400,
+      clearMs: 200,
+    });
+
+    expect(ok).toBe(false);
+    const row = orch.store.getAgent("halfboot");
+    expect(row?.status_name).toBe("dev-channel-confirm-failed");
+    expect(row?.status_desc).toContain("nothing will confirm it");
+  });
+
+  test("prompt stuck through all retries → false + status records the stuck prompt", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "stuckboot" } });
+    screenState.screens["dvc"] = { queue: [], fallback: MARKER_SCREEN };
+
+    const ok = await autoConfirmDevChannel("dvc", "stuckboot", {
+      store: orch.store,
+      agentId: "stuckboot",
+      appearMs: 2_000,
+      clearMs: 300,
+    });
+
+    expect(ok).toBe(false);
+    expect(crs()).toBe(3);
+    const row = orch.store.getAgent("stuckboot");
+    expect(row?.status_name).toBe("dev-channel-confirm-failed");
+    expect(row?.status_desc).toContain("did not clear after 3 CR attempts");
   });
 });
