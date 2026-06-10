@@ -64,6 +64,22 @@ function shellEscape(s: string): string {
 }
 
 /**
+ * Source the nearest ancestor `.env` (walking up from the project dir),
+ * exporting everything it defines (set -a). MCP servers declared in
+ * .mcp.json interpolate ${VAR}s (RENDER_API_KEY, DD_API_KEY, …) and the
+ * non-interactive shell screen spawns never fires direnv — without this
+ * those servers see empty values. Ported verbatim from ~/.wire/cc-launch.sh
+ * as part of retiring that script; placement AFTER the env exports
+ * preserves its semantics (a `.env` value wins a collision with the
+ * forwarded env map, exactly as before). Runtime-agnostic: launchers that
+ * also source `.env` themselves just re-export the same values.
+ */
+export const SOURCE_NEAREST_ENV =
+  `d="$PWD"; while [ "$d" != "/" ]; do ` +
+  `if [ -f "$d/.env" ]; then set -a; . "$d/.env"; set +a; break; fi; ` +
+  `d=$(dirname "$d"); done`;
+
+/**
  * Extract the recorded aux_surface (caller-workspace split) id from a
  * persisted spawn manifest, if any. Returns undefined when the manifest
  * is missing, malformed, or has no aux surface — caller treats those
@@ -210,7 +226,7 @@ export class Orchestrator {
     const envExports = `export ${Object.entries(opts.env)
       .map(([k, v]) => `${k}=${shellEscape(v)}`)
       .join(" ")}`;
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${command}`;
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${SOURCE_NEAREST_ENV} && ${command}`;
 
     // Create screen session
     const session = await screen.createSession(screenName, fullCommand);
@@ -443,7 +459,7 @@ export class Orchestrator {
     const envExports = `export ${Object.entries(mergedEnv)
       .map(([k, v]) => `${k}=${shellEscape(v)}`)
       .join(" ")}`;
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${command}`;
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${SOURCE_NEAREST_ENV} && ${command}`;
 
     const session = await screen.createSession(screenName, fullCommand);
 

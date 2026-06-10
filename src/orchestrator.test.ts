@@ -1,5 +1,6 @@
 import { describe, test, expect, beforeEach, afterAll, mock } from "bun:test";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { execSync } from "child_process";
 import { join } from "path";
 import { tmpdir } from "os";
 import type { TerminalBackend } from "./terminal";
@@ -23,7 +24,7 @@ mock.module("./screen", () => ({
   killSession: async () => {},
 }));
 
-const { Orchestrator } = await import("./orchestrator");
+const { Orchestrator, SOURCE_NEAREST_ENV } = await import("./orchestrator");
 
 function makeTerminal(): TerminalBackend {
   return {
@@ -521,6 +522,69 @@ describe("registerAgent id-mismatch safety", () => {
       if (prevSty === undefined) delete process.env.STY;
       else process.env.STY = prevSty;
       screenState.isAliveResult = false;
+    }
+  });
+});
+
+describe("nearest-ancestor .env sourcing (cc-launch.sh fold)", () => {
+  test("launch command sources .env after the env exports, before the runtime command", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "envy" } });
+
+    const cmd = createSessionCalls[0]!.command;
+    expect(cmd).toContain(SOURCE_NEAREST_ENV);
+    const exportsIdx = cmd.indexOf("export AGENT_ID");
+    const sourceIdx = cmd.indexOf(SOURCE_NEAREST_ENV);
+    expect(exportsIdx).toBeGreaterThan(-1);
+    // .env values must win a collision with the forwarded env map —
+    // exactly cc-launch.sh's ordering (exports first, then source).
+    expect(sourceIdx).toBeGreaterThan(exportsIdx);
+    // the runtime command is the tail, after the sourcing
+    expect(cmd.length).toBeGreaterThan(sourceIdx + SOURCE_NEAREST_ENV.length);
+  });
+
+  test("resume command gets the same sourcing", async () => {
+    await orch.resumeAgent({
+      id: "envy2",
+      ccSessionId: "11111111-2222-3333-4444-555555555555",
+      projectDir: "/tmp/envy2-wd",
+    });
+
+    const cmd = createSessionCalls[0]!.command;
+    expect(cmd).toContain(SOURCE_NEAREST_ENV);
+    const sourceIdx = cmd.indexOf(SOURCE_NEAREST_ENV);
+    expect(sourceIdx).toBeGreaterThan(cmd.indexOf("export AGENT_ID"));
+    expect(cmd.indexOf("--resume", sourceIdx)).toBeGreaterThan(sourceIdx);
+  });
+
+  test("the snippet exports vars from the NEAREST ancestor .env in a real shell", () => {
+    const root = mkdtempSync(join(tmpdir(), "envfold-"));
+    try {
+      mkdirSync(join(root, "a", "b"), { recursive: true });
+      writeFileSync(join(root, ".env"), "FOLD_PROBE=root-level\n");
+      writeFileSync(join(root, "a", ".env"), "FOLD_PROBE=nearest-wins\nFOLD_EXPORTED=yes\n");
+
+      const out = execSync(
+        `cd '${join(root, "a", "b")}' && ${SOURCE_NEAREST_ENV} && printf '%s:%s' "$FOLD_PROBE" "$FOLD_EXPORTED"`,
+        { shell: "/bin/sh", encoding: "utf8" },
+      );
+      expect(out).toBe("nearest-wins:yes");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("no .env anywhere up the tree is a clean no-op", () => {
+    // /private/tmp mkdtemp dirs have no ancestor .env until / — but guard
+    // against a stray /tmp/.env on dev machines by probing an unset var.
+    const root = mkdtempSync(join(tmpdir(), "envfold-none-"));
+    try {
+      const out = execSync(
+        `cd '${root}' && ${SOURCE_NEAREST_ENV} && printf '%s' "${"$"}{FOLD_PROBE_ABSENT:-unset}"`,
+        { shell: "/bin/sh", encoding: "utf8" },
+      );
+      expect(out).toBe("unset");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
