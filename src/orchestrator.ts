@@ -96,32 +96,85 @@ function readAuxSurface(spawnManifest: string | null): string | undefined {
 }
 
 /**
- * Auto-confirm Claude's dev-channel prompt by polling the screen buffer
- * for the prompt marker, then sending CR. Fire-and-forget; bounded by a
- * 30s deadline. Replaces the prior fixed-3s setTimeout which raced
- * Claude's startup time (the typical case on cold caches: claude takes
- * >3s to render the prompt, the CR lands in a still-starting shell, and
- * the agent stays stuck on the prompt forever).
+ * Auto-confirm Claude's dev-channel prompt and VERIFY the confirm landed.
+ *
+ * Polls the screen buffer for the prompt marker, sends CR, then polls
+ * again until the marker CLEARS — retrying the CR if it didn't. A
+ * fire-and-forget CR can miss (screen still initializing, prompt redraw
+ * race), and under boot-storm load the prompt can take >30s to render at
+ * all; either way the dev-channel plugin silently never loads and the
+ * agent runs half-booted — e.g. Wire-blind: registered on the broker
+ * with no client behind it (canele-2947, 2026-06-10, cost a day of
+ * messaging). Polling beats setTimeout because boot time varies with
+ * machine load; verifying beats trusting because sendKeys has no
+ * delivery receipt.
+ *
+ * Resolution states:
+ *  - marker seen, CR confirmed cleared        → true (confirmed)
+ *  - normal input UI rendered with no marker  → true (no prompt this boot)
+ *  - marker stuck through CR retries, or
+ *    nothing rendered within the window       → false + LOUD persistent
+ *    status on the agent row (status_name="dev-channel-confirm-failed")
+ *    so the half-boot is visible to operators and orchestrators instead
+ *    of being discovered by silence.
  */
-async function autoConfirmDevChannel(screenName: string, label: string): Promise<void> {
+export async function autoConfirmDevChannel(
+  screenName: string,
+  label: string,
+  opts: { store?: CrewStore; agentId?: string; appearMs?: number; clearMs?: number } = {},
+): Promise<boolean> {
   const marker = "Enter to confirm";
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
+  // CC renders its normal input UI only after the dev-channel gate, so
+  // either footer hint appearing without the marker means no prompt is
+  // coming this boot.
+  const bootedWithoutPrompt = (buf: string) =>
+    !buf.includes(marker) && (buf.includes("? for shortcuts") || buf.includes("⏵⏵"));
+  const appearDeadline = Date.now() + (opts.appearMs ?? 120_000);
+
+  let seen = false;
+  while (Date.now() < appearDeadline) {
     try {
       const buf = await screen.readOutput(screenName);
-      if (buf.includes(marker)) {
-        await screen.sendKeys(screenName, "\r");
-        return;
-      }
+      if (buf.includes(marker)) { seen = true; break; }
+      if (bootedWithoutPrompt(buf)) return true;
     } catch {
       // screen may be momentarily unavailable during startup; retry
     }
     await new Promise((r) => setTimeout(r, 250));
   }
-  console.warn(
-    `[crew] dev-channel auto-confirm timed out for ${label} ` +
-    `(marker '${marker}' not seen in 30s)`,
-  );
+
+  if (seen) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await screen.sendKeys(screenName, "\r");
+      } catch {
+        // transient send failure — the clear-poll below times out and we retry
+      }
+      const clearDeadline = Date.now() + (opts.clearMs ?? 5_000);
+      while (Date.now() < clearDeadline) {
+        await new Promise((r) => setTimeout(r, 250));
+        try {
+          const buf = await screen.readOutput(screenName);
+          if (!buf.includes(marker)) return true;
+        } catch {
+          // transient read failure; keep polling
+        }
+      }
+    }
+  }
+
+  const detail = seen
+    ? `dev-channel prompt did not clear after 3 CR attempts on ${screenName}`
+    : `neither dev-channel prompt nor input UI rendered within the window on ${screenName} — if the prompt shows later, nothing will confirm it`;
+  console.warn(`[crew] dev-channel auto-confirm FAILED for ${label}: ${detail}`);
+  if (opts.store && opts.agentId) {
+    try {
+      opts.store.updateAgentStatus(opts.agentId, "dev-channel-confirm-failed", detail);
+    } catch {
+      // status write is best-effort; the warn above already fired
+    }
+  }
+  return false;
 }
 
 export class Orchestrator {
@@ -234,7 +287,7 @@ export class Orchestrator {
     // Auto-confirm the dev-channel prompt. Fire-and-forget — helper polls
     // the screen buffer until the prompt marker appears, then sends CR.
     // See autoConfirmDevChannel comment for why polling beats setTimeout.
-    void autoConfirmDevChannel(screenName, id);
+    void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id });
 
     // Best-effort: if the caller asked to be split next to the new agent,
     // and the backend supports per-caller splits (cmux today, iTerm2
@@ -464,7 +517,7 @@ export class Orchestrator {
     const session = await screen.createSession(screenName, fullCommand);
 
     // Auto-confirm dev-channel prompt — same polling helper as launchAgent.
-    void autoConfirmDevChannel(screenName, `resumed ${opts.id}`);
+    void autoConfirmDevChannel(screenName, `resumed ${opts.id}`, { store: this.store, agentId: opts.id });
 
     // Write a fresh manifest for the resumed agent so it can be resumed
     // again later. Channels flow into the manifest only here (launchAgent
