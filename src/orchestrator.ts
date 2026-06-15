@@ -109,11 +109,20 @@ function readAuxSurface(spawnManifest: string | null): string | undefined {
  * machine load; verifying beats trusting because sendKeys has no
  * delivery receipt.
  *
+ * The appear-poll is bounded by SESSION LIVENESS (not a fixed window): it keeps
+ * watching for the prompt as long as the screen session is alive, so a slow
+ * boot-storm spawn that renders the prompt minutes in still gets confirmed
+ * instead of being abandoned by a clock. `appearMs` is only a generous absolute
+ * safety cap.
+ *
  * Resolution states:
  *  - marker seen, CR confirmed cleared        → true (confirmed)
  *  - normal input UI rendered with no marker  → true (no prompt this boot)
+ *  - session exited before any prompt         → false, NO status (self-exit:
+ *    the agent died/finished on its own; not a confirm failure)
  *  - marker stuck through CR retries, or
- *    nothing rendered within the window       → false + LOUD persistent
+ *    nothing rendered before the cap while
+ *    the session stayed alive                 → false + LOUD persistent
  *    status on the agent row (status_name="dev-channel-confirm-failed")
  *    so the half-boot is visible to operators and orchestrators instead
  *    of being discovered by silence.
@@ -129,16 +138,33 @@ export async function autoConfirmDevChannel(
   // coming this boot.
   const bootedWithoutPrompt = (buf: string) =>
     !buf.includes(marker) && (buf.includes("? for shortcuts") || buf.includes("⏵⏵"));
-  const appearDeadline = Date.now() + (opts.appearMs ?? 120_000);
+  // Bound the appear-poll on SESSION LIVENESS, not a fixed clock. Under
+  // boot-storm load a slow spawn can render the prompt minutes in; the old
+  // fixed 120s window gave up first, leaving the prompt unconfirmed and the
+  // agent hung (Brioche, 2026-06-15 — hit 4 spawns). Keep watching as long as
+  // the screen session is alive, up to a generous absolute safety cap.
+  // `appearMs` is that cap now.
+  const appearDeadline = Date.now() + (opts.appearMs ?? 600_000);
 
   let seen = false;
+  let sessionGone = false;
+  let deadPolls = 0;
   while (Date.now() < appearDeadline) {
     try {
       const buf = await screen.readOutput(screenName);
       if (buf.includes(marker)) { seen = true; break; }
       if (bootedWithoutPrompt(buf)) return true;
     } catch {
-      // screen may be momentarily unavailable during startup; retry
+      // screen may be momentarily unavailable during startup; liveness checked below
+    }
+    // A live screen always has a pid; tolerate a couple transient misses
+    // (screen -ls race) before declaring the session gone — so we never bail on
+    // a still-booting agent and re-introduce the unconfirmed-prompt hang.
+    if (await screen.isAlive(screenName)) {
+      deadPolls = 0;
+    } else if (++deadPolls >= 3) {
+      sessionGone = true;
+      break;
     }
     await new Promise((r) => setTimeout(r, 250));
   }
@@ -163,9 +189,17 @@ export async function autoConfirmDevChannel(
     }
   }
 
+  // A session that exited before any prompt appeared isn't a confirm failure —
+  // the agent died or finished on its own (its own logs own that story). Don't
+  // stamp the alarming dev-channel-confirm-failed status for a self-exit.
+  if (sessionGone) {
+    console.warn(`[crew] dev-channel auto-confirm: ${screenName} session ended before any prompt — nothing to confirm`);
+    return false;
+  }
+
   const detail = seen
     ? `dev-channel prompt did not clear after 3 CR attempts on ${screenName}`
-    : `neither dev-channel prompt nor input UI rendered within the window on ${screenName} — if the prompt shows later, nothing will confirm it`;
+    : `neither dev-channel prompt nor input UI rendered before the ${Math.round((opts.appearMs ?? 600_000) / 1000)}s cap on ${screenName} while the session stayed alive — if the prompt shows later, nothing will confirm it`;
   console.warn(`[crew] dev-channel auto-confirm FAILED for ${label}: ${detail}`);
   if (opts.store && opts.agentId) {
     try {
@@ -287,7 +321,15 @@ export class Orchestrator {
     // Auto-confirm the dev-channel prompt. Fire-and-forget — helper polls
     // the screen buffer until the prompt marker appears, then sends CR.
     // See autoConfirmDevChannel comment for why polling beats setTimeout.
-    void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id });
+    //
+    // Claude Code-specific: the markers ("Enter to confirm" + its input-UI
+    // footer) are CC's. Codex (and other runtimes) clear their own gates in the
+    // launcher (codex-launch.sh --dangerously-bypass + pre-trust), so running
+    // this CC-shaped confirm against them only polls a screen it can't read and
+    // stamps a misleading dev-channel-confirm-failed status. Gate to claude-code.
+    if (runtime === "claude-code") {
+      void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id });
+    }
 
     // Best-effort: if the caller asked to be split next to the new agent,
     // and the backend supports per-caller splits (cmux today, iTerm2

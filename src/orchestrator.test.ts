@@ -616,6 +616,10 @@ describe("autoConfirmDevChannel — verify-after-confirm", () => {
   const BOOTED_SCREEN = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ? for shortcuts";
   const crs = () => screenState.sendKeysLog.filter((e) => e.name === "dvc" && e.keys === "\r").length;
 
+  // A booting agent's screen session is alive; the appear-poll is now bounded by
+  // that liveness, so the session-alive case is the baseline for these tests.
+  beforeEach(() => { screenState.isAliveResult = true; });
+
   test("confirms the prompt and verifies it cleared", async () => {
     screenState.screens["dvc"] = { queue: ["starting claude…", MARKER_SCREEN], fallback: BOOTED_SCREEN };
 
@@ -682,5 +686,47 @@ describe("autoConfirmDevChannel — verify-after-confirm", () => {
     const row = orch.store.getAgent("stuckboot");
     expect(row?.status_name).toBe("dev-channel-confirm-failed");
     expect(row?.status_desc).toContain("did not clear after 3 CR attempts");
+  });
+
+  test("session exits before any prompt → false, NO confirm-failed status (self-exit)", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "deadboot" } });
+    screenState.isAliveResult = false; // session gone; "dvc-dead" never renders anything
+
+    const ok = await autoConfirmDevChannel("dvc-dead", "deadboot", {
+      store: orch.store,
+      agentId: "deadboot",
+      appearMs: 5_000, // generous cap; the liveness check ends it in ~3 polls
+      clearMs: 200,
+    });
+
+    expect(ok).toBe(false);
+    // A self-exit is NOT a confirm failure — the alarming status must NOT be stamped.
+    const row = orch.store.getAgent("deadboot");
+    expect(row?.status_name).not.toBe("dev-channel-confirm-failed");
+  });
+
+  test("a slow prompt that renders after the old 120s window still gets confirmed (liveness-bounded)", async () => {
+    // Session alive (beforeEach). The prompt is absent for many polls, then
+    // appears — the old fixed window would have given up; the liveness bound
+    // keeps watching and confirms it.
+    const slow: string[] = Array(8).fill("booting…"); // ~8 polls of no prompt
+    screenState.screens["dvc"] = { queue: [...slow, MARKER_SCREEN], fallback: BOOTED_SCREEN };
+
+    const ok = await autoConfirmDevChannel("dvc", "slowboot", { appearMs: 60_000, clearMs: 1_000 });
+
+    expect(ok).toBe(true);
+    expect(crs()).toBe(1);
+  });
+
+  test("non-claude-code runtime (codex) does NOT arm the CC dev-channel confirm", async () => {
+    // A marker on the codex agent's own screen WOULD trigger a CR if the
+    // (CC-specific) confirm loop ran. The gate must skip it for codex.
+    screenState.screens["wire-codexgate"] = { queue: [], fallback: MARKER_SCREEN };
+    await orch.launchAgent({ env: { AGENT_ID: "codexgate" }, runtime: "codex" });
+    // Give a fire-and-forget confirm loop well over one poll interval to act.
+    await new Promise((r) => setTimeout(r, 500));
+    const crsCodex = screenState.sendKeysLog.filter((e) => e.name === "wire-codexgate" && e.keys === "\r").length;
+    expect(crsCodex).toBe(0);
+    expect(orch.store.getAgent("codexgate")?.status_name).not.toBe("dev-channel-confirm-failed");
   });
 });
