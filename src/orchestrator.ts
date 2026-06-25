@@ -1589,6 +1589,14 @@ export class Orchestrator {
     name: string;
     sshHost: string;
     sshPort?: number;
+    /**
+     * Externally-reachable Wire broker URL for agents spawned on this machine
+     * (e.g. 'https://patisserie.ngrok.io'). Required for cross-machine spawn:
+     * the sponsoring parent registers the new ephemeral against this url so
+     * the remote broker knows its key, and the agent gets it as
+     * WIRE_EXTERNAL_URL. Omit for machines that run no distinct broker.
+     */
+    brokerUrl?: string;
     notes?: string;
     skipProbe?: boolean;
     /**
@@ -1630,6 +1638,7 @@ export class Orchestrator {
       hostname: probedHostname,
       ssh_host: opts.sshHost,
       ssh_port: opts.sshPort,
+      broker_url: opts.brokerUrl,
       notes: opts.notes,
     });
     if (crewVersion) {

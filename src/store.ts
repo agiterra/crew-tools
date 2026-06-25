@@ -62,6 +62,13 @@ export type Machine = {
   hostname: string;          // OS hostname, for dedupe + self-detect
   ssh_host: string;          // 'tim@mac-mini.local' or similar
   ssh_port: number | null;   // null = default 22
+  // Externally-reachable Wire broker URL for agents spawned ON this machine
+  // (e.g. 'https://patisserie.ngrok.io'). Used by cross-machine spawn: the
+  // sponsoring parent registers the new ephemeral against THIS url (so the
+  // remote broker — which the agent dials over its own localhost — knows the
+  // key), and the agent receives it as WIRE_EXTERNAL_URL. null = the machine
+  // runs no distinct broker (a remote spawn there is rejected at spawn time).
+  broker_url: string | null;
   added_at: number;
   last_seen: number | null;
   crew_version: string | null;
@@ -275,12 +282,24 @@ export class CrewStore {
         hostname TEXT NOT NULL,
         ssh_host TEXT NOT NULL,
         ssh_port INTEGER,
+        broker_url TEXT,
         added_at INTEGER NOT NULL,
         last_seen INTEGER,
         crew_version TEXT,
         notes TEXT
       );
     `);
+
+    // Add broker_url column to machines (cross-machine spawn). Nullable —
+    // pre-existing rows + the local self-row carry no distinct broker. A
+    // CREATE TABLE above only applies to fresh DBs; existing DBs need the
+    // ALTER. pragma check keeps it idempotent (same pattern as machine_name).
+    const hasBrokerUrl = this.db.prepare(
+      "SELECT * FROM pragma_table_info('machines') WHERE name='broker_url'"
+    ).get();
+    if (!hasBrokerUrl) {
+      this.db.exec("ALTER TABLE machines ADD COLUMN broker_url TEXT");
+    }
 
     // First-boot: ensure the local machine is registered so JOINs on
     // agents.machine_name always resolve for local rows. Idempotent.
@@ -541,21 +560,23 @@ export class CrewStore {
     hostname: string;
     ssh_host: string;
     ssh_port?: number;
+    broker_url?: string;
     notes?: string;
   }): Machine {
     const now = Date.now();
     this.db.prepare(
-      `INSERT INTO machines (name, hostname, ssh_host, ssh_port, added_at, last_seen, crew_version, notes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO machines (name, hostname, ssh_host, ssh_port, broker_url, added_at, last_seen, crew_version, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       opts.name, opts.hostname, opts.ssh_host, opts.ssh_port ?? null,
-      now, null, null, opts.notes ?? null,
+      opts.broker_url ?? null, now, null, null, opts.notes ?? null,
     );
     return {
       name: opts.name,
       hostname: opts.hostname,
       ssh_host: opts.ssh_host,
       ssh_port: opts.ssh_port ?? null,
+      broker_url: opts.broker_url ?? null,
       added_at: now,
       last_seen: null,
       crew_version: null,
