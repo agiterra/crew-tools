@@ -68,6 +68,89 @@ export async function createSession(
   return { name, pid };
 }
 
+// --- Cross-machine (remote) screen sessions ---
+//
+// A remote agent runs in a screen session on ANOTHER machine, owned by a
+// different UID (the per-UID `_ephemeral` pool). We reach it over SSH and
+// `sudo -u <uid>`. Two load-bearing gotchas, both proven 2026-06-25:
+//   1. macOS `sudo -H/-u <uid>` does NOT deliver HOME — screen then uses the
+//      SSH user's `~/.screen` and dies 'Cannot opendir … Permission denied'.
+//      We set HOME + SCREENDIR explicitly via `env` (allowed by the box's broad
+//      NOPASSWD sudo for tim; the personae→_ephemeral screen-only rule isn't
+//      enough on its own).
+//   2. The launch command (cd && export && agent prompt) is full of &&, quotes
+//      and shell metachars — base64 the launch SCRIPT so it crosses SSH cleanly.
+
+export type RemoteTarget = { sshHost: string; runAsUid: string };
+
+/** `sudo -n -u <uid> env HOME=… SCREENDIR=… <screen>` — the remote screen prefix. */
+function remoteScreen(t: RemoteTarget): string {
+  const home = `/Users/${t.runAsUid}`;
+  return `sudo -n -u ${t.runAsUid} env HOME=${home} SCREENDIR=${home}/.screen ${SCREEN}`;
+}
+
+/** Run a command on the remote host's login shell (pipes/&& work). Returns stdout. */
+async function sshRun(t: RemoteTarget, remoteCommand: string): Promise<string> {
+  const r = await $`ssh -o BatchMode=yes -o ConnectTimeout=15 ${t.sshHost} ${remoteCommand}`
+    .quiet()
+    .nothrow();
+  return r.stdout.toString();
+}
+
+/** Create a detached screen session on a remote host, owned by `runAsUid`. */
+export async function createRemoteSession(
+  name: string,
+  command: string,
+  t: RemoteTarget,
+): Promise<ScreenSession> {
+  const scriptFile = `/tmp/crew-launch-${name}-${Date.now()}.sh`;
+  const body = `#!/usr/bin/env -S /bin/zsh -l\nrm -f '${scriptFile}'\n${command}\n`;
+  const b64 = Buffer.from(body).toString("base64");
+  // Write the script (as the SSH user, in world-readable /tmp so the ephemeral
+  // UID can exec it), then sudo to the ephemeral UID and launch screen.
+  const remote =
+    `printf %s ${b64} | base64 -d > ${scriptFile}; chmod 755 ${scriptFile}; ` +
+    `${remoteScreen(t)} -dmS ${name} ${scriptFile}`;
+  await sshRun(t, remote);
+  const pid = await getRemoteSessionPid(name, t);
+  if (pid === null) {
+    throw new Error(`remote screen session '${name}' on ${t.sshHost} failed to start`);
+  }
+  return { name, pid };
+}
+
+/** PID of a named screen session on a remote host, or null. */
+export async function getRemoteSessionPid(name: string, t: RemoteTarget): Promise<number | null> {
+  const out = await sshRun(t, `${remoteScreen(t)} -ls`);
+  for (const line of out.split("\n")) {
+    const match = line.match(/^\t(\d+)\.(\S+)\t/);
+    if (match && match[2] === name) return parseInt(match[1]);
+  }
+  return null;
+}
+
+/** Read the screen buffer of a remote session (hardcopy + cat in one round-trip). */
+export async function readRemoteOutput(name: string, t: RemoteTarget): Promise<string> {
+  const tmp = `/tmp/screen-hc-${name}-${Date.now()}`;
+  // hardcopy runs as the ephemeral UID (writes $tmp owned by it); `sudo cat`
+  // (as the SSH user, broad NOPASSWD) reads it regardless of mode.
+  const out = await sshRun(
+    t,
+    `${remoteScreen(t)} -S ${name} -X hardcopy ${tmp}; sleep 0.3; sudo -n cat ${tmp} 2>/dev/null; rm -f ${tmp}`,
+  );
+  return out.trimEnd();
+}
+
+/** Send keystrokes to a remote session (e.g. the dev-channel confirm CR). */
+export async function sendRemoteKeys(name: string, text: string, t: RemoteTarget): Promise<void> {
+  // base64 the payload so CRs / metachars survive the SSH + sudo + screen hop.
+  const b64 = Buffer.from(text).toString("base64");
+  await sshRun(
+    t,
+    `${remoteScreen(t)} -S ${name} -X stuff "$(printf %s ${b64} | base64 -d)"`,
+  );
+}
+
 /**
  * List all screen sessions.
  */
