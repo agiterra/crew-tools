@@ -387,9 +387,11 @@ export class CrewStore {
     badge?: string;
     ttl_idle_minutes?: number;
     spawn_manifest?: string;
+    /** Machine the agent runs on. Defaults to the local hostname; set for remote (cross-machine) spawns. */
+    machine_name?: string;
   }): Agent {
     const now = Date.now();
-    const machineName = hostname().toLowerCase();
+    const machineName = agent.machine_name ?? hostname().toLowerCase();
     this.db.prepare(
       `INSERT INTO agents (id, display_name, runtime, screen_name, screen_pid, cc_session_id, pane, badge, launched_at, last_seen, ttl_idle_minutes, spawn_manifest, machine_name)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`

@@ -121,7 +121,7 @@ function readAuxSurface(spawnManifest: string | null): string | undefined {
 export async function autoConfirmDevChannel(
   screenName: string,
   label: string,
-  opts: { store?: CrewStore; agentId?: string; appearMs?: number; clearMs?: number } = {},
+  opts: { store?: CrewStore; agentId?: string; appearMs?: number; clearMs?: number; remote?: screen.RemoteTarget } = {},
 ): Promise<boolean> {
   const marker = "Enter to confirm";
   // CC renders its normal input UI only after the dev-channel gate, so
@@ -129,12 +129,15 @@ export async function autoConfirmDevChannel(
   // coming this boot.
   const bootedWithoutPrompt = (buf: string) =>
     !buf.includes(marker) && (buf.includes("? for shortcuts") || buf.includes("⏵⏵"));
+  // Screen accessors — remote (ssh + sudo -u) for a cross-machine agent, else local.
+  const read = () => (opts.remote ? screen.readRemoteOutput(screenName, opts.remote) : screen.readOutput(screenName));
+  const sendCR = () => (opts.remote ? screen.sendRemoteKeys(screenName, "\r", opts.remote) : screen.sendKeys(screenName, "\r"));
   const appearDeadline = Date.now() + (opts.appearMs ?? 120_000);
 
   let seen = false;
   while (Date.now() < appearDeadline) {
     try {
-      const buf = await screen.readOutput(screenName);
+      const buf = await read();
       if (buf.includes(marker)) { seen = true; break; }
       if (bootedWithoutPrompt(buf)) return true;
     } catch {
@@ -146,7 +149,7 @@ export async function autoConfirmDevChannel(
   if (seen) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        await screen.sendKeys(screenName, "\r");
+        await sendCR();
       } catch {
         // transient send failure — the clear-poll below times out and we retry
       }
@@ -154,7 +157,7 @@ export async function autoConfirmDevChannel(
       while (Date.now() < clearDeadline) {
         await new Promise((r) => setTimeout(r, 250));
         try {
-          const buf = await screen.readOutput(screenName);
+          const buf = await read();
           if (!buf.includes(marker)) return true;
         } catch {
           // transient read failure; keep polling
@@ -232,6 +235,16 @@ export class Orchestrator {
      * iTerm2 leaves it undefined and the orchestrator skips this step).
      */
     splitInCallerWorkspace?: { direction: "right" | "down" };
+    /**
+     * Spawn on a REMOTE machine (cross-machine spawn). Names a row in the
+     * machines table; when its ssh_host is non-local, the agent's screen is
+     * created there via ssh + `sudo -u <run_as_uid>`. The agent runs headless
+     * from this orchestrator's POV (no local pane); machine_name is stamped to
+     * the remote host so the reconciler (which skips non-local rows) leaves it.
+     */
+    machine?: string;
+    /** Per-UID account to spawn the remote agent under (e.g. `_ephemeral`). Required when `machine` is remote. */
+    runAsUid?: string;
   }): Promise<Agent> {
     const id = opts.env.AGENT_ID;
     if (!id) throw new Error("env.AGENT_ID is required");
@@ -281,13 +294,27 @@ export class Orchestrator {
       .join(" ")}`;
     const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${SOURCE_NEAREST_ENV} && ${command}`;
 
-    // Create screen session
-    const session = await screen.createSession(screenName, fullCommand);
+    // Create screen session — local, or on a remote host when opts.machine
+    // names a non-local machine (cross-machine spawn: ssh + sudo -u <run_as_uid>).
+    const machineRow = opts.machine ? this.store.getMachine(opts.machine) : undefined;
+    if (opts.machine && !machineRow) {
+      throw new Error(`launchAgent: unknown machine '${opts.machine}' — register it with machine_register first`);
+    }
+    const remoteTarget: screen.RemoteTarget | undefined =
+      machineRow && machineRow.ssh_host !== "localhost"
+        ? { sshHost: machineRow.ssh_host, runAsUid: opts.runAsUid ?? "" }
+        : undefined;
+    if (remoteTarget && !opts.runAsUid) {
+      throw new Error(`launchAgent: machine='${opts.machine}' is remote — run_as_uid is required (the per-UID account to spawn under, e.g. _ephemeral)`);
+    }
+    const session = remoteTarget
+      ? await screen.createRemoteSession(screenName, fullCommand, remoteTarget)
+      : await screen.createSession(screenName, fullCommand);
 
     // Auto-confirm the dev-channel prompt. Fire-and-forget — helper polls
     // the screen buffer until the prompt marker appears, then sends CR.
     // See autoConfirmDevChannel comment for why polling beats setTimeout.
-    void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id });
+    void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id, remote: remoteTarget });
 
     // Best-effort: if the caller asked to be split next to the new agent,
     // and the backend supports per-caller splits (cmux today, iTerm2
@@ -372,6 +399,10 @@ export class Orchestrator {
       badge: opts.badge,
       ttl_idle_minutes: opts.ttlIdleMinutes,
       spawn_manifest: JSON.stringify(manifest),
+      // Stamp the remote host for cross-machine spawns so the reconciler (which
+      // skips non-local machine_name rows) doesn't false-reap an agent whose
+      // screen lives on another box.
+      machine_name: remoteTarget ? opts.machine : undefined,
     });
   }
 
