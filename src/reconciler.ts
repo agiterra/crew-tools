@@ -12,7 +12,7 @@
  */
 
 import { CrewStore, type Agent } from "./store.js";
-import { listSessions, type ScreenSession } from "./screen.js";
+import { type ScreenSession } from "./screen.js";
 import { listThemes, loadTheme, pickName, backgroundImagePath } from "./themes.js";
 import type { TerminalBackend } from "./terminal.js";
 
@@ -42,39 +42,19 @@ export async function reconcile(
   options?: { tabOrphanAgeMs?: number },
 ): Promise<ReconcileResult> {
   const tabOrphanAgeMs = options?.tabOrphanAgeMs ?? DEFAULT_TAB_ORPHAN_AGE_MS;
-  const agents = store.listAgents();
-  const sessions = await listSessions();
-  const sessionByName = new Map(sessions.map((s) => [s.name, s]));
-  const localMachine = store.localMachineName();
 
+  // Agent ↔ screen reality is no longer reconciled here. It moved to the
+  // RealityLayer (reality.ts), which the orchestrator drives as a grace-
+  // gated healer (Orchestrator.reconcile + startReaper): reads hide stale
+  // rows immediately, deletion waits out a grace, and a transient `screen
+  // -ls` blip can no longer cascade-delete live (or peer) agents — the
+  // failure mode the old "delete on first absence" loop risked. This
+  // function is now a pure METADATA healer for panes, tabs, and themes.
+  // alive/dead/orphans remain in the result shape but are populated by the
+  // reality healer; the reconciler leaves them empty.
   const alive: string[] = [];
   const dead: string[] = [];
-  const knownScreenNames = new Set<string>();
-
-  for (const agent of agents) {
-    // Cross-machine safety: the local reconciler is NOT authoritative for
-    // agents on peer machines. Their screen sessions live on the remote
-    // host; `screen -ls` here will always return nothing for them. Without
-    // this skip, the first time a peer is registered and fleet_list
-    // populates the DB with remote rows, the next boot would cascade-
-    // delete every remote agent — classic latent fatal bug.
-    if (agent.machine_name !== localMachine) continue;
-
-    knownScreenNames.add(agent.screen_name);
-    const session = sessionByName.get(agent.screen_name);
-    if (session) {
-      store.updateAgentPid(agent.id, session.pid);
-      store.touchAgent(agent.id);
-      alive.push(agent.id);
-    } else {
-      store.deleteAgent(agent.id);
-      dead.push(agent.id);
-    }
-  }
-
-  const orphans = sessions.filter(
-    (s) => s.name.startsWith("wire-") && !knownScreenNames.has(s.name),
-  );
+  const orphans: ScreenSession[] = [];
 
   // --- Pane session check ---
   // Pane lifecycle follows iTerm: if we confirm the pane's iTerm session is

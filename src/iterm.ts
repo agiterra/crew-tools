@@ -40,6 +40,56 @@ export async function currentSessionId(): Promise<string> {
 }
 
 /**
+ * Enumerate every live iTerm2 session across all windows/tabs in one
+ * AppleScript pass. Returns `{ id, tty, title }` per session.
+ *
+ * Used by the reality layer to confirm which pane/tab DB rows still point
+ * at a live session. One osascript invocation walks the whole hierarchy
+ * (cheaper than per-session `isSessionAlive` probes) and emits a flat,
+ * line-oriented record stream: fields are joined with US (\x1f) and records
+ * with RS (\x1e), neither of which can appear in an iTerm session id, tty,
+ * or (sanely) a pane title — so parsing is unambiguous even if a title
+ * contains tabs or spaces.
+ *
+ * Total + non-throwing per the TerminalBackend contract: any AppleScript
+ * failure (iTerm not running, mid-walk session teardown) yields `[]`.
+ */
+export async function enumerateSessions(): Promise<
+  Array<{ id: string; tty: string | null; title: string | null }>
+> {
+  try {
+    const raw = await osascript(`
+      tell application "iTerm2"
+        set out to ""
+        repeat with w in windows
+          repeat with t in tabs of w
+            repeat with s in sessions of t
+              set out to out & (id of s) & character id 31 & (tty of s) & character id 31 & (name of s) & character id 30
+            end repeat
+          end repeat
+        end repeat
+        return out
+      end tell
+    `);
+    const sessions: Array<{ id: string; tty: string | null; title: string | null }> = [];
+    for (const record of raw.split("\x1e")) {
+      if (!record) continue;
+      const [id, tty, title] = record.split("\x1f");
+      if (!id) continue;
+      sessions.push({
+        id,
+        tty: tty && tty.length > 0 ? tty : null,
+        title: title && title.length > 0 ? title : null,
+      });
+    }
+    return sessions;
+  } catch (e) {
+    console.error(`[crew] enumerateSessions (iterm) failed:`, e);
+    return [];
+  }
+}
+
+/**
  * Get the iTerm2 session ID for the session owning a specific TTY.
  * More reliable than ITERM_SESSION_ID env var which can go stale.
  */

@@ -2,7 +2,7 @@
  * iTerm2 backend — wraps iterm.ts functions into the TerminalBackend interface.
  */
 
-import type { TerminalBackend, PaneProfile } from "./terminal.js";
+import type { TerminalBackend, PaneProfile, TerminalSession } from "./terminal.js";
 import * as iterm from "./iterm.js";
 
 export class ItermBackend implements TerminalBackend {
@@ -14,6 +14,10 @@ export class ItermBackend implements TerminalBackend {
 
   sessionIdForTty(ttyName: string): Promise<string | null> {
     return iterm.sessionIdForTty(ttyName);
+  }
+
+  enumerateSessions(): Promise<TerminalSession[]> {
+    return iterm.enumerateSessions();
   }
 
   splitPane(direction: "horizontal" | "vertical"): Promise<string> {

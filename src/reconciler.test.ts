@@ -31,6 +31,7 @@ function makeTerminal(aliveSessionIds: string[]): TerminalBackend & { calls: Ter
     calls,
     currentSessionId: mock(async () => ""),
     sessionIdForTty: mock(async () => null),
+    enumerateSessions: mock(async () => []),
     splitPane: mock(async () => ""),
     splitSession: mock(async () => ""),
     writeToSession: mock(async () => {}),
@@ -60,37 +61,9 @@ function makeTerminal(aliveSessionIds: string[]): TerminalBackend & { calls: Ter
   return t;
 }
 
-describe("reconcile cross-machine safety", () => {
-  test("skips agents on peer machines (does NOT cascade-delete remote rows)", async () => {
-    // Local row: screen looks dead, reconciler prunes it.
-    store.createAgent({
-      id: "local-dead",
-      display_name: "LocalDead",
-      runtime: "claude-code",
-      screen_name: "wire-local-dead",
-    });
-    // Remote row: pretend the agent lives on home-mini. createAgent stamps
-    // the local hostname, so we UPDATE to simulate a fleet_list insertion.
-    store.createMachine({ name: "home-mini", hostname: "home-mini", ssh_host: "tim@home-mini" });
-    store.createAgent({
-      id: "remote-alive",
-      display_name: "RemoteAlive",
-      runtime: "claude-code",
-      screen_name: "wire-remote-alive",
-    });
-    store["db"].prepare("UPDATE agents SET machine_name = ? WHERE id = ?").run("home-mini", "remote-alive");
-
-    const result = await reconcile(store);
-
-    // Local dead agent got pruned.
-    expect(result.dead).toContain("local-dead");
-    expect(store.getAgent("local-dead")).toBeNull();
-    // Remote agent is untouched — NOT in alive (we don't claim it is) and NOT in dead.
-    expect(result.alive).not.toContain("remote-alive");
-    expect(result.dead).not.toContain("remote-alive");
-    expect(store.getAgent("remote-alive")).not.toBeNull();
-  });
-});
+// NOTE: agent ↔ screen reconciliation (including cross-machine safety) moved
+// to the RealityLayer — see reality.test.ts. The reconciler is now a pure
+// metadata healer for panes, tabs, and themes.
 
 describe("reconcile theme healing", () => {
   test("assigns theme to untheme tab", async () => {

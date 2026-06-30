@@ -7,6 +7,7 @@ export { CmuxBackend } from "./cmux.js";
 export { createBackend, detectTerminal, type TerminalBackend, type TerminalType, type PaneProfile } from "./terminal.js";
 export { loadRuntimes, getLaunchCommand, expandCommand, type RuntimeConfig } from "./runtimes.js";
 export { reconcile, formatReport, type ReconcileResult } from "./reconciler.js";
+export { RealityLayer, type RealitySnapshot, type HealResult } from "./reality.js";
 export { pickName, isValidTheme, THEME_NAMES, backgroundImagePath, loadTheme, listThemes, resolveThemeDir, saveTheme, updateTheme, type ThemeConfig } from "./themes.js";
 export { startServer } from "./mcp-server.js";
 export { runCli } from "./cli.js";

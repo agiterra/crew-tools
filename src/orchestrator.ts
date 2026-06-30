@@ -11,6 +11,7 @@ import * as screen from "./screen.js";
 import type { TerminalBackend } from "./terminal.js";
 import { getLaunchCommand } from "./runtimes.js";
 import { reconcile, formatReport } from "./reconciler.js";
+import { RealityLayer } from "./reality.js";
 import { pickName, backgroundImagePath, loadTheme, updateTheme, listThemes } from "./themes.js";
 import { getClaudeCodeSessionId } from "./claude-session.js";
 
@@ -183,10 +184,17 @@ export async function autoConfirmDevChannel(
 export class Orchestrator {
   readonly store: CrewStore;
   readonly terminal: TerminalBackend;
+  /**
+   * Reality layer — the source of truth for what exists. Reads join db rows
+   * against it so a stale row never surfaces; the healer prunes lingering
+   * rows on a grace. See {@link reality.ts}.
+   */
+  readonly reality: RealityLayer;
 
   constructor(terminal: TerminalBackend, dbPath: string = DEFAULT_DB) {
     this.terminal = terminal;
     this.store = new CrewStore(dbPath);
+    this.reality = new RealityLayer(terminal);
   }
 
   // --- Agent lifecycle ---
@@ -1084,10 +1092,18 @@ export class Orchestrator {
   }
 
   /**
-   * List all agents with their current state.
+   * List agents with their current state, reality-joined: a local agent is
+   * returned only if its screen session is live right now; remote agents
+   * (another machine's reality) pass through unverified. So a stale DB row
+   * can never surface — the generalization of the Wire peerHasAgent fix.
+   *
+   * This is also the continuous lazy-GC-on-read path: each call heals the
+   * agent table toward reality (refresh live pids, mark/prune dead rows on
+   * a grace). The snapshot is cached (≤TTL), so frequent polling is cheap.
    */
-  listAgents(): Agent[] {
-    return this.store.listAgents();
+  async listAgents(): Promise<Agent[]> {
+    const { live } = await this.reality.heal(this.store, this.store.localMachineName());
+    return live;
   }
 
   // --- Pane I/O ---
@@ -1761,11 +1777,19 @@ export class Orchestrator {
   // --- Reconciler ---
 
   /**
-   * Reconcile DB state with running screen sessions.
-   * Run on boot and periodically.
+   * Reconcile DB state with reality. Runs on boot and periodically.
+   *
+   * Two stages: the reality healer prunes/refreshes the agent table against
+   * live screen sessions (grace-gated), then the metadata reconciler heals
+   * pane/tab/theme drift on the survivors. The healer's agent verdicts are
+   * folded into the report so the boot log still shows alive/dead/orphans.
    */
   async reconcile(): Promise<string> {
+    const heal = await this.reality.heal(this.store, this.store.localMachineName());
     const result = await reconcile(this.store, this.terminal);
+    result.alive = heal.result.alive;
+    result.dead = heal.result.gcd;
+    result.orphans = heal.result.orphans;
     const agents = this.store.listAgents();
     return formatReport(result, agents);
   }
@@ -1800,11 +1824,18 @@ export class Orchestrator {
     return reaped;
   }
 
-  /** Start the reaper interval. Call once from a long-lived process. */
+  /**
+   * Start the reaper interval. Call once from a long-lived process. Each
+   * tick also runs the reality healer so rows whose screen died between
+   * reads get pruned (grace-gated) even when nothing calls agent_list.
+   */
   startReaper(intervalMs = 60_000): void {
     if (this.reaperInterval) return;
     this.reaperInterval = setInterval(() => {
       this.reap().catch((e) => console.error(`[crew] reaper tick failed:`, e));
+      this.reality
+        .heal(this.store, this.store.localMachineName())
+        .catch((e) => console.error(`[crew] reality heal tick failed:`, e));
     }, intervalMs);
   }
 

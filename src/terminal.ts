@@ -20,6 +20,26 @@ export interface PaneProfile {
 }
 
 /**
+ * A live terminal session/surface as reported by the backend itself.
+ *
+ * The reality layer ({@link ../reality.ts}) enumerates these and LEFT JOINs
+ * the pane/tab DB rows against them, so a stale DB row (pointing at a
+ * session that no longer exists) can never surface as live. It's the
+ * terminal-side analogue of `screen.listSessions()`.
+ *
+ * `id` is the same opaque identifier the rest of the backend uses for this
+ * surface — an iTerm2 session UUID, or a cmux surface ref (`surface:N`) —
+ * so it compares directly against `pane.iterm_id` / `tab.iterm_session_id`.
+ * `tty` and `title` are best-effort: null when the backend can't supply
+ * them cheaply.
+ */
+export interface TerminalSession {
+  id: string;
+  tty: string | null;
+  title: string | null;
+}
+
+/**
  * Common interface for terminal backends.
  * Both iTerm2 and cmux implement this.
  */
@@ -34,6 +54,18 @@ export interface TerminalBackend {
 
   /** Resolve a TTY device path to a session/surface ID. */
   sessionIdForTty(ttyName: string): Promise<string | null>;
+
+  /**
+   * Enumerate every live session/surface this backend currently hosts,
+   * flattened across its window/tab/pane hierarchy. The reality layer uses
+   * this as the source of truth for which pane/tab DB rows still exist.
+   *
+   * Implementations MUST be total and non-throwing: a transient enumeration
+   * failure returns `[]` (matching `screen.listSessions()`), never throws —
+   * the caller treats an empty snapshot as "no terminal reality available"
+   * and falls back to leaving DB rows untouched rather than reaping them.
+   */
+  enumerateSessions(): Promise<TerminalSession[]>;
 
   // --- Pane operations ---
 

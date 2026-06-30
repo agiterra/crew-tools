@@ -50,6 +50,7 @@ function makeTerminal(): TerminalBackend {
     name: "test",
     currentSessionId: mock(async () => ""),
     sessionIdForTty: mock(async () => null),
+    enumerateSessions: mock(async () => []),
     splitPane: mock(async () => ""),
     splitSession: mock(async () => ""),
     writeToSession: mock(async () => {}),

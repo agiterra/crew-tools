@@ -327,7 +327,7 @@ export async function startServer(): Promise<void> {
     {
       name: "agent_list",
       description:
-        "List agents with status, pane, and runtime. Optional filters narrow the result — useful when you only want attached agents (for routing) or headless ones (for cleanup). Dead agents are pruned by the boot-time reconciler, so the list only contains agents whose screen session was alive at last check.",
+        "List agents with status, pane, and runtime. Optional filters narrow the result — useful when you only want attached agents (for routing) or headless ones (for cleanup). The list is reality-joined: a local agent appears only if its screen session is live at read time (stale rows are hidden immediately and pruned on a grace), while agents on peer machines pass through unverified.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -741,7 +741,7 @@ export async function startServer(): Promise<void> {
           result = { stopped: a.id, cc_session_id: a.cc_session_id };
           break;
         case "agent_list": {
-          let agents = orchestrator.listAgents();
+          let agents = await orchestrator.listAgents();
           if (typeof a.attached === "boolean") {
             agents = agents.filter((ag) => (ag.pane !== null) === a.attached);
           }

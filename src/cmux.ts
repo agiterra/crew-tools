@@ -13,7 +13,7 @@
  */
 
 import { $ } from "bun";
-import type { TerminalBackend, PaneProfile } from "./terminal.js";
+import type { TerminalBackend, PaneProfile, TerminalSession } from "./terminal.js";
 
 /**
  * Run a cmux CLI command and return trimmed stdout.
@@ -245,6 +245,46 @@ export class CmuxBackend implements TerminalBackend {
     // Fall back to identify command
     const info = await cmuxJson("identify");
     return info.focused?.surface_ref ?? info.focused?.surfaceRef;
+  }
+
+  /**
+   * Enumerate every live cmux surface across all windows/workspaces in one
+   * `tree --json` walk. Returns `{ id, tty, title }` per surface.
+   *
+   * `id` is the surface REF (`surface:N`) — the same value createPane /
+   * splitSession return and crew persists as `pane.iterm_id`, so it joins
+   * directly against the DB. (Surface refs reset across cmux daemon
+   * restarts; that staleness is inherent to cmux and already handled by
+   * resolveSurface for per-surface ops. The reality layer treats a stored
+   * ref that no longer appears here as "gone", which is the correct
+   * conservative read.)
+   *
+   * Total + non-throwing per the TerminalBackend contract: a failed tree
+   * query yields `[]`.
+   */
+  async enumerateSessions(): Promise<TerminalSession[]> {
+    try {
+      const tree = await cmuxJson("tree");
+      const sessions: TerminalSession[] = [];
+      for (const win of tree.windows ?? []) {
+        for (const ws of win.workspaces ?? []) {
+          for (const pane of ws.panes ?? []) {
+            for (const surface of pane.surfaces ?? []) {
+              if (!surface.ref) continue;
+              sessions.push({
+                id: surface.ref,
+                tty: typeof surface.tty === "string" && surface.tty.length > 0 ? surface.tty : null,
+                title: typeof surface.title === "string" && surface.title.length > 0 ? surface.title : null,
+              });
+            }
+          }
+        }
+      }
+      return sessions;
+    } catch (e) {
+      console.error(`[crew] enumerateSessions (cmux) failed:`, e);
+      return [];
+    }
   }
 
   async sessionIdForTty(ttyName: string): Promise<string | null> {
