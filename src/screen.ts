@@ -58,10 +58,16 @@ export async function createSession(
   const scriptFile = `/tmp/crew-launch-${name}-${Date.now()}.sh`;
   await Bun.write(scriptFile, `#!/usr/bin/env -S ${shell} -l\nrm -f '${scriptFile}'\n${command}\n`);
   await $`chmod +x ${scriptFile}`.quiet();
-  await $`${SCREEN} -c ${screenrc} -dmS ${name} ${scriptFile}`.quiet();
+  // -U forces UTF-8 so box-drawing / symbols in a TUI (claude/codex) render
+  // clean on attach instead of â/Â mojibake. The screenrc on a fresh install
+  // doesn't set defutf8, so the flag is load-bearing (2026-06-30).
+  await $`${SCREEN} -U -c ${screenrc} -dmS ${name} ${scriptFile}`.quiet();
 
-  // Get the screen PID
-  const pid = await getSessionPid(name);
+  // `screen -dmS` forks; the session can lag a beat before `screen -ls` lists
+  // it. A single immediate getSessionPid() loses that race and spuriously
+  // throws "failed to start" (the kouign/palmier spawn failures, 2026-06-30).
+  // Poll instead.
+  const pid = await pollSessionPid(name);
   if (pid === null) {
     throw new Error(`screen session '${name}' failed to start`);
   }
@@ -83,10 +89,14 @@ export async function createSession(
 
 export type RemoteTarget = { sshHost: string; runAsUid: string };
 
-/** `sudo -n -u <uid> env HOME=… SCREENDIR=… <screen>` — the remote screen prefix. */
+/** `sudo -n -u <uid> env HOME=… SCREENDIR=… LANG/LC_ALL <screen>` — remote screen prefix. */
 function remoteScreen(t: RemoteTarget): string {
   const home = `/Users/${t.runAsUid}`;
-  return `sudo -n -u ${t.runAsUid} env HOME=${home} SCREENDIR=${home}/.screen ${SCREEN}`;
+  // `sudo` strips the locale → screen runs in the C/POSIX locale and mangles
+  // UTF-8 (box-drawing chars become â/Â). Force UTF-8 in the env so BOTH session
+  // creation (-U below) AND hardcopy reads (readRemoteOutput) come back clean
+  // (the 2026-06-29 cross-machine-attach mojibake; same class hit herald's read).
+  return `sudo -n -u ${t.runAsUid} env HOME=${home} SCREENDIR=${home}/.screen LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ${SCREEN}`;
 }
 
 /** Run a command on the remote host's login shell (pipes/&& work). Returns stdout. */
@@ -110,9 +120,12 @@ export async function createRemoteSession(
   // UID can exec it), then sudo to the ephemeral UID and launch screen.
   const remote =
     `printf %s ${b64} | base64 -d > ${scriptFile}; chmod 755 ${scriptFile}; ` +
-    `${remoteScreen(t)} -dmS ${name} ${scriptFile}`;
+    `${remoteScreen(t)} -U -dmS ${name} ${scriptFile}`;
   await sshRun(t, remote);
-  const pid = await getRemoteSessionPid(name, t);
+  // Poll — same forked-screen race as the local path, but over SSH (slower), so
+  // a longer deadline. A single check would intermittently false-fail a healthy
+  // cross-machine spawn.
+  const pid = await pollRemoteSessionPid(name, t);
   if (pid === null) {
     throw new Error(`remote screen session '${name}' on ${t.sshHost} failed to start`);
   }
@@ -127,6 +140,24 @@ export async function getRemoteSessionPid(name: string, t: RemoteTarget): Promis
     if (match && match[2] === name) return parseInt(match[1]);
   }
   return null;
+}
+
+/**
+ * Poll for a remote screen session's PID (the cross-machine analogue of
+ * pollSessionPid). Longer default deadline since each check is an SSH round-trip.
+ */
+export async function pollRemoteSessionPid(
+  name: string,
+  t: RemoteTarget,
+  timeoutMs = 8000,
+): Promise<number | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const pid = await getRemoteSessionPid(name, t);
+    if (pid !== null) return pid;
+    if (Date.now() >= deadline) return null;
+    await new Promise((r) => setTimeout(r, 400));
+  }
 }
 
 /** Read the screen buffer of a remote session (hardcopy + cat in one round-trip). */
@@ -179,6 +210,23 @@ export async function getSessionPid(name: string): Promise<number | null> {
   const sessions = await listSessions();
   const session = sessions.find((s) => s.name === name);
   return session?.pid ?? null;
+}
+
+/**
+ * Poll for a screen session's PID until it appears or the deadline elapses.
+ * `screen -dmS` returns before the forked session is necessarily listed by
+ * `screen -ls`; a single immediate getSessionPid() loses that race and reports
+ * a healthy spawn as failed (kouign/palmier, 2026-06-30). Returns the PID once
+ * the session shows up, or null if it never does within `timeoutMs`.
+ */
+export async function pollSessionPid(name: string, timeoutMs = 5000): Promise<number | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const pid = await getSessionPid(name);
+    if (pid !== null) return pid;
+    if (Date.now() >= deadline) return null;
+    await new Promise((r) => setTimeout(r, 200));
+  }
 }
 
 /**
