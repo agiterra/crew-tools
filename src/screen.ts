@@ -100,7 +100,7 @@ function remoteScreen(t: RemoteTarget): string {
 }
 
 /** Run a command on the remote host's login shell (pipes/&& work). Returns stdout. */
-async function sshRun(t: RemoteTarget, remoteCommand: string): Promise<string> {
+export async function sshRun(t: RemoteTarget, remoteCommand: string): Promise<string> {
   const r = await $`ssh -o BatchMode=yes -o ConnectTimeout=15 ${t.sshHost} ${remoteCommand}`
     .quiet()
     .nothrow();

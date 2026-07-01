@@ -74,6 +74,11 @@ let dbPath: string;
 let orch: InstanceType<typeof Orchestrator>;
 
 beforeEach(() => {
+  // These exercise spawn MECHANICS (env forwarding, manifest, machine routing)
+  // against a mocked screen — bypass the Phase-2 fail-closed credential guard so
+  // they don't depend on a live Claude credential in $HOME. The guard has its
+  // own coverage in credentials.test.ts.
+  process.env.CREW_SKIP_CRED_CHECK = "1";
   tmpDir = mkdtempSync(join(tmpdir(), "orchestrator-test-"));
   dbPath = join(tmpDir, "test.db");
   orch = new Orchestrator(makeTerminal(), dbPath);

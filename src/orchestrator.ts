@@ -14,6 +14,7 @@ import { reconcile, formatReport } from "./reconciler.js";
 import { RealityLayer } from "./reality.js";
 import { pickName, backgroundImagePath, loadTheme, updateTheme, listThemes } from "./themes.js";
 import { getClaudeCodeSessionId } from "./claude-session.js";
+import { assertClaudeCredentialLive } from "./credentials.js";
 
 const DEFAULT_DB = join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
 const SCREEN_PREFIX = "wire-";
@@ -315,6 +316,20 @@ export class Orchestrator {
     if (remoteTarget && !opts.runAsUid) {
       throw new Error(`launchAgent: machine='${opts.machine}' is remote — run_as_uid is required (the per-UID account to spawn under, e.g. _ephemeral)`);
     }
+
+    // Phase 2 credential model: fail closed. A claude-code agent whose Claude
+    // subscription credential is missing/expired 401-loops on boot — burning a
+    // screen slot, and for _ephemeral engineers silently stalling the fleet. So
+    // verify the credential in the home the agent will actually run under
+    // (remote: /Users/<run_as_uid>; local: this process's $HOME) BEFORE spawning.
+    if (runtime === "claude-code") {
+      await assertClaudeCredentialLive(
+        remoteTarget
+          ? { kind: "remote", target: remoteTarget }
+          : { kind: "local", home: process.env.HOME ?? "" },
+      );
+    }
+
     const session = remoteTarget
       ? await screen.createRemoteSession(screenName, fullCommand, remoteTarget)
       : await screen.createSession(screenName, fullCommand);
@@ -552,6 +567,10 @@ export class Orchestrator {
       .map(([k, v]) => `${k}=${shellEscape(v)}`)
       .join(" ")}`;
     const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${SOURCE_NEAREST_ENV} && ${command}`;
+
+    // Fail closed on a dead credential — same guard as launchAgent. Resume is
+    // local + claude-code only (guarded above), so the target is always $HOME.
+    await assertClaudeCredentialLive({ kind: "local", home: process.env.HOME ?? "" });
 
     const session = await screen.createSession(screenName, fullCommand);
 
