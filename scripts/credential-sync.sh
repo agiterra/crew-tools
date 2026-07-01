@@ -80,3 +80,39 @@ for home in /Users/*/; do
   fanned=$((fanned+1))
 done
 log "OK: fanned access-token-only cred from '$ANCHOR' (valid until $(date -r $((exp/1000)))) to $fanned identities"
+
+# ---- Codex (OpenAI ChatGPT-OAuth) fan ----
+# Codex engineers auth via ~/.codex/auth.json. The anchor is `tim` (where the
+# operator runs `codex login`), NOT the Claude anchor. Per Tim 2026-07-01: fan
+# the FULL cred (refresh token included) for now — unblock first; tighten to an
+# access-token-only strip later once OpenAI's refresh-rotation behavior is
+# confirmed (Claude strips because Anthropic rotates; OpenAI unverified). Only
+# fans to homes that ALREADY have ~/.codex (i.e. real Codex identities); never
+# creates one. Env override: CODEX_ANCHOR (default tim).
+CODEX_ANCHOR="${CODEX_ANCHOR:-tim}"
+CODEX_SRC="/Users/$CODEX_ANCHOR/.codex/auth.json"
+if run test -f "$CODEX_SRC"; then
+  codex_json=$(run cat "$CODEX_SRC")
+  if printf '%s' "$codex_json" | jq -e '.tokens.access_token' >/dev/null 2>&1; then
+    codex_fanned=0
+    for home in /Users/*/; do
+      id=$(basename "$home")
+      case "$id" in "$CODEX_ANCHOR"|tim|Shared|Guest|.localized) continue;; esac
+      d="${home}.codex"
+      run test -d "$d" || continue
+      t="$d/auth.json"
+      own=$(run stat -f '%Su:%Sg' "$home")
+      tmp="${t}.tmp.$$"
+      printf '%s' "$codex_json" | run tee "$tmp" >/dev/null
+      run chown "$own" "$tmp"
+      run chmod 600 "$tmp"
+      run mv -f "$tmp" "$t"
+      codex_fanned=$((codex_fanned+1))
+    done
+    log "OK: fanned FULL codex cred from '$CODEX_ANCHOR' to $codex_fanned identities"
+  else
+    log "SKIP codex: anchor '$CODEX_ANCHOR' has no tokens.access_token in $CODEX_SRC"
+  fi
+else
+  log "SKIP codex: anchor cred $CODEX_SRC missing"
+fi
