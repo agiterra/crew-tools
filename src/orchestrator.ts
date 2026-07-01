@@ -15,6 +15,7 @@ import { RealityLayer } from "./reality.js";
 import { pickName, backgroundImagePath, loadTheme, updateTheme, listThemes } from "./themes.js";
 import { getClaudeCodeSessionId } from "./claude-session.js";
 import { assertClaudeCredentialLive } from "./credentials.js";
+import { buildConfigDirSetup } from "./config-dir.js";
 
 const DEFAULT_DB = join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
 const SCREEN_PREFIX = "wire-";
@@ -301,7 +302,11 @@ export class Orchestrator {
     const envExports = `export ${Object.entries(opts.env)
       .map(([k, v]) => `${k}=${shellEscape(v)}`)
       .join(" ")}`;
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${SOURCE_NEAREST_ENV} && ${command}`;
+    // Per-agent CLAUDE_CONFIG_DIR (Phase 2 increment #2). After
+    // SOURCE_NEAREST_ENV so a .env-provided CLAUDE_CONFIG_DIR wins the
+    // snippet's unset-guard, same precedence as every other env var.
+    const configDirSetup = runtime === "claude-code" ? ` && ${buildConfigDirSetup(id, projectDir)}` : "";
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${SOURCE_NEAREST_ENV}${configDirSetup} && ${command}`;
 
     // Create screen session — local, or on a remote host when opts.machine
     // names a non-local machine (cross-machine spawn: ssh + sudo -u <run_as_uid>).
@@ -566,7 +571,12 @@ export class Orchestrator {
     const envExports = `export ${Object.entries(mergedEnv)
       .map(([k, v]) => `${k}=${shellEscape(v)}`)
       .join(" ")}`;
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${SOURCE_NEAREST_ENV} && ${command}`;
+    // Same per-agent config dir as launchAgent — a resumed agent reuses its
+    // dir (idempotent seeding), so its CC session transcript is found. To
+    // resume a PRE-isolation agent (transcript in the shared ~/.claude),
+    // pass env.CLAUDE_CONFIG_DIR=$HOME/.claude — the snippet's unset-guard
+    // then no-ops.
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${SOURCE_NEAREST_ENV} && ${buildConfigDirSetup(opts.id, projectDir)} && ${command}`;
 
     // Fail closed on a dead credential — same guard as launchAgent. Resume is
     // local + claude-code only (guarded above), so the target is always $HOME.
