@@ -22,8 +22,8 @@ export type RuntimeConfig = {
 
 const DEFAULTS: Record<string, RuntimeConfig> = {
   "claude-code": {
-    command: "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions",
-    description: "Claude Code with Wire channel (SSE push). MCP plugins (wire-ipc, personai, crew) load from installed_plugins.json per project scope.",
+    command: "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions --model claude-fable-5",
+    description: "Claude Code with Wire channel (SSE push). MCP plugins (wire-ipc, personai, crew) load from installed_plugins.json per project scope. Model pinned to Fable 5 (fleet Fable deploy 2026-07-01); override per-machine via ~/.wire/runtimes.json.",
   },
   "codex": {
     command: "codex",
