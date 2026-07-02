@@ -87,7 +87,15 @@ export async function createSession(
 //   2. The launch command (cd && export && agent prompt) is full of &&, quotes
 //      and shell metachars — base64 the launch SCRIPT so it crosses SSH cleanly.
 
+/**
+ * Where a cross-UID screen lives. `sshHost: "local"` is the SAME-HOST case:
+ * the command runs through a local login shell instead of ssh, but still
+ * `sudo -n -u <runAsUid>` — used by a machine-resident service (crew-service)
+ * spawning agents under the per-UID account without an ssh loopback.
+ */
 export type RemoteTarget = { sshHost: string; runAsUid: string };
+
+export const LOCAL_SUDO_HOST = "local";
 
 /** `sudo -n -u <uid> env HOME=… SCREENDIR=… LANG/LC_ALL <screen>` — remote screen prefix. */
 function remoteScreen(t: RemoteTarget): string {
@@ -99,8 +107,14 @@ function remoteScreen(t: RemoteTarget): string {
   return `sudo -n -u ${t.runAsUid} env HOME=${home} SCREENDIR=${home}/.screen LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 ${SCREEN}`;
 }
 
-/** Run a command on the remote host's login shell (pipes/&& work). Returns stdout. */
+/** Run a command on the target's login shell (pipes/&& work). Returns stdout.
+ *  `sshHost: "local"` executes through a local `/bin/zsh -lc` — identical shell
+ *  semantics to the ssh path (login shell), minus the network hop. */
 export async function sshRun(t: RemoteTarget, remoteCommand: string): Promise<string> {
+  if (t.sshHost === LOCAL_SUDO_HOST) {
+    const r = await $`/bin/zsh -lc ${remoteCommand}`.quiet().nothrow();
+    return r.stdout.toString();
+  }
   const r = await $`ssh -o BatchMode=yes -o ConnectTimeout=15 ${t.sshHost} ${remoteCommand}`
     .quiet()
     .nothrow();
@@ -130,6 +144,26 @@ export async function createRemoteSession(
     throw new Error(`remote screen session '${name}' on ${t.sshHost} failed to start`);
   }
   return { name, pid };
+}
+
+/** Target-aware isAlive — a session under another UID (and/or another host). */
+export async function isRemoteAlive(name: string, t: RemoteTarget): Promise<boolean> {
+  return (await getRemoteSessionPid(name, t)) !== null;
+}
+
+/**
+ * Kill a screen session owned by another UID (and/or on another host) — the
+ * target-aware analogue of killSession: TERM children, grace, KILL, then quit.
+ */
+export async function killRemoteSession(name: string, t: RemoteTarget): Promise<void> {
+  const pid = await getRemoteSessionPid(name, t);
+  if (pid) {
+    await sshRun(
+      t,
+      `sudo -n -u ${t.runAsUid} pkill -TERM -P ${pid}; sleep 0.5; sudo -n -u ${t.runAsUid} pkill -KILL -P ${pid}; true`,
+    );
+  }
+  await sshRun(t, `${remoteScreen(t)} -S ${name} -X quit; true`);
 }
 
 /** PID of a named screen session on a remote host, or null. */

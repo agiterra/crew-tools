@@ -62,6 +62,13 @@ export type SpawnManifest = {
    * if cleanup fails, the agent's lifecycle still completes.
    */
   aux_surface?: string;
+  /**
+   * Per-UID account the agent's screen runs under (e.g. `_ephemeral`) when it
+   * differs from this process's user. Stamped at launch/resume so stop/close/
+   * alive checks address the right SCREENDIR (a same-UID `screen -ls` can't
+   * see another UID's session). Absent = same-UID local screen.
+   */
+  run_as_uid?: string;
 };
 
 /** Escape a string for use in a shell command. */
@@ -205,6 +212,34 @@ export class Orchestrator {
   // --- Agent lifecycle ---
 
   /**
+   * Cross-UID/remote screen target for an agent row, or undefined for a plain
+   * same-UID local screen. Derived from the manifest's run_as_uid stamp +
+   * the machines table: remote machine → ssh target, local machine (or no
+   * machine) with a foreign uid → local-sudo target.
+   */
+  private targetFor(agent: { spawn_manifest: string | null; machine_name: string | null }): screen.RemoteTarget | undefined {
+    let uid: string | undefined;
+    try {
+      uid = agent.spawn_manifest
+        ? ((JSON.parse(agent.spawn_manifest) as SpawnManifest).run_as_uid || undefined)
+        : undefined;
+    } catch {
+      uid = undefined;
+    }
+    if (!uid) return undefined;
+    const machineRow = agent.machine_name ? this.store.getMachine(agent.machine_name) : undefined;
+    const sshHost =
+      machineRow && machineRow.ssh_host !== "localhost" ? machineRow.ssh_host : screen.LOCAL_SUDO_HOST;
+    return { sshHost, runAsUid: uid };
+  }
+
+  /** Target-aware screen liveness for an agent row. */
+  private async agentScreenAlive(agent: { screen_name: string; spawn_manifest: string | null; machine_name: string | null }): Promise<boolean> {
+    const target = this.targetFor(agent);
+    return target ? screen.isRemoteAlive(agent.screen_name, target) : screen.isAlive(agent.screen_name);
+  }
+
+  /**
    * Launch an agent in a screen session.
    * The agent runs in background — no pane attachment required.
    */
@@ -278,7 +313,7 @@ export class Orchestrator {
     // Check for existing agent with the same ID
     const existing = this.store.getAgent(id);
     if (existing) {
-      const alive = await screen.isAlive(existing.screen_name);
+      const alive = await this.agentScreenAlive(existing);
       if (alive) {
         // During handoff, the old agent is still running.
         // Use a suffixed screen name to avoid collision.
@@ -317,11 +352,18 @@ export class Orchestrator {
     if (opts.machine && !machineRow) {
       throw new Error(`launchAgent: unknown machine '${opts.machine}' — register it with machine_register first`);
     }
+    // Cross-UID/cross-machine target. Three shapes:
+    //   machine remote                → ssh + sudo -u <runAsUid>  (cross-machine)
+    //   machine local + runAsUid set  → local sudo -u <runAsUid>  (machine-resident
+    //                                   service spawning under the per-UID account)
+    //   neither                       → plain same-UID local screen
     const remoteTarget: screen.RemoteTarget | undefined =
       machineRow && machineRow.ssh_host !== "localhost"
         ? { sshHost: machineRow.ssh_host, runAsUid: opts.runAsUid ?? "" }
-        : undefined;
-    if (remoteTarget && !opts.runAsUid) {
+        : opts.runAsUid
+          ? { sshHost: screen.LOCAL_SUDO_HOST, runAsUid: opts.runAsUid }
+          : undefined;
+    if (machineRow && machineRow.ssh_host !== "localhost" && !opts.runAsUid) {
       throw new Error(`launchAgent: machine='${opts.machine}' is remote — run_as_uid is required (the per-UID account to spawn under, e.g. _ephemeral)`);
     }
 
@@ -418,6 +460,7 @@ export class Orchestrator {
       display_name: displayName,
       ttl_idle_minutes: opts.ttlIdleMinutes,
       aux_surface: auxSurface,
+      run_as_uid: opts.runAsUid,
     };
 
     // Record in DB
@@ -432,8 +475,9 @@ export class Orchestrator {
       spawn_manifest: JSON.stringify(manifest),
       // Stamp the remote host for cross-machine spawns so the reconciler (which
       // skips non-local machine_name rows) doesn't false-reap an agent whose
-      // screen lives on another box.
-      machine_name: remoteTarget ? opts.machine : undefined,
+      // screen lives on another box. Local-sudo spawns stay unstamped — their
+      // screens are on THIS machine, just under another UID.
+      machine_name: remoteTarget && remoteTarget.sshHost !== screen.LOCAL_SUDO_HOST ? opts.machine : undefined,
     });
   }
 
@@ -490,11 +534,17 @@ export class Orchestrator {
     attachToPane?: string;
     /** Badge text. Falls back to tombstone's badge. */
     badge?: string;
+    /**
+     * Per-UID account to resume under (local sudo). Falls back to the
+     * tombstone manifest's run_as_uid so a crew-service `_ephemeral` spawn
+     * resumes under the same account without the caller restating it.
+     */
+    runAsUid?: string;
   }): Promise<Agent> {
     // Refuse to double-resume
     const existing = this.store.getAgent(opts.id);
     if (existing) {
-      const alive = await screen.isAlive(existing.screen_name);
+      const alive = await this.agentScreenAlive(existing);
       if (alive) {
         throw new Error(
           `resumeAgent: agent '${opts.id}' is already running (screen '${existing.screen_name}'). ` +
@@ -581,14 +631,28 @@ export class Orchestrator {
     // then no-ops.
     const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${SOURCE_NEAREST_ENV} && ${buildConfigDirSetup(opts.id, projectDir)} && ${command}`;
 
-    // Fail closed on a dead credential — same guard as launchAgent. Resume is
-    // local + claude-code only (guarded above), so the target is always $HOME.
-    await assertClaudeCredentialLive({ kind: "local", home: process.env.HOME ?? "" });
+    // Resume is same-HOST only, but may cross UIDs: a crew-service
+    // `_ephemeral` spawn resumes under its original account (tombstone
+    // manifest run_as_uid) via local sudo, mirroring launchAgent.
+    const runAsUid = opts.runAsUid ?? manifest?.run_as_uid;
+    const resumeTarget: screen.RemoteTarget | undefined = runAsUid
+      ? { sshHost: screen.LOCAL_SUDO_HOST, runAsUid }
+      : undefined;
 
-    const session = await screen.createSession(screenName, fullCommand);
+    // Fail closed on a dead credential — same guard as launchAgent, in the
+    // home the agent will actually run under.
+    await assertClaudeCredentialLive(
+      resumeTarget
+        ? { kind: "remote", target: resumeTarget }
+        : { kind: "local", home: process.env.HOME ?? "" },
+    );
+
+    const session = resumeTarget
+      ? await screen.createRemoteSession(screenName, fullCommand, resumeTarget)
+      : await screen.createSession(screenName, fullCommand);
 
     // Auto-confirm dev-channel prompt — same polling helper as launchAgent.
-    void autoConfirmDevChannel(screenName, `resumed ${opts.id}`, { store: this.store, agentId: opts.id });
+    void autoConfirmDevChannel(screenName, `resumed ${opts.id}`, { store: this.store, agentId: opts.id, remote: resumeTarget });
 
     // Write a fresh manifest for the resumed agent so it can be resumed
     // again later. Channels flow into the manifest only here (launchAgent
@@ -603,6 +667,7 @@ export class Orchestrator {
       display_name: displayName,
       ttl_idle_minutes: manifest?.ttl_idle_minutes,
       channels: opts.channels ?? manifest?.channels,
+      run_as_uid: runAsUid,
     };
 
     const created = this.store.createAgent({
@@ -760,10 +825,17 @@ export class Orchestrator {
     // Two sendKeys: type the slash command first, then press Enter. Splitting
     // the keystrokes mirrors what a human types and avoids any runtime that
     // might buffer-and-discard before the newline arrives.
+    const target = this.targetFor(agent);
     try {
-      await screen.sendKeys(agent.screen_name, "/exit");
-      await new Promise((r) => setTimeout(r, 100));
-      await screen.sendKeys(agent.screen_name, "\n");
+      if (target) {
+        await screen.sendRemoteKeys(agent.screen_name, "/exit", target);
+        await new Promise((r) => setTimeout(r, 100));
+        await screen.sendRemoteKeys(agent.screen_name, "\n", target);
+      } else {
+        await screen.sendKeys(agent.screen_name, "/exit");
+        await new Promise((r) => setTimeout(r, 100));
+        await screen.sendKeys(agent.screen_name, "\n");
+      }
     } catch (e) {
       // Screen session may already be gone — fall through to cleanup.
       console.error(`[crew] closeAgent: sendKeys failed for '${agent.id}': ${e}`);
@@ -772,13 +844,14 @@ export class Orchestrator {
     // Wait for the runtime to exit on its own. Polls every 250ms.
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (!(await screen.isAlive(agent.screen_name))) break;
+      if (!(await this.agentScreenAlive(agent))) break;
       await new Promise((r) => setTimeout(r, 250));
     }
 
-    if (await screen.isAlive(agent.screen_name)) {
+    if (await this.agentScreenAlive(agent)) {
       console.error(`[crew] closeAgent: '${agent.id}' did not exit within ${timeoutMs}ms — hard-killing screen`);
-      await screen.killSession(agent.screen_name);
+      if (target) await screen.killRemoteSession(agent.screen_name, target);
+      else await screen.killSession(agent.screen_name);
     }
 
     await this.cleanupAuxSurface(agent.id, auxSurface);
@@ -821,7 +894,9 @@ export class Orchestrator {
 
     const auxSurface = readAuxSurface(agent.spawn_manifest);
 
-    await screen.killSession(agent.screen_name);
+    const target = this.targetFor(agent);
+    if (target) await screen.killRemoteSession(agent.screen_name, target);
+    else await screen.killSession(agent.screen_name);
     await this.cleanupAuxSurface(agent.id, auxSurface);
     // Leave a tombstone so agent_resume can reconstruct the spawn later.
     this.store.tombstoneAgent(agent);

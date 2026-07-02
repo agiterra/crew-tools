@@ -4,7 +4,7 @@ export * as screen from "./screen.js";
 export * as iterm from "./iterm.js";
 export { ItermBackend } from "./iterm-backend.js";
 export { CmuxBackend } from "./cmux.js";
-export { createBackend, detectTerminal, type TerminalBackend, type TerminalType, type PaneProfile } from "./terminal.js";
+export { createBackend, detectTerminal, HeadlessBackend, type TerminalBackend, type TerminalType, type PaneProfile } from "./terminal.js";
 export { loadRuntimes, getLaunchCommand, expandCommand, type RuntimeConfig } from "./runtimes.js";
 export { reconcile, formatReport, type ReconcileResult } from "./reconciler.js";
 export { RealityLayer, type RealitySnapshot, type HealResult } from "./reality.js";

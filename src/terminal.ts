@@ -266,3 +266,39 @@ export async function createBackend(
   const { ItermBackend } = await import("./iterm-backend.js");
   return new ItermBackend();
 }
+
+/**
+ * Headless backend — for machine-resident composers (crew-service) that drive
+ * agent lifecycle (spawn/stop/resume in screens) but own NO terminal surface.
+ * Enumeration is empty (reality's "no terminal available" branch: rows are
+ * left untouched, never reaped on its say-so); every pane/tab operation
+ * throws loudly rather than pretending a surface exists.
+ */
+export class HeadlessBackend implements TerminalBackend {
+  readonly name = "headless";
+  private die(op: string): never {
+    throw new Error(`headless terminal backend: ${op} requires a terminal surface`);
+  }
+  async currentSessionId(): Promise<string> { this.die("currentSessionId"); }
+  async sessionIdForTty(): Promise<string | null> { return null; }
+  async enumerateSessions(): Promise<TerminalSession[]> { return []; }
+  async splitPane(): Promise<string> { this.die("splitPane"); }
+  async splitSession(): Promise<string> { this.die("splitSession"); }
+  async writeToSession(): Promise<void> { this.die("writeToSession"); }
+  async attachScreen(): Promise<void> { this.die("attachScreen"); }
+  async closeSession(): Promise<void> { this.die("closeSession"); }
+  async isSessionAlive(): Promise<boolean> { return false; }
+  async createTab(): Promise<string> { this.die("createTab"); }
+  async setSessionName(): Promise<void> { this.die("setSessionName"); }
+  async setBadge(): Promise<void> { this.die("setBadge"); }
+  writePaneProfile(): string { this.die("writePaneProfile"); }
+  writeEmptyPaneProfile(): string { this.die("writeEmptyPaneProfile"); }
+  async setProfile(): Promise<void> { this.die("setProfile"); }
+  async splitPaneWithProfile(): Promise<string> { this.die("splitPaneWithProfile"); }
+  async splitSessionWithProfile(): Promise<string> { this.die("splitSessionWithProfile"); }
+  async flashSession(): Promise<void> { this.die("flashSession"); }
+  async notifySession(): Promise<void> { this.die("notifySession"); }
+  async renameWorkspace(): Promise<void> { this.die("renameWorkspace"); }
+  async splitWebBrowser(): Promise<string> { this.die("splitWebBrowser"); }
+  async splitSessionWebBrowser(): Promise<string> { this.die("splitSessionWebBrowser"); }
+}

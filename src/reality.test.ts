@@ -233,3 +233,39 @@ describe("RealityLayer.heal (grace-gated metadata healer)", () => {
     expect(store.getAgent("remote-alive")).not.toBeNull();
   });
 });
+
+describe("cross-UID rows (manifest run_as_uid) — never verified, never reaped here", () => {
+  test("a local-machine row under another UID passes reads and survives heal past grace", async () => {
+    // crew-service local-sudo spawn: machine_name = local, screen under
+    // _ephemeral — invisible to this process's same-UID screen -ls.
+    store.createAgent({
+      id: "eph", display_name: "Eph", runtime: "claude-code", screen_name: "wire-eph",
+      spawn_manifest: JSON.stringify({ env: {}, runtime: "claude-code", project_dir: "/tmp", display_name: "Eph", run_as_uid: "_ephemeral" }),
+    });
+    store.createAgent({ id: "dead", display_name: "Dead", runtime: "claude-code", screen_name: "wire-dead" });
+
+    let clock = 0;
+    const reality = makeReality({ screens: () => [], now: () => clock, graceMs: 1000 });
+
+    // Reads: cross-UID row passes through despite an empty snapshot.
+    const live = await reality.liveAgentRows(store.listAgents(), localMachine);
+    expect(live.map((a) => a.id)).toEqual(["eph"]);
+
+    // Heal past grace: same-UID dead row is reaped; cross-UID row is NOT.
+    await reality.heal(store, localMachine);
+    clock = 5000;
+    const { result } = await reality.heal(store, localMachine);
+    expect(result.gcd).toEqual(["dead"]);
+    expect(store.getAgent("eph")).not.toBeNull();
+  });
+
+  test("a row whose run_as_uid MATCHES this process user is verified normally", async () => {
+    store.createAgent({
+      id: "self-uid", display_name: "S", runtime: "claude-code", screen_name: "wire-self-uid",
+      spawn_manifest: JSON.stringify({ env: {}, runtime: "claude-code", project_dir: "/tmp", display_name: "S", run_as_uid: process.env.USER }),
+    });
+    const reality = makeReality({ screens: () => [] });
+    const live = await reality.liveAgentRows(store.listAgents(), localMachine);
+    expect(live).toEqual([]); // same-UID → snapshot-verified → missing → hidden
+  });
+});

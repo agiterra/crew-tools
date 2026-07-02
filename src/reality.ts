@@ -24,6 +24,17 @@ import type { TerminalBackend, TerminalSession } from "./terminal.js";
 /** Screen sessions crew owns are named `wire-<agentId>`. */
 const SCREEN_PREFIX = "wire-";
 
+/** run_as_uid from a spawn manifest JSON, or undefined (absent/unparseable). */
+function manifestRunAsUid(spawnManifest: string | null | undefined): string | undefined {
+  if (!spawnManifest) return undefined;
+  try {
+    const uid = (JSON.parse(spawnManifest) as { run_as_uid?: string }).run_as_uid;
+    return uid || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Snapshot freshness window. Within this, every read shares one
  * `screen -ls` + one terminal enumeration — so a burst of agent_list polls
@@ -185,6 +196,18 @@ export class RealityLayer {
         // through (federation verifies it remotely in a later phase). This
         // is the same guard that keeps the reconciler from cascade-deleting
         // peer rows; here it keeps reads from dropping them.
+        live.push(row);
+        continue;
+      }
+      // Another UID's reality — same verifiability principle. A screen under
+      // e.g. `_ephemeral` (crew-service local-sudo spawn, manifest
+      // run_as_uid) is INVISIBLE to this process's same-UID `screen -ls`, so
+      // "missing from the snapshot" proves nothing. Reaping here would
+      // false-delete live agents from the machine-shared crews.db (the
+      // multi-writer skew class). crew-service's multi-UID lister owns their
+      // liveness; we pass them through.
+      const rowUid = manifestRunAsUid(row.spawn_manifest);
+      if (rowUid && rowUid !== (process.env.USER ?? "")) {
         live.push(row);
         continue;
       }
