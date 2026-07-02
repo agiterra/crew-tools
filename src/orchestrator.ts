@@ -17,7 +17,10 @@ import { getClaudeCodeSessionId } from "./claude-session.js";
 import { assertClaudeCredentialLive } from "./credentials.js";
 import { buildConfigDirSetup } from "./config-dir.js";
 
-const DEFAULT_DB = join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
+// CREW_DB overrides for the machine-shared database (one crews.db per
+// machine, e.g. /opt/agiterra/crew/crews.db group-fabrica — Tim 2026-07-02).
+// Default stays the per-user path for machines without the shared setup.
+const DEFAULT_DB = process.env.CREW_DB ?? join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
 const SCREEN_PREFIX = "wire-";
 
 function titleCase(s: string): string {
