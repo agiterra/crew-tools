@@ -41,6 +41,30 @@ mock.module("./screen", () => ({
     return s.queue.length > 0 ? s.queue.shift()! : s.fallback;
   },
   killSession: async () => {},
+  // Cross-UID/remote screen surface (v2.19.0). Tests drive same-UID agents, so
+  // these mirror the local mocks; a test exercising a run_as_uid agent keys the
+  // same screenState by screen name.
+  LOCAL_SUDO_HOST: "local",
+  sendRemoteKeys: async (name: string, keys: string) => {
+    screenState.sendKeysLog.push({ name, keys });
+    screenState.sendKeysHook?.(name, keys);
+  },
+  readRemoteOutput: async (name: string) => {
+    const s = screenState.screens[name];
+    if (!s) return "";
+    return s.queue.length > 0 ? s.queue.shift()! : s.fallback;
+  },
+  isRemoteAlive: async () => screenState.isAliveResult,
+  killRemoteSession: async () => {},
+  createRemoteSession: async (name: string, command: string) => {
+    createSessionCalls.push({ name, command });
+    return { name, pid: 12345 };
+  },
+  // Imported by credentials.ts (remote credential read). Unused in these tests
+  // (CREW_SKIP_CRED_CHECK short-circuits) but the mock must satisfy the import.
+  sshRun: async () => "",
+  getRemoteSessionPid: async () => null,
+  pollRemoteSessionPid: async () => null,
 }));
 
 const { Orchestrator, SOURCE_NEAREST_ENV, autoConfirmDevChannel } = await import("./orchestrator");
@@ -621,6 +645,7 @@ describe("autoConfirmDevChannel — verify-after-confirm", () => {
   const MARKER_SCREEN = "Development channels can run arbitrary code.\n  Enter to confirm · Esc to reject";
   const BOOTED_SCREEN = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ? for shortcuts";
   const crs = () => screenState.sendKeysLog.filter((e) => e.name === "dvc" && e.keys === "\r").length;
+  const lfs = () => screenState.sendKeysLog.filter((e) => e.name === "dvc" && e.keys === "\n").length;
 
   test("confirms the prompt and verifies it cleared", async () => {
     screenState.screens["dvc"] = { queue: ["starting claude…", MARKER_SCREEN], fallback: BOOTED_SCREEN };
@@ -684,9 +709,57 @@ describe("autoConfirmDevChannel — verify-after-confirm", () => {
     });
 
     expect(ok).toBe(false);
-    expect(crs()).toBe(3);
+    // 3 submit attempts, byte-alternated CR/LF/CR → 2 CRs.
+    expect(crs()).toBe(2);
+    expect(lfs()).toBe(1);
     const row = orch.store.getAgent("stuckboot");
     expect(row?.status_name).toBe("dev-channel-confirm-failed");
-    expect(row?.status_desc).toContain("did not clear after 3 CR attempts");
+    expect(row?.status_desc).toContain("did not clear after 3 submit attempts");
+  });
+});
+
+describe("sendToAgent — two-phase submit-verify + alternate-byte (v2.20.0)", () => {
+  async function spawnActive(id: string) {
+    await orch.launchAgent({ env: { AGENT_ID: id } });
+    // launchAgent's background autoConfirm polls wire-<id>; give the send test
+    // its own deterministic screen content.
+    return `wire-${id}`;
+  }
+  const bytesTo = (name: string) =>
+    screenState.sendKeysLog.filter((e) => e.name === name).map((e) => e.keys);
+
+  test("body that appears then clears on submit → landed:true; body + one terminator sent", async () => {
+    const scr = await spawnActive("s-ok");
+    // After the body is typed the draft shows it; the FIRST terminator clears it.
+    screenState.screens[scr] = { queue: [], fallback: "❯ hello world draft" };
+    screenState.sendKeysHook = (name, keys) => {
+      if (name === scr && (keys === "\r" || keys === "\n")) {
+        screenState.screens[scr]!.fallback = "❯ "; // draft submitted, input empty
+      }
+    };
+    const r = await orch.sendToAgent("s-ok", "hello world\n");
+    expect(r.landed).toBe(true);
+    const keys = bytesTo(scr);
+    expect(keys[0]).toBe("hello world"); // body first
+    expect(keys.filter((k) => k === "\r" || k === "\n").length).toBe(1); // one terminator
+  });
+
+  test("submit lost → alternates CR/LF/CR, reports landed:false after 3", async () => {
+    const scr = await spawnActive("s-stuck");
+    // Draft never clears — every terminator is 'swallowed'.
+    screenState.screens[scr] = { queue: [], fallback: "❯ stuck draft here" };
+    const r = await orch.sendToAgent("s-stuck", "stuck draft here\n");
+    expect(r.landed).toBe(false);
+    const terms = bytesTo(scr).filter((k) => k === "\r" || k === "\n");
+    expect(terms).toEqual(["\r", "\n", "\r"]); // alternated
+  }, 15_000); // fully-stuck path exhausts 3× the ~2.5s submit-verify poll by design
+
+  test("no trailing terminator → preserves type-and-verify (landed reflects appearance)", async () => {
+    const scr = await spawnActive("s-notrail");
+    screenState.screens[scr] = { queue: [], fallback: "❯ just typing this" };
+    const r = await orch.sendToAgent("s-notrail", "just typing this");
+    expect(r.landed).toBe(true);
+    const keys = bytesTo(scr);
+    expect(keys.every((k) => k !== "\r" && k !== "\n")).toBe(true); // no submit sent
   });
 });

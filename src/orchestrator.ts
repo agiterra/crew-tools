@@ -144,7 +144,7 @@ export async function autoConfirmDevChannel(
     !buf.includes(marker) && (buf.includes("? for shortcuts") || buf.includes("⏵⏵"));
   // Screen accessors — remote (ssh + sudo -u) for a cross-machine agent, else local.
   const read = () => (opts.remote ? screen.readRemoteOutput(screenName, opts.remote) : screen.readOutput(screenName));
-  const sendCR = () => (opts.remote ? screen.sendRemoteKeys(screenName, "\r", opts.remote) : screen.sendKeys(screenName, "\r"));
+  const sendByte = (b: string) => (opts.remote ? screen.sendRemoteKeys(screenName, b, opts.remote) : screen.sendKeys(screenName, b));
   const appearDeadline = Date.now() + (opts.appearMs ?? 120_000);
 
   let seen = false;
@@ -160,9 +160,15 @@ export async function autoConfirmDevChannel(
   }
 
   if (seen) {
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // Let the marker's render settle before the first keypress — a terminator
+    // inside CC's paste-coalescing window can be swallowed (the same class that
+    // bites agent_send). Then alternate CR/LF across retries: if CR is coalesced
+    // or dropped on a loaded box, LF may land (reference-cc-screen-stuff-submit-bytes).
+    await new Promise((r) => setTimeout(r, 600));
+    const bytes = ["\r", "\n", "\r"];
+    for (let attempt = 0; attempt < bytes.length; attempt++) {
       try {
-        await sendCR();
+        await sendByte(bytes[attempt]);
       } catch {
         // transient send failure — the clear-poll below times out and we retry
       }
@@ -180,7 +186,7 @@ export async function autoConfirmDevChannel(
   }
 
   const detail = seen
-    ? `dev-channel prompt did not clear after 3 CR attempts on ${screenName}`
+    ? `dev-channel prompt did not clear after 3 submit attempts (CR/LF alternated) on ${screenName}`
     : `neither dev-channel prompt nor input UI rendered within the window on ${screenName} — if the prompt shows later, nothing will confirm it`;
   console.warn(`[crew] dev-channel auto-confirm FAILED for ${label}: ${detail}`);
   if (opts.store && opts.agentId) {
@@ -1130,39 +1136,73 @@ export class Orchestrator {
     ccSessionId?: string,
   ): Promise<{ screen: string; landed: boolean | null }> {
     const agent = this.resolveAgent(agentId, ccSessionId);
-    await screen.sendKeys(agent.screen_name, text);
     this.store.touchAgent(agent.id);
 
-    // Verify-after-send: never return a blind success. Read the screen back so
-    // callers can confirm delivery (the `screen -X stuff` -> sent:true path lied
-    // when input silently didn't land — Brioche burned a whole session on it,
-    // 2026-06-02). For sends that leave visible text in the input box (printable,
-    // no trailing submit key), poll until the text's tail actually appears
-    // (whitespace-normalized to survive terminal line-wrapping); for control /
-    // submit keys (\r, Esc, arrows) there's no stable visible text to match, so
-    // landed=null and the caller assesses from the returned screen.
+    // Target-aware accessors: a service-spawned _ephemeral (or cross-machine)
+    // agent's screen lives under another UID/host and a same-UID sendKeys/read
+    // silently no-ops. Route through the remote (sudo -u / ssh) path when the
+    // manifest says so.
+    const target = this.targetFor(agent);
+    const send = (t: string) =>
+      target ? screen.sendRemoteKeys(agent.screen_name, t, target) : screen.sendKeys(agent.screen_name, t);
+    const read = () =>
+      target ? screen.readRemoteOutput(agent.screen_name, target) : screen.readOutput(agent.screen_name);
+
     const norm = (s: string) => s.replace(/\s+/g, " ").trim();
-    const printable = text.replace(/[\x00-\x1f\x7f]/g, "");
-    const endsWithSubmit = /[\r\n]$/.test(text);
-    const verifiable = printable.trim().length >= 2 && !endsWithSubmit;
+    // Split a trailing submit terminator off the body: the paste-coalescing
+    // failure (reference-cc-screen-stuff-submit-bytes) happens when a terminator
+    // arrives inside the coalescing window of the body text — CC treats it as a
+    // pasted newline (inserts) instead of a submit keypress. Sending the body,
+    // letting it settle, THEN a lone terminator (verified, retried with the
+    // alternate byte) is the robust recipe.
+    const m = text.match(/^([\s\S]*?)([\r\n]+)$/);
+    const body = m ? m[1] : text;
+    const submits = m != null;
 
-    if (!verifiable) {
-      return { screen: await screen.readOutput(agent.screen_name), landed: null };
-    }
-
-    const needle = norm(printable).slice(-48);
-    const deadline = Date.now() + 1500;
+    // --- Phase 1: type the body (if any) and verify it landed ---
+    const printable = body.replace(/[\x00-\x1f\x7f]/g, "");
+    const bodyVerifiable = printable.trim().length >= 2;
     let out = "";
-    let landed = false;
-    while (Date.now() < deadline) {
-      out = await screen.readOutput(agent.screen_name);
-      if (norm(out).includes(needle)) {
-        landed = true;
-        break;
+    if (body.length) {
+      await send(body);
+      if (bodyVerifiable) {
+        const needle = norm(printable).slice(-48);
+        const deadline = Date.now() + 1500;
+        let seen = false;
+        while (Date.now() < deadline) {
+          out = await read();
+          if (norm(out).includes(needle)) { seen = true; break; }
+          await new Promise((r) => setTimeout(r, 80));
+        }
+        if (!submits) return { screen: out, landed: seen };
+        if (!seen) {
+          // Body never appeared — a terminator now would submit an empty/partial
+          // draft. Report the miss rather than blind-firing.
+          return { screen: out, landed: false };
+        }
+      } else if (!submits) {
+        return { screen: await read(), landed: null };
       }
-      await new Promise((r) => setTimeout(r, 80));
     }
-    return { screen: out, landed };
+
+    // --- Phase 2: submit. Settle for paste-coalescing, then alternate the
+    // terminator byte, verifying the body draft actually cleared the input box. ---
+    const needle = bodyVerifiable ? norm(printable).slice(-48) : "";
+    await new Promise((r) => setTimeout(r, 700)); // coalescing settle
+    for (const term of ["\r", "\n", "\r"]) {
+      await send(term);
+      const deadline = Date.now() + 2500;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 150));
+        out = await read();
+        // Submitted when the body draft is no longer sitting in the input box.
+        // Bare-terminator sends (no verifiable body) can't be checked this way —
+        // report null and let the caller read `out`.
+        if (!needle) return { screen: out, landed: null };
+        if (!norm(out).includes(needle)) return { screen: out, landed: true };
+      }
+    }
+    return { screen: out, landed: false };
   }
 
   /**
