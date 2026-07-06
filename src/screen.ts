@@ -144,7 +144,7 @@ export async function createRemoteSession(
   // AND the self-rm succeeds because the runner owns the file. chown needs root;
   // the box's NOPASSWD sudo (same grant the spawn itself rides) provides it.
   const remote =
-    `printf %s ${b64} | base64 -d > ${scriptFile}; chmod 600 ${scriptFile}; ` +
+    `printf %s ${b64} | base64 -d > ${scriptFile}; chmod 700 ${scriptFile}; ` +
     `sudo -n chown ${t.runAsUid} ${scriptFile}; ` +
     `${remoteScreen(t)} -U -dmS ${name} ${scriptFile}`;
   await sshRun(t, remote);
