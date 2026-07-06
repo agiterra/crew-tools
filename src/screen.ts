@@ -164,18 +164,55 @@ export async function isRemoteAlive(name: string, t: RemoteTarget): Promise<bool
 }
 
 /**
- * Kill a screen session owned by another UID (and/or on another host) — the
- * target-aware analogue of killSession: TERM children, grace, KILL, then quit.
+ * Reap the agent's REAL process tree and report how many processes survive.
+ *
+ * The login shell, the runtime (claude/codex), and every MCP subprocess share
+ * ONE process group — the screen child's pgid. `screen` starts each window in
+ * a fresh session, so the child shell and its whole subtree get a pgid
+ * distinct from screen's own. The old `pkill -P <screenPid>` reaped only the
+ * DIRECT child (the login shell) and orphaned the runtime + MCP procs into
+ * init — the "closed but 430MB alive" zombie (madeleine/profiterole/fraisier,
+ * 2026-07-06). Killing the whole process group takes the subtree down at once.
+ *
+ * `killPrefix` is "" for a same-uid local kill, or `sudo -n -u <uid>` for a
+ * cross-uid target. `run` executes a POSIX-sh string and returns its stdout.
+ * Returns the count of processes still in the group after SIGKILL + a settle
+ * (init reaps the killed children near-instantly); 0 = tree confirmed dead.
+ * NOTE: does NOT quit the screen wrapper itself — screen sits in its own pgid,
+ * so the caller still runs `screen -X quit` after.
  */
-export async function killRemoteSession(name: string, t: RemoteTarget): Promise<void> {
+async function reapTree(
+  screenPid: number,
+  killPrefix: string,
+  run: (cmd: string) => Promise<string>,
+): Promise<number> {
+  const snippet =
+    `c=$(pgrep -P ${screenPid} | head -1); ` +
+    `if [ -z "$c" ]; then echo "SURV=0"; else ` +
+    `g=$(ps -o pgid= -p "$c" | tr -d " "); ` +
+    `if [ -z "$g" ]; then echo "SURV=0"; else ` +
+    `${killPrefix} kill -TERM -"$g" 2>/dev/null; sleep 0.5; ` +
+    `${killPrefix} kill -KILL -"$g" 2>/dev/null; sleep 0.3; ` +
+    `echo "SURV=$(pgrep -g "$g" 2>/dev/null | wc -l | tr -d " ")"; ` +
+    `fi; fi`;
+  const out = await run(snippet);
+  const m = out.match(/SURV=(\d+)/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+/**
+ * Kill a screen session owned by another UID (and/or on another host) — the
+ * target-aware analogue of killSession. Reaps the whole agent process group,
+ * then quits the screen wrapper. Returns surviving-process count (0 = clean).
+ */
+export async function killRemoteSession(name: string, t: RemoteTarget): Promise<number> {
   const pid = await getRemoteSessionPid(name, t);
+  let survivors = 0;
   if (pid) {
-    await sshRun(
-      t,
-      `sudo -n -u ${t.runAsUid} pkill -TERM -P ${pid}; sleep 0.5; sudo -n -u ${t.runAsUid} pkill -KILL -P ${pid}; true`,
-    );
+    survivors = await reapTree(pid, `sudo -n -u ${t.runAsUid}`, (cmd) => sshRun(t, cmd));
   }
   await sshRun(t, `${remoteScreen(t)} -S ${name} -X quit; true`);
+  return survivors;
 }
 
 /** PID of a named screen session on a remote host, or null. */
@@ -405,16 +442,15 @@ export async function readOutput(name: string): Promise<string> {
  * Kill a screen session and all its child processes.
  * Screen's quit only sends SIGHUP which some processes ignore (e.g. Codex).
  */
-export async function killSession(name: string): Promise<void> {
-  // Find the screen PID and kill the entire process group
+export async function killSession(name: string): Promise<number> {
   const pid = await getSessionPid(name);
+  let survivors = 0;
   if (pid) {
-    // Kill all children of the screen process first
-    await $`pkill -TERM -P ${pid}`.quiet().nothrow();
-    // Give them a moment to exit gracefully
-    await new Promise((r) => setTimeout(r, 500));
-    // Force-kill any survivors
-    await $`pkill -KILL -P ${pid}`.quiet().nothrow();
+    survivors = await reapTree(pid, "", async (cmd) => {
+      const r = await $`/bin/sh -c ${cmd}`.quiet().nothrow();
+      return r.stdout.toString();
+    });
   }
   await $`${SCREEN} -S ${name} -X quit`.quiet().nothrow();
+  return survivors;
 }

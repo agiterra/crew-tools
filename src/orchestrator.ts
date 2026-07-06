@@ -867,10 +867,30 @@ export class Orchestrator {
       await new Promise((r) => setTimeout(r, 250));
     }
 
-    if (await this.agentScreenAlive(agent)) {
-      console.error(`[crew] closeAgent: '${agent.id}' did not exit within ${timeoutMs}ms — hard-killing screen`);
-      if (target) await screen.killRemoteSession(agent.screen_name, target);
-      else await screen.killSession(agent.screen_name);
+    // ALWAYS reap the process group + verify, even when the screen socket is
+    // already gone. "Screen socket dead" != "tree dead": a wedged runtime can
+    // hold the screen open past /exit (then the socket outlives the timeout),
+    // and a runtime that exits uncleanly can leave the screen socket gone while
+    // its MCP subprocesses orphan into init. Either way the row must not be
+    // deleted while the tree lives — that is the invisible-zombie class (close
+    // returns success, dashboard row vanishes, a 430MB claude keeps running;
+    // madeleine/profiterole/fraisier, 2026-07-06). reap* returns the count of
+    // processes still in the agent's group after SIGKILL.
+    const survivors = target
+      ? await screen.killRemoteSession(agent.screen_name, target)
+      : await screen.killSession(agent.screen_name);
+
+    if (survivors > 0) {
+      // Fail LOUD and keep the row: a lingering, now-untracked process tree is
+      // worse than a visible "close failed". The caller (bridge/operator) sees
+      // the throw and can escalate; the agent stays on the dashboard, findable.
+      console.error(
+        `[crew] closeAgent: '${agent.id}' left ${survivors} process(es) alive after SIGKILL — ` +
+          `NOT deleting its row (keeping it visible for manual reap).`,
+      );
+      throw new Error(
+        `closeAgent: '${agent.id}' process tree survived kill (${survivors} live) — row kept for diagnosis`,
+      );
     }
 
     await this.cleanupAuxSurface(agent.id, auxSurface);
