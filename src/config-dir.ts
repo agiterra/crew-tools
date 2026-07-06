@@ -88,7 +88,17 @@ export function buildConfigDirSetup(agentId: string, projectDir: string): string
     `if [ -z "\${CLAUDE_CONFIG_DIR:-}" ] && grep -qs claudeAiOauth "$HOME/.claude/.credentials.json"; then ` +
     `export CLAUDE_CONFIG_DIR="$HOME/.claude-agents/${agentId}"; ` +
     `mkdir -p "$CLAUDE_CONFIG_DIR" || exit 90; ` +
+    // .credentials.json MUST be a live symlink to the fanned credential, ALWAYS
+    // re-linked (ln -sf) — never a skip-if-exists copy. A stale REAL file here
+    // (left by older code or a prior spawn) shadows both the live fanned
+    // credential AND the CLAUDE_CODE_OAUTH_TOKEN env, so it silently expires and
+    // 401s the agent while the real ~/.claude credential is perfectly valid
+    // (profiterole canary, 2026-07-06 — expired 07-03 copy in a reused dir).
+    `if [ -e "$HOME/.claude/.credentials.json" ]; then ` +
+    `ln -sf "$HOME/.claude/.credentials.json" "$CLAUDE_CONFIG_DIR/.credentials.json" || exit 91; ` +
+    `fi; ` +
     `for e in ${entries}; do ` +
+    `if [ "$e" = ".credentials.json" ]; then continue; fi; ` +
     `if [ -e "$HOME/.claude/$e" ] && [ ! -e "$CLAUDE_CONFIG_DIR/$e" ]; then ` +
     `ln -s "$HOME/.claude/$e" "$CLAUDE_CONFIG_DIR/$e" || exit 91; ` +
     `fi; done; ` +

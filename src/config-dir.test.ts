@@ -74,6 +74,23 @@ describe("buildConfigDirSetup (executed against a fake home)", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  test("heals a stale REAL .credentials.json copy into a live symlink (the 401 trap)", () => {
+    const home = runInFakeHome("gateau");
+    const dir = join(home, ".claude-agents", "gateau");
+    const cred = join(dir, ".credentials.json");
+    // Simulate a prior spawn / older code that left a frozen real credential
+    // (an expired copy) where the live symlink should be.
+    rmSync(cred, { force: true });
+    writeFileSync(cred, JSON.stringify({ claudeAiOauth: { accessToken: "STALE-EXPIRED" } }));
+    expect(lstatSync(cred).isSymbolicLink()).toBe(false);
+    // Re-run: the credential must be force-relinked to the live fanned one.
+    execSync(buildConfigDirSetup("gateau", "/tmp/proj"), { shell: "/bin/sh", env: { HOME: home, PATH: process.env.PATH } });
+    expect(lstatSync(cred).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(cred)).toBe(join(home, ".claude", ".credentials.json"));
+    expect(JSON.parse(readFileSync(cred, "utf-8")).claudeAiOauth.accessToken).toBe("tok");
+    rmSync(home, { recursive: true, force: true });
+  });
+
   test("merges oauthAccount from an anchor ~/.claude.json into the seed", () => {
     const home = runInFakeHome("gateau", (h) =>
       writeFileSync(join(h, ".claude.json"), '{"oauthAccount":{"emailAddress":"x@y.z"},"other":"ignored"}'),
