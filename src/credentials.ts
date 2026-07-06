@@ -26,6 +26,13 @@
  *     a different, non-fanned auth scheme is in use (e.g. a cockpit on console
  *     auth). We only guard the fleet's fanned-subscription model; we do not
  *     second-guess an auth scheme we don't manage.
+ *   - A durable setup-token at `<home>/.claude-oauth-token` → LIVE regardless
+ *     of `.credentials.json`: the home's `.zshenv` exports it as
+ *     `CLAUDE_CODE_OAUTH_TOKEN` (provisioned together — see
+ *     reference-spawn-host-provisioning), which claude-code prefers over the
+ *     file credential. Setup-tokens are long-lived and non-rotating, so an
+ *     expired fanned copy next to one is NOT provable death — it's the exact
+ *     false-negative that forced `CREW_SKIP_CRED_CHECK=1` on the laptop host.
  *
  * Escape hatch: `CREW_SKIP_CRED_CHECK` bypasses the guard entirely — a guard
  * must never permanently brick fleet spawns.
@@ -100,6 +107,33 @@ export function credentialPath(target: CredentialTarget): string {
     : `/Users/${target.target.runAsUid}/.claude/.credentials.json`;
 }
 
+/** Absolute path to the durable setup-token for a target. */
+export function setupTokenPath(target: CredentialTarget): string {
+  return target.kind === "local"
+    ? join(target.home, ".claude-oauth-token")
+    : `/Users/${target.target.runAsUid}/.claude-oauth-token`;
+}
+
+/**
+ * True when the target home holds a non-empty durable setup-token. The token
+ * reaches claude-code as CLAUDE_CODE_OAUTH_TOKEN via the home's `.zshenv`
+ * export (provisioned alongside the file), and takes precedence over
+ * `.credentials.json` — so its presence makes the home's auth live no matter
+ * what state the fanned copy is in.
+ */
+export async function hasSetupToken(target: CredentialTarget): Promise<boolean> {
+  const path = setupTokenPath(target);
+  if (target.kind === "local") {
+    try {
+      return readFileSync(path, "utf-8").trim() !== "";
+    } catch {
+      return false;
+    }
+  }
+  const out = await sshRun(target.target, `sudo -n cat ${path} 2>/dev/null`);
+  return out.trim() !== "";
+}
+
 /** Read the credential file content, or null if absent/unreadable. */
 export async function readCredential(target: CredentialTarget): Promise<string | null> {
   const path = credentialPath(target);
@@ -126,8 +160,12 @@ export async function assertClaudeCredentialLive(target: CredentialTarget): Prom
   const content = await readCredential(target);
   const status = credentialStatus(content);
   if (!status.live) {
+    // A dead fanned credential is only provable death when no durable
+    // setup-token backs the home (the token wins inside claude-code).
+    if (await hasSetupToken(target)) return;
     throw new Error(
-      `crew: refusing to spawn claude-code — Claude credential ${status.reason} at ${credentialPath(target)}. ` +
+      `crew: refusing to spawn claude-code — Claude credential ${status.reason} at ${credentialPath(target)}, ` +
+        `and no setup-token at ${setupTokenPath(target)}. ` +
         `Re-run agiterra-credential-sync (or re-login the anchor). Override with CREW_SKIP_CRED_CHECK=1.`,
     );
   }

@@ -116,4 +116,22 @@ describe("local readCredential + assertClaudeCredentialLive", () => {
     process.env.CREW_SKIP_CRED_CHECK = "1";
     await expect(assertClaudeCredentialLive({ kind: "local", home })).resolves.toBeUndefined();
   });
+
+  test("setup-token rescues an expired access-token-only credential", async () => {
+    writeFileSync(join(home, ".claude", ".credentials.json"), cred("tok", Date.now() - HOUR));
+    writeFileSync(join(home, ".claude-oauth-token"), "sk-ant-oat01-durable\n");
+    await expect(assertClaudeCredentialLive({ kind: "local", home })).resolves.toBeUndefined();
+  });
+
+  test("setup-token rescues a missing credential file", async () => {
+    writeFileSync(join(home, ".claude-oauth-token"), "sk-ant-oat01-durable\n");
+    await expect(assertClaudeCredentialLive({ kind: "local", home })).resolves.toBeUndefined();
+  });
+
+  test("EMPTY setup-token does not rescue — still provable death", async () => {
+    writeFileSync(join(home, ".claude-oauth-token"), "  \n");
+    await expect(assertClaudeCredentialLive({ kind: "local", home })).rejects.toThrow(
+      /no setup-token/,
+    );
+  });
 });
