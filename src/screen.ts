@@ -57,7 +57,11 @@ export async function createSession(
   await $`mkdir -p ${wireDir} && touch -a ${screenrc}`.quiet().nothrow();
   const scriptFile = `/tmp/crew-launch-${name}-${Date.now()}.sh`;
   await Bun.write(scriptFile, `#!/usr/bin/env -S ${shell} -l\nrm -f '${scriptFile}'\n${command}\n`);
-  await $`chmod +x ${scriptFile}`.quiet();
+  // 0700, NOT world-readable: the launch chain embeds AGENT_PRIVATE_KEY, so a
+  // 0755 script in shared /tmp leaks the key to every local user until the
+  // self-rm runs (and it doesn't always — see the remote path). Same uid writes
+  // and execs here, so owner-only is sufficient.
+  await $`chmod 700 ${scriptFile}`.quiet();
   // -U forces UTF-8 so box-drawing / symbols in a TUI (claude/codex) render
   // clean on attach instead of â/Â mojibake. The screenrc on a fresh install
   // doesn't set defutf8, so the flag is load-bearing (2026-06-30).
@@ -130,10 +134,18 @@ export async function createRemoteSession(
   const scriptFile = `/tmp/crew-launch-${name}-${Date.now()}.sh`;
   const body = `#!/usr/bin/env -S /bin/zsh -l\nrm -f '${scriptFile}'\n${command}\n`;
   const b64 = Buffer.from(body).toString("base64");
-  // Write the script (as the SSH user, in world-readable /tmp so the ephemeral
-  // UID can exec it), then sudo to the ephemeral UID and launch screen.
+  // The launch script embeds AGENT_PRIVATE_KEY. It's written by the SSH/service
+  // user (tim) but exec'd by the ephemeral UID via sudo, so it can't be
+  // owner-only-tim. The OLD form (chmod 755) left it WORLD-READABLE in sticky
+  // /tmp — and the in-script self-rm runs as the ephemeral UID, which can't
+  // delete a tim-owned file in sticky /tmp, so every spawn leaked a readable
+  // key at rest (profiterole, 2026-07-06). Fix: chmod 600 while tim owns it,
+  // then chown to the ephemeral UID — now ONLY that UID (and root) can read it,
+  // AND the self-rm succeeds because the runner owns the file. chown needs root;
+  // the box's NOPASSWD sudo (same grant the spawn itself rides) provides it.
   const remote =
-    `printf %s ${b64} | base64 -d > ${scriptFile}; chmod 755 ${scriptFile}; ` +
+    `printf %s ${b64} | base64 -d > ${scriptFile}; chmod 600 ${scriptFile}; ` +
+    `sudo -n chown ${t.runAsUid} ${scriptFile}; ` +
     `${remoteScreen(t)} -U -dmS ${name} ${scriptFile}`;
   await sshRun(t, remote);
   // Poll — same forked-screen race as the local path, but over SSH (slower), so
