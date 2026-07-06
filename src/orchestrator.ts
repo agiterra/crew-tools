@@ -742,9 +742,22 @@ export class Orchestrator {
     let callerPane: string | null = null;
     const attached = await screen.isAttached(screenName);
     if (opts.callerSessionId && attached) {
-      callerPane = this.store.listPanes().find((p) => p.iterm_id === opts.callerSessionId)?.name ?? null;
-      if (!callerPane) {
-        callerPane = await this.autoRegisterPane(opts.callerSessionId);
+      // Pane auto-link is COSMETIC; the identity row below is load-bearing.
+      // autoRegisterPane enumerates iTerm via AppleScript, which fails from
+      // any account outside the GUI user's session (-1728/-10810) — personas
+      // on per-UID homes hit this on every self-register. Never let the
+      // pane-link kill the registration; log and register pane-less.
+      try {
+        callerPane = this.store.listPanes().find((p) => p.iterm_id === opts.callerSessionId)?.name ?? null;
+        if (!callerPane) {
+          callerPane = await this.autoRegisterPane(opts.callerSessionId);
+        }
+      } catch (e) {
+        console.error(
+          `[crew] registerAgent: pane auto-link failed (registering without pane — agent_attach later):`,
+          e instanceof Error ? e.message : e,
+        );
+        callerPane = null;
       }
     }
 
