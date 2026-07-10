@@ -29,7 +29,10 @@ async function findScreen(): Promise<string> {
     return "screen";
   }
 }
-const SCREEN = await findScreen();
+// Exported so terminal backends type the SAME binary into pane shells: a pane
+// whose PATH resolves Apple screen 4 attaches against the wrong socket dir and
+// reports "no screen session found" for a live agent (task #29).
+export const SCREEN = await findScreen();
 
 export type ScreenSession = {
   name: string;

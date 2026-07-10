@@ -4,6 +4,7 @@
 
 import type { TerminalBackend, PaneProfile, TerminalSession } from "./terminal.js";
 import * as iterm from "./iterm.js";
+import { SCREEN } from "./screen.js";
 
 export class ItermBackend implements TerminalBackend {
   readonly name = "iterm" as const;
@@ -42,7 +43,9 @@ export class ItermBackend implements TerminalBackend {
   ): Promise<void> {
     // AppleScript's `write text` auto-appends a newline, so the attach
     // command commits without an explicit trailing \n.
-    return iterm.writeToSession(sessionId, `screen -${mode} ${screenName}`);
+    // Absolute SCREEN path: the pane shell's PATH may resolve Apple screen 4,
+    // whose socket dir can't see homebrew-screen-5 sessions (task #29).
+    return iterm.writeToSession(sessionId, `${SCREEN} -${mode} ${screenName}`);
   }
 
   closeSession(sessionId: string): Promise<void> {

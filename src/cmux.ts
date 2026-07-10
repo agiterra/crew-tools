@@ -14,6 +14,7 @@
 
 import { $ } from "bun";
 import type { TerminalBackend, PaneProfile, TerminalSession } from "./terminal.js";
+import { SCREEN } from "./screen.js";
 
 /**
  * Run a cmux CLI command and return trimmed stdout.
@@ -354,7 +355,9 @@ export class CmuxBackend implements TerminalBackend {
     mode: "r" | "x" = "r",
   ): Promise<void> {
     const args = await this.surfaceArgs(sessionId);
-    await cmux("send", ...args, `screen -${mode} ${screenName}`);
+    // Absolute SCREEN path: the pane shell's PATH may resolve Apple screen 4,
+    // whose socket dir can't see homebrew-screen-5 sessions (task #29).
+    await cmux("send", ...args, `${SCREEN} -${mode} ${screenName}`);
     await cmux("send-key", ...args, "enter");
     try {
       await cmux(
@@ -362,7 +365,7 @@ export class CmuxBackend implements TerminalBackend {
         ...args,
         "--kind", "agent",
         "--name", screenName,
-        "--shell", `screen -${mode} ${screenName}`,
+        "--shell", `${SCREEN} -${mode} ${screenName}`,
       );
     } catch (err) {
       // Non-fatal — older cmux builds lack surface.resume; not load-bearing.
