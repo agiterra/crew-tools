@@ -1244,7 +1244,10 @@ export class Orchestrator {
    */
   async readAgent(agentId: string, ccSessionId?: string): Promise<string> {
     const agent = this.resolveAgent(agentId, ccSessionId);
-    return screen.readOutput(agent.screen_name);
+    const target = this.targetFor(agent);
+    return target
+      ? screen.readRemoteOutput(agent.screen_name, target)
+      : screen.readOutput(agent.screen_name);
   }
 
   /**

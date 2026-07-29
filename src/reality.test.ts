@@ -100,6 +100,28 @@ describe("RealityLayer.snapshot", () => {
     }
     expect(logged.length).toBeGreaterThan(0);
   });
+
+  test("a failed screen probe is marked ambiguous so reads fail open", async () => {
+    store.createAgent({ id: "maybe-live", display_name: "Maybe", runtime: "claude-code", screen_name: "wire-maybe-live" });
+    const reality = new RealityLayer(undefined, {
+      graceMs: 0,
+      screenLister: async () => {
+        throw new Error("screen socket directory unavailable");
+      },
+      terminalEnumerator: async () => [],
+    });
+    const orig = console.error;
+    console.error = () => {};
+    try {
+      const live = await reality.liveAgentRows(store.listAgents(), localMachine);
+      expect(live.map((a) => a.id)).toEqual(["maybe-live"]);
+      await reality.heal(store, localMachine);
+      await reality.heal(store, localMachine);
+    } finally {
+      console.error = orig;
+    }
+    expect(store.getAgent("maybe-live")).not.toBeNull();
+  });
 });
 
 describe("RealityLayer.liveAgentRows (reality LEFT JOIN db)", () => {
@@ -259,10 +281,11 @@ describe("cross-UID rows (manifest run_as_uid) — never verified, never reaped 
     expect(store.getAgent("eph")).not.toBeNull();
   });
 
-  test("a row whose run_as_uid MATCHES this process user is verified normally", async () => {
+  test("a row whose run_as_uid is provably this numeric UID is verified normally", async () => {
+    const uid = typeof process.getuid === "function" ? String(process.getuid()) : "0";
     store.createAgent({
       id: "self-uid", display_name: "S", runtime: "claude-code", screen_name: "wire-self-uid",
-      spawn_manifest: JSON.stringify({ env: {}, runtime: "claude-code", project_dir: "/tmp", display_name: "S", run_as_uid: process.env.USER }),
+      spawn_manifest: JSON.stringify({ env: {}, runtime: "claude-code", project_dir: "/tmp", display_name: "S", run_as_uid: uid }),
     });
     const reality = makeReality({ screens: () => [] });
     const live = await reality.liveAgentRows(store.listAgents(), localMachine);
