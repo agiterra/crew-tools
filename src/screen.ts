@@ -8,7 +8,7 @@
  */
 
 import { $ } from "bun";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "path";
 
 // Resolve screen binary: prefer homebrew 5.x (color support) over macOS built-in 4.0.
@@ -57,7 +57,12 @@ export async function createSession(
   // Defensive: `screen -c <missing-file>` fails silently. Ensure the screenrc
   // exists (empty is fine) so a fresh install — where the wire installer
   // hasn't yet written this file — doesn't break agent launches.
-  await $`mkdir -p ${wireDir} && touch -a ${screenrc}`.quiet().nothrow();
+  // Plain fs, NOT `$\`touch -a\``: Bun shell's builtin touch rejects -a
+  // ("unsupported option", exit 1) and the old .nothrow() swallowed that,
+  // so the guard silently never created the file (herald/vacherin sidecar
+  // launches all failed on fresh homes, 2026-07-29).
+  mkdirSync(wireDir, { recursive: true });
+  if (!existsSync(screenrc)) writeFileSync(screenrc, "");
   const scriptFile = `/tmp/crew-launch-${name}-${Date.now()}.sh`;
   await Bun.write(scriptFile, `#!/usr/bin/env -S ${shell} -l\nrm -f '${scriptFile}'\n${command}\n`);
   // 0700, NOT world-readable: the launch chain embeds AGENT_PRIVATE_KEY, so a
