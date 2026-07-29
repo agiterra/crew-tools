@@ -16,6 +16,7 @@ import { Orchestrator } from "./orchestrator.js";
 import { createBackend } from "./terminal.js";
 import { listThemes, loadTheme, resolveThemeDir } from "./themes.js";
 import { getClaudeCodeSessionId } from "./claude-session.js";
+import { createCrewRpcWriter, type CrewRpcWriter } from "./crew-rpc.js";
 import { execSync } from "child_process";
 
 /**
@@ -28,6 +29,39 @@ export async function startServer(): Promise<void> {
   const CALLER_AGENT_ID =
     process.env.AGENT_ID ?? "unknown";
   const ccSessionId = getClaudeCodeSessionId();
+  let rpcWriter: CrewRpcWriter | null = null;
+  const rpcWriterReady = createCrewRpcWriter()
+    .then((writer) => {
+      rpcWriter = writer;
+      console.error(`[crew] RPC writer ready (dest=${writer.dest})`);
+      return writer;
+    })
+    .catch((e) => {
+      console.error(`[crew] RPC writer unavailable; write tools will fail closed: ${(e as Error).message}`);
+      return null;
+    });
+
+  async function crewRpc(method: string, params: unknown, timeoutMs?: number): Promise<unknown> {
+    const writer = rpcWriter ?? await rpcWriterReady;
+    if (!writer) throw new Error("crew RPC writer unavailable; refusing direct crews.db write");
+    return writer.request(method, params, timeoutMs);
+  }
+
+  async function crewRpcTo(dest: string, method: string, params: unknown, timeoutMs?: number): Promise<unknown> {
+    const writer = rpcWriter ?? await rpcWriterReady;
+    if (!writer) throw new Error("crew RPC writer unavailable; refusing direct crews.db write");
+    return writer.requestTo(dest, method, params, timeoutMs);
+  }
+
+  async function tryCrewRpc(method: string, params: unknown, label: string): Promise<boolean> {
+    try {
+      await crewRpc(method, params);
+      return true;
+    } catch (e) {
+      console.error(`[crew] ${label} via RPC failed: ${(e as Error).message}`);
+      return false;
+    }
+  }
 
   // Self-stamp: if we can identify the current agent (via STY) and we have a
   // session ID, update the agent's cc_session_id immediately. Without this,
@@ -38,8 +72,15 @@ export async function startServer(): Promise<void> {
   const myAgent = screenName ? orchestrator.store.getAgentByScreen(screenName) : null;
 
   if (ccSessionId && myAgent) {
-    orchestrator.store.updateAgentCcSession(myAgent.screen_name, ccSessionId);
-    console.error(`[crew] self-stamped ${myAgent.id} cc_session_id=${ccSessionId.slice(0, 8)}\u2026`);
+    if (await tryCrewRpc("crew.agent_register", {
+      id: myAgent.id,
+      name: myAgent.display_name,
+      runtime: myAgent.runtime,
+      caller_session_id: await callerSession(),
+      cc_session_id: ccSessionId,
+    }, `self-stamp ${myAgent.id} cc_session_id`)) {
+      console.error(`[crew] self-stamped ${myAgent.id} cc_session_id=${ccSessionId.slice(0, 8)}\u2026`);
+    }
   }
 
   // Self-stamp pane.iterm_id and agent.pane. The MCP server inherits the
@@ -60,7 +101,11 @@ export async function startServer(): Promise<void> {
       if (!myPane && myAgent.pane) {
         const named = orchestrator.store.getPane(myAgent.pane);
         if (named && !named.iterm_id) {
-          orchestrator.store.setPaneItermId(myAgent.pane, sessionId);
+          await tryCrewRpc("crew.pane_register", {
+            tab: named.tab,
+            name: myAgent.pane,
+            iterm_session_id: sessionId,
+          }, `self-stamp pane '${myAgent.pane}' iterm_id`);
           myPane = orchestrator.store.getPane(myAgent.pane) ?? undefined;
           console.error(`[crew] self-stamped pane '${myAgent.pane}' iterm_id=${sessionId}`);
         } else if (named) {
@@ -74,7 +119,11 @@ export async function startServer(): Promise<void> {
         const tabName = myAgent.id;
         const candidates = orchestrator.store.listPanes(tabName).filter((p) => !p.iterm_id);
         if (candidates.length === 1) {
-          orchestrator.store.setPaneItermId(candidates[0].name, sessionId);
+          await tryCrewRpc("crew.pane_register", {
+            tab: candidates[0].tab,
+            name: candidates[0].name,
+            iterm_session_id: sessionId,
+          }, `self-stamp pane '${candidates[0].name}' iterm_id`);
           myPane = orchestrator.store.getPane(candidates[0].name) ?? undefined;
           console.error(`[crew] self-stamped pane '${candidates[0].name}' iterm_id=${sessionId} (matched via tab='${tabName}')`);
         } else if (candidates.length > 1) {
@@ -96,8 +145,12 @@ export async function startServer(): Promise<void> {
       if (myPane) {
         const fresh = orchestrator.store.getAgentByScreen(screenName!);
         if (fresh && !fresh.pane) {
-          orchestrator.store.updateAgentPane(fresh.id, myPane.name);
-          console.error(`[crew] self-stamped agent '${fresh.id}' pane='${myPane.name}'`);
+          if (await tryCrewRpc("crew.agent_attach", {
+            id: fresh.id,
+            pane: myPane.name,
+          }, `self-stamp agent '${fresh.id}' pane`)) {
+            console.error(`[crew] self-stamped agent '${fresh.id}' pane='${myPane.name}'`);
+          }
         } else if (fresh && fresh.pane !== myPane.name) {
           console.error(
             `[crew] self-stamp: env-derived pane '${myPane.name}' differs from DB pane '${fresh.pane}' for '${fresh.id}' — NOT overriding (agent_attach is authoritative). ` +
@@ -679,33 +732,29 @@ export async function startServer(): Promise<void> {
 
       switch (name) {
         case "agent_launch": {
-          result = await orchestrator.launchAgent({
+          const params = {
             env: a.env as Record<string, string>,
             runtime: a.runtime as string | undefined,
-            projectDir: a.project_dir as string | undefined,
-            machine: a.machine as string | undefined,
-            runAsUid: a.run_as_uid as string | undefined,
-            extraFlags: a.extra_flags as string | undefined,
+            project_dir: a.project_dir as string | undefined,
+            extra_flags: a.extra_flags as string | undefined,
             prompt: a.prompt as string | undefined,
             badge: a.badge as string | undefined,
-            ttlIdleMinutes: a.ttl_idle_minutes as number | undefined,
-            splitInCallerWorkspace: a.split_in_caller_workspace as { direction: "right" | "down" } | undefined,
-          });
+            ttl_idle_minutes: a.ttl_idle_minutes as number | undefined,
+          };
+          const machine = a.machine as string | undefined;
+          const localMachine = orchestrator.store.localMachineName();
+          result = machine && machine !== localMachine
+            ? await crewRpcTo(`crew-svc@${machine}`, "crew.agent_spawn", params, 120_000)
+            : await crewRpc("crew.agent_spawn", params, 120_000);
           break;
         }
         case "agent_resume": {
-          result = await orchestrator.resumeAgent({
+          result = await crewRpc("crew.agent_resume", {
             id: a.id as string,
-            ccSessionId: a.cc_session_id as string | undefined,
-            projectDir: a.project_dir as string | undefined,
+            cc_session_id: a.cc_session_id as string | undefined,
+            project_dir: a.project_dir as string | undefined,
             env: a.env as Record<string, string> | undefined,
-            channels: a.channels as string[] | undefined,
-            extraFlags: a.extra_flags as string | undefined,
-            attachToPane: a.attach_to_pane as string | undefined,
-            displayName: a.display_name as string | undefined,
-            badge: a.badge as string | undefined,
-            runtime: a.runtime as string | undefined,
-          });
+          }, 120_000);
           break;
         }
         case "tombstone_list": {
@@ -716,29 +765,30 @@ export async function startServer(): Promise<void> {
           break;
         }
         case "agent_register":
-          result = await orchestrator.registerAgent({
+          result = await crewRpc("crew.agent_register", {
             id: a.id as string,
-            displayName: a.name as string,
+            name: a.name as string,
             runtime: a.runtime as string | undefined,
-            callerSessionId: await callerSession(),
-            ccSessionId: (a.cc_session_id as string | undefined) ?? ccSessionId ?? undefined,
+            caller_session_id: await callerSession(),
+            cc_session_id: (a.cc_session_id as string | undefined) ?? ccSessionId ?? undefined,
           });
           break;
         case "agent_badge": {
-          const outcome = await orchestrator.setAgentBadge(a.id as string, a.text as string);
-          result = { badge_set: a.id, text: a.text, ...outcome };
+          result = await crewRpc("crew.agent_badge", { id: a.id, text: a.text });
           break;
         }
         case "agent_interrupt":
-          result = await orchestrator.interruptAgent(a.id as string, !!a.background, a.cc_session_id as string | undefined);
+          result = await crewRpc("crew.agent_interrupt", {
+            id: a.id,
+            background: !!a.background,
+            cc_session_id: a.cc_session_id,
+          });
           break;
         case "agent_close":
-          await orchestrator.closeAgent(a.id as string, a.cc_session_id as string | undefined);
-          result = { closed: a.id, cc_session_id: a.cc_session_id };
+          result = await crewRpc("crew.agent_close", { id: a.id, cc_session_id: a.cc_session_id }, 120_000);
           break;
         case "agent_stop":
-          await orchestrator.stopAgent(a.id as string, a.cc_session_id as string | undefined);
-          result = { stopped: a.id, cc_session_id: a.cc_session_id };
+          result = await crewRpc("crew.agent_stop", { id: a.id }, 120_000);
           break;
         case "agent_list": {
           let agents = await orchestrator.listAgents();
@@ -755,31 +805,23 @@ export async function startServer(): Promise<void> {
           break;
         }
         case "agent_attach":
-          await orchestrator.attachAgent(a.id as string, a.pane as string);
-          result = { attached: a.id, pane: a.pane };
+          result = await crewRpc("crew.agent_attach", { id: a.id, pane: a.pane });
           break;
         case "agent_detach":
-          await orchestrator.detachAgent(a.id as string);
-          result = { detached: a.id };
+          result = await crewRpc("crew.agent_detach", { id: a.id });
           break;
         case "agent_move":
-          await orchestrator.moveAgent(a.id as string, a.pane as string);
-          result = { moved: a.id, pane: a.pane };
+          result = await crewRpc("crew.agent_move", { id: a.id, pane: a.pane });
           break;
         case "agent_swap":
-          await orchestrator.swapAgents(a.id_a as string, a.id_b as string);
-          result = { swapped: [a.id_a, a.id_b] };
+          result = await crewRpc("crew.agent_swap", { id_a: a.id_a, id_b: a.id_b });
           break;
         case "agent_send": {
-          const sendRes = await orchestrator.sendToAgent(
-            a.id as string,
-            a.text as string,
-            (a.cc_session_id as string | undefined) ?? (a.session as string | undefined),
-          );
-          // Never a blind sent:true — `landed` confirms verifiable text actually
-          // appeared (true/false), null for control/submit keys; `screen` is the
-          // post-send hardcopy for the caller to assess.
-          result = { sent: true, landed: sendRes.landed, screen: sendRes.screen };
+          result = await crewRpc("crew.agent_send", {
+            id: a.id,
+            text: a.text,
+            cc_session_id: (a.cc_session_id as string | undefined) ?? (a.session as string | undefined),
+          });
           break;
         }
         case "agent_read":
@@ -788,26 +830,30 @@ export async function startServer(): Promise<void> {
         case "tab_register": {
           const sessionId = (a.iterm_session_id as string | undefined) ?? (await callerSession());
           if (!sessionId) throw new Error(`cannot detect terminal session — pass iterm_session_id explicitly or run from inside ${terminalName}`);
-          result = await orchestrator.registerTab(a.name as string, sessionId, a.theme as string | undefined);
+          result = await crewRpc("crew.tab_register", {
+            name: a.name,
+            iterm_session_id: sessionId,
+            theme: a.theme,
+          });
           break;
         }
         case "tab_create":
-          result = await orchestrator.createTab(a.name as string, a.theme as string | undefined);
+          result = await crewRpc("crew.tab_create", { name: a.name, theme: a.theme });
           break;
         case "tab_list":
           result = orchestrator.listTabs();
           break;
         case "tab_destroy":
-          orchestrator.deleteTab(a.name as string);
-          result = { destroyed: a.name };
+          result = await crewRpc("crew.tab_destroy", { name: a.name });
           break;
         case "pane_register": {
           const sessionId = await callerSession();
           if (!sessionId) throw new Error(`cannot detect terminal session — are you running in ${terminalName}?`);
-          if (!orchestrator.store.getTab(a.tab as string)) {
-            orchestrator.createTab(a.tab as string);
-          }
-          result = await orchestrator.registerPane(a.tab as string, a.name as string | undefined, sessionId);
+          result = await crewRpc("crew.pane_register", {
+            tab: a.tab,
+            name: a.name,
+            iterm_session_id: sessionId,
+          });
           break;
         }
         case "pane_create": {
@@ -823,48 +869,56 @@ export async function startServer(): Promise<void> {
               if (callerPane && callerPane.tab === targetTab) relTo = callerId;
             }
           }
-          result = await orchestrator.createPane(
-            targetTab,
-            a.name as string | undefined,
-            a.position as string | undefined,
-            relTo,
-          );
+          result = await crewRpc("crew.pane_create", {
+            tab: targetTab,
+            name: a.name,
+            position: a.position,
+            relative_to: relTo,
+          });
           break;
         }
         case "pane_send":
-          await orchestrator.sendToPane(a.pane as string, a.text as string);
-          result = { sent: true, pane: a.pane };
+          result = await crewRpc("crew.pane_send", { pane: a.pane, text: a.text });
           break;
         case "pane_badge":
-          await orchestrator.setBadge(a.pane as string, a.text as string);
-          result = { badge_set: a.pane, text: a.text };
+          result = await crewRpc("crew.pane_badge", { pane: a.pane, text: a.text });
           break;
         case "pane_notify":
-          await orchestrator.notifyPane(a.pane as string, a.title as string, a.body as string | undefined);
-          result = { notified: a.pane, title: a.title };
+          result = await crewRpc("crew.pane_notify", { pane: a.pane, title: a.title, body: a.body });
           break;
         case "pane_list":
           result = orchestrator.listPanes(a.tab as string | undefined);
           break;
         case "pane_close":
-          await orchestrator.closePane(a.name as string, await callerSession());
-          result = { closed: a.name };
+          result = await crewRpc("crew.pane_close", { name: a.name, caller_session_id: await callerSession() });
           break;
         case "url_open":
-          result = await orchestrator.openUrl({
-            tab: a.tab as string,
-            pane: a.pane as string | undefined,
-            url: a.url as string,
-            position: a.position as string | undefined,
-            relativeTo: (a.relative_to as string) ?? await callerSession(),
-          });
+          if (!orchestrator.store.getTab(a.tab as string)) throw new Error(`tab '${a.tab as string}' not found`);
+          {
+            const paneName = (a.pane as string | undefined) ?? `url-${Date.now()}`;
+            const position = (a.position as string | undefined) ?? "below";
+            const direction = (position === "left" || position === "right") ? "vertical" : "horizontal";
+            const relativeTo = (a.relative_to as string | undefined) ?? await callerSession();
+            const resolvedRelativeTo = relativeTo
+              ? (orchestrator.store.getPane(relativeTo)?.iterm_id ?? relativeTo)
+              : undefined;
+            const sessionId = resolvedRelativeTo
+              ? await terminal.splitSessionWebBrowser(resolvedRelativeTo, a.url as string, direction)
+              : await terminal.splitWebBrowser(a.url as string, direction);
+            const pane = await crewRpc("crew.pane_register", {
+              tab: a.tab,
+              name: paneName,
+              iterm_session_id: sessionId,
+            });
+            result = { pane, url: a.url };
+          }
           break;
         case "theme_update": {
           const updates: { blend?: number; mode?: number; images?: Record<string, string> } = {};
           if (a.blend !== undefined) updates.blend = a.blend as number;
           if (a.mode !== undefined) updates.mode = a.mode as number;
           if (a.images) updates.images = a.images as Record<string, string>;
-          result = await orchestrator.updateThemeAndRebuild(a.theme as string, updates);
+          result = await crewRpc("crew.theme_update", { theme: a.theme, ...updates }, 120_000);
           break;
         }
         case "theme_list": {
@@ -883,18 +937,18 @@ export async function startServer(): Promise<void> {
           break;
         }
         case "reconcile":
-          result = { report: await orchestrator.reconcile() };
+          result = await crewRpc("crew.reconcile", {}, 120_000);
           break;
         case "machine_register": {
-          result = await orchestrator.registerMachine({
+          result = await crewRpc("crew.machine_register", {
             name: a.name as string,
-            sshHost: a.ssh_host as string,
-            sshPort: a.ssh_port as number | undefined,
-            brokerUrl: a.broker_url as string | undefined,
+            ssh_host: a.ssh_host as string,
+            ssh_port: a.ssh_port as number | undefined,
+            broker_url: a.broker_url as string | undefined,
             notes: a.notes as string | undefined,
-            skipProbe: Boolean(a.skip_probe),
+            skip_probe: Boolean(a.skip_probe),
             reciprocal: Boolean(a.reciprocal),
-            localAddress: a.local_address as string | undefined,
+            local_address: a.local_address as string | undefined,
           });
           break;
         }
@@ -902,11 +956,10 @@ export async function startServer(): Promise<void> {
           result = orchestrator.listMachines();
           break;
         case "machine_remove":
-          orchestrator.removeMachine(a.name as string);
-          result = { removed: a.name };
+          result = await crewRpc("crew.machine_remove", { name: a.name });
           break;
         case "machine_probe":
-          result = await orchestrator.probeMachine(a.name as string);
+          result = await crewRpc("crew.machine_probe", { name: a.name }, 60_000);
           break;
         default:
           throw new Error(`unknown tool: ${name}`);
@@ -944,6 +997,11 @@ export async function startServer(): Promise<void> {
     } catch (e) {
       console.error(`[crew] transport close failed:`, e);
     }
+    try {
+      await rpcWriter?.stop();
+    } catch (e) {
+      console.error(`[crew] RPC writer stop failed:`, e);
+    }
     // Small drain window for any in-flight wire ops
     await new Promise((r) => setTimeout(r, 100));
     process.exit(0);
@@ -952,8 +1010,10 @@ export async function startServer(): Promise<void> {
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGHUP", () => void shutdown("SIGHUP"));
 
-  const report = await orchestrator.reconcile();
+  const reconcileResult = await crewRpc("crew.reconcile", {});
+  const report = typeof reconcileResult === "object" && reconcileResult !== null && "report" in reconcileResult
+    ? String((reconcileResult as { report?: unknown }).report ?? "")
+    : JSON.stringify(reconcileResult, null, 2);
   console.error(`[crew] boot reconcile:\n${report}`);
-  orchestrator.startReaper();
   console.error(`[crew] ready (caller=${CALLER_AGENT_ID}, terminal=${terminalName}, cc_session=${ccSessionId ?? "unknown"})`);
 }

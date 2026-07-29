@@ -18,8 +18,7 @@
  *   2  orchestrator error (command reached the orchestrator but failed)
  */
 
-import { Orchestrator } from "./orchestrator.js";
-import { createBackend } from "./terminal.js";
+import { createCrewRpcWriter } from "./crew-rpc.js";
 import pkg from "../package.json" with { type: "json" };
 
 const USAGE = `Usage: crew <command> [args]
@@ -40,6 +39,15 @@ Exit codes: 0 success, 1 usage, 2 orchestrator error.
 `;
 
 type CliResult = { exit: number; stdout?: string; stderr?: string };
+
+async function withCrewRpc<T>(fn: (request: (method: string, params: unknown, timeoutMs?: number) => Promise<unknown>) => Promise<T>): Promise<T> {
+  const writer = await createCrewRpcWriter();
+  try {
+    return await fn((method, params, timeoutMs) => writer.request(method, params, timeoutMs));
+  } finally {
+    await writer.stop();
+  }
+}
 
 async function readJsonArg(src: string): Promise<unknown> {
   const text = src === "-" ? await Bun.stdin.text() : await Bun.file(src).text();
@@ -85,9 +93,16 @@ export async function runCli(argv: string[]): Promise<CliResult> {
         return { exit: 1, stderr: "launch JSON must include 'env' object with at least AGENT_ID\n" };
       }
       try {
-        const orch = new Orchestrator(await createBackend());
-        const agent = await orch.launchAgent(opts as Parameters<Orchestrator["launchAgent"]>[0]);
-        return { exit: 0, stdout: `${JSON.stringify(agent)}\n` };
+        const result = await withCrewRpc((request) => request("crew.agent_spawn", {
+          env,
+          runtime: opts.runtime,
+          project_dir: opts.project_dir ?? opts.projectDir,
+          prompt: opts.prompt,
+          badge: opts.badge,
+          ttl_idle_minutes: opts.ttl_idle_minutes ?? opts.ttlIdleMinutes,
+          extra_flags: opts.extra_flags ?? opts.extraFlags,
+        }, 120_000));
+        return { exit: 0, stdout: `${JSON.stringify(result)}\n` };
       } catch (e) {
         return { exit: 2, stderr: `launch failed: ${(e as Error).message}\n` };
       }
@@ -108,9 +123,13 @@ export async function runCli(argv: string[]): Promise<CliResult> {
         return { exit: 1, stderr: "resume JSON must include 'id' (string)\n" };
       }
       try {
-        const orch = new Orchestrator(await createBackend());
-        const agent = await orch.resumeAgent(opts as Parameters<Orchestrator["resumeAgent"]>[0]);
-        return { exit: 0, stdout: `${JSON.stringify(agent)}\n` };
+        const result = await withCrewRpc((request) => request("crew.agent_resume", {
+          id: opts.id,
+          cc_session_id: opts.cc_session_id ?? opts.ccSessionId,
+          project_dir: opts.project_dir ?? opts.projectDir,
+          env: opts.env,
+        }, 120_000));
+        return { exit: 0, stdout: `${JSON.stringify(result)}\n` };
       } catch (e) {
         return { exit: 2, stderr: `resume failed: ${(e as Error).message}\n` };
       }
@@ -121,9 +140,11 @@ export async function runCli(argv: string[]): Promise<CliResult> {
       if (!id) return { exit: 1, stderr: "close requires <id>\n" };
       const flags = parseFlags(rest.slice(1));
       try {
-        const orch = new Orchestrator(await createBackend());
-        await orch.closeAgent(id, flags["cc-session-id"] || undefined);
-        return { exit: 0, stdout: `${JSON.stringify({ closed: id })}\n` };
+        const result = await withCrewRpc((request) => request("crew.agent_close", {
+          id,
+          cc_session_id: flags["cc-session-id"] || undefined,
+        }, 120_000));
+        return { exit: 0, stdout: `${JSON.stringify(result)}\n` };
       } catch (e) {
         return { exit: 2, stderr: `close failed: ${(e as Error).message}\n` };
       }
@@ -134,9 +155,8 @@ export async function runCli(argv: string[]): Promise<CliResult> {
       if (!id) return { exit: 1, stderr: "stop requires <id>\n" };
       const flags = parseFlags(rest.slice(1));
       try {
-        const orch = new Orchestrator(await createBackend());
-        await orch.stopAgent(id, flags["cc-session-id"] || undefined);
-        return { exit: 0, stdout: `${JSON.stringify({ stopped: id })}\n` };
+        const result = await withCrewRpc((request) => request("crew.agent_stop", { id }, 120_000));
+        return { exit: 0, stdout: `${JSON.stringify(result)}\n` };
       } catch (e) {
         return { exit: 2, stderr: `stop failed: ${(e as Error).message}\n` };
       }
@@ -149,9 +169,8 @@ export async function runCli(argv: string[]): Promise<CliResult> {
         return { exit: 1, stderr: "agent-send requires <id> <text>\n" };
       }
       try {
-        const orch = new Orchestrator(await createBackend());
-        await orch.sendToAgent(id, text);
-        return { exit: 0, stdout: `${JSON.stringify({ sent: true, id })}\n` };
+        const result = await withCrewRpc((request) => request("crew.agent_send", { id, text }));
+        return { exit: 0, stdout: `${JSON.stringify(result)}\n` };
       } catch (e) {
         return { exit: 2, stderr: `agent-send failed: ${(e as Error).message}\n` };
       }
@@ -175,15 +194,14 @@ export async function runCli(argv: string[]): Promise<CliResult> {
         return { exit: 1, stderr: "machine-register JSON must include 'ssh_host'\n" };
       }
       try {
-        const orch = new Orchestrator(await createBackend());
-        const m = await orch.registerMachine({
+        const result = await withCrewRpc((request) => request("crew.machine_register", {
           name: opts.name,
-          sshHost: opts.ssh_host,
-          sshPort: typeof opts.ssh_port === "number" ? opts.ssh_port : undefined,
+          ssh_host: opts.ssh_host,
+          ssh_port: typeof opts.ssh_port === "number" ? opts.ssh_port : undefined,
           notes: typeof opts.notes === "string" ? opts.notes : undefined,
-          skipProbe: Boolean(opts.skip_probe),
-        });
-        return { exit: 0, stdout: `${JSON.stringify(m)}\n` };
+          skip_probe: Boolean(opts.skip_probe),
+        }, 60_000));
+        return { exit: 0, stdout: `${JSON.stringify(result)}\n` };
       } catch (e) {
         return { exit: 2, stderr: `machine-register failed: ${(e as Error).message}\n` };
       }
