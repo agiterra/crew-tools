@@ -20,6 +20,10 @@ const screenState = {
   screens: {} as Record<string, { queue: string[]; fallback: string }>,
   sendKeysLog: [] as Array<{ name: string; keys: string }>,
   sendKeysHook: null as ((name: string, keys: string) => void) | null,
+  killSessionCalls: [] as string[],
+  killSessionSurvivors: 0,
+  terminateSessionCalls: [] as Array<{ name: string; timeoutMs: number }>,
+  terminateSessionSurvivors: 0,
 };
 mock.module("./screen", () => ({
   createSession: async (name: string, command: string) => {
@@ -40,7 +44,14 @@ mock.module("./screen", () => ({
     if (!s) return "";
     return s.queue.length > 0 ? s.queue.shift()! : s.fallback;
   },
-  killSession: async () => {},
+  killSession: async (name: string) => {
+    screenState.killSessionCalls.push(name);
+    return screenState.killSessionSurvivors;
+  },
+  terminateSessionTree: async (name: string, timeoutMs: number) => {
+    screenState.terminateSessionCalls.push({ name, timeoutMs });
+    return screenState.terminateSessionSurvivors;
+  },
   // Cross-UID/remote screen surface (v2.19.0). Tests drive same-UID agents, so
   // these mirror the local mocks; a test exercising a run_as_uid agent keys the
   // same screenState by screen name.
@@ -55,7 +66,14 @@ mock.module("./screen", () => ({
     return s.queue.length > 0 ? s.queue.shift()! : s.fallback;
   },
   isRemoteAlive: async () => screenState.isAliveResult,
-  killRemoteSession: async () => {},
+  killRemoteSession: async (name: string) => {
+    screenState.killSessionCalls.push(name);
+    return screenState.killSessionSurvivors;
+  },
+  terminateRemoteSessionTree: async (name: string, _target: unknown, timeoutMs: number) => {
+    screenState.terminateSessionCalls.push({ name, timeoutMs });
+    return screenState.terminateSessionSurvivors;
+  },
   createRemoteSession: async (name: string, command: string) => {
     createSessionCalls.push({ name, command });
     return { name, pid: 12345 };
@@ -110,6 +128,10 @@ beforeEach(() => {
   screenState.screens = {};
   screenState.sendKeysLog.length = 0;
   screenState.sendKeysHook = null;
+  screenState.killSessionCalls.length = 0;
+  screenState.killSessionSurvivors = 0;
+  screenState.terminateSessionCalls.length = 0;
+  screenState.terminateSessionSurvivors = 0;
 });
 
 afterAll(() => {
@@ -369,6 +391,55 @@ describe("spawn manifest + tombstones", () => {
     expect(tomb!.spawn_manifest).not.toBeNull();
     const manifest = JSON.parse(tomb!.spawn_manifest!);
     expect(manifest.project_dir).toBe("/tmp/galette");
+  });
+
+  test("closeAgent terminates codex bridge runtimes with SIGTERM instead of slash-exit", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "bridge" },
+      runtime: "codex",
+      projectDir: "/tmp/bridge",
+    });
+
+    await orch.closeAgent("bridge", undefined, 250);
+
+    expect(screenState.sendKeysLog).toEqual([]);
+    expect(screenState.terminateSessionCalls).toEqual([{ name: "wire-bridge", timeoutMs: 250 }]);
+    expect(screenState.killSessionCalls).toEqual(["wire-bridge"]);
+    expect(orch.store.getAgent("bridge")).toBeNull();
+    expect(orch.store.getLatestTombstone("bridge")).not.toBeNull();
+  });
+
+  test("stopAgent terminates codex bridge runtimes before the final hard reap", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "bridge-stop" },
+      runtime: "codex",
+      projectDir: "/tmp/bridge-stop",
+    });
+
+    await orch.stopAgent("bridge-stop");
+
+    expect(screenState.terminateSessionCalls).toEqual([{ name: "wire-bridge-stop", timeoutMs: 10_000 }]);
+    expect(screenState.killSessionCalls).toEqual(["wire-bridge-stop"]);
+    expect(orch.store.getAgent("bridge-stop")).toBeNull();
+  });
+
+  test("stopAgent keeps the live row when the process group survives hard reap", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "stubborn" },
+      runtime: "codex",
+      projectDir: "/tmp/stubborn",
+    });
+    screenState.killSessionSurvivors = 2;
+    const orig = console.error;
+    console.error = () => {};
+    try {
+      await expect(orch.stopAgent("stubborn")).rejects.toThrow(/process tree survived kill/);
+    } finally {
+      console.error = orig;
+    }
+
+    expect(orch.store.getAgent("stubborn")).not.toBeNull();
+    expect(orch.store.getLatestTombstone("stubborn")).toBeNull();
   });
 });
 

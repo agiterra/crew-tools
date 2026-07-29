@@ -36,6 +36,21 @@ function manifestRunAsUid(spawnManifest: string | null | undefined): string | un
 }
 
 /**
+ * Whether this process's plain `screen -ls` can prove death for a row's
+ * run_as_uid. An absent run_as_uid is the legacy same-UID path. A numeric
+ * run_as_uid matching process.getuid() is also provably same-UID. Usernames
+ * are not enough: service/local-sudo spawns stamp names like `_ephemeral`,
+ * but their screen namespace is selected by sudo HOME/SCREENDIR, not by this
+ * process's USER string. Treat those as unverifiable and fail open.
+ */
+function screenNamespaceVerifiableHere(runAsUid: string | undefined): boolean {
+  if (!runAsUid) return true;
+  const getuid = process.getuid;
+  if (typeof getuid !== "function") return false;
+  return runAsUid === String(getuid.call(process));
+}
+
+/**
  * Snapshot freshness window. Within this, every read shares one
  * `screen -ls` + one terminal enumeration — so a burst of agent_list polls
  * costs one probe, and agents can't flicker in/out between reads in the
@@ -55,6 +70,8 @@ const DEFAULT_GRACE_MS = 60_000;
 export interface RealitySnapshot {
   /** Live local screen sessions, keyed by session name. */
   screens: Map<string, ScreenSession>;
+  /** True only when the screen probe succeeded; false means absence proves nothing. */
+  screenProbeOk: boolean;
   /** Live terminal sessions/surfaces, keyed by id. */
   terminals: Map<string, TerminalSession>;
   /** Capture time (ms, from the injected clock). */
@@ -146,18 +163,22 @@ export class RealityLayer {
     if (this.inflight) return this.inflight;
     this.inflight = (async () => {
       try {
-        const [screens, terminals] = await Promise.all([
-          this.screenLister().catch((e) => {
+        const [screenProbe, terminals] = await Promise.all([
+          this.screenLister().then(
+            (screens) => ({ screens, ok: true }),
+            (e) => {
             console.error(`[crew] reality: screen list failed:`, e);
-            return [] as ScreenSession[];
-          }),
+              return { screens: [] as ScreenSession[], ok: false };
+            },
+          ),
           this.terminalEnumerator().catch((e) => {
             console.error(`[crew] reality: terminal enumerate failed:`, e);
             return [] as TerminalSession[];
           }),
         ]);
         this.cached = {
-          screens: new Map(screens.map((s) => [s.name, s])),
+          screens: new Map(screenProbe.screens.map((s) => [s.name, s])),
+          screenProbeOk: screenProbe.ok,
           terminals: new Map(terminals.map((t) => [t.id, t])),
           at: this.now(),
         };
@@ -191,6 +212,12 @@ export class RealityLayer {
     const knownLocalScreens = new Set<string>();
 
     for (const row of rows) {
+      if (!snap.screenProbeOk) {
+        // Probe failure is ambiguous evidence, not death. Keep every row
+        // readable and do not feed anything into the destructive heal path.
+        live.push(row);
+        continue;
+      }
       if (row.machine_name !== localMachine) {
         // Another machine's reality — not ours to confirm or reap. Pass
         // through (federation verifies it remotely in a later phase). This
@@ -207,7 +234,7 @@ export class RealityLayer {
       // multi-writer skew class). crew-service's multi-UID lister owns their
       // liveness; we pass them through.
       const rowUid = manifestRunAsUid(row.spawn_manifest);
-      if (rowUid && rowUid !== (process.env.USER ?? "")) {
+      if (!screenNamespaceVerifiableHere(rowUid)) {
         live.push(row);
         continue;
       }

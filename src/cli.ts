@@ -29,7 +29,7 @@ Commands:
   launch  --json <path|->                  Launch a fresh agent. JSON opts fed to Orchestrator.launchAgent().
                                            Use '-' to read from stdin (preferred for secrets like AGENT_PRIVATE_KEY).
   resume  --json <path|->                  Resume a stopped agent.
-  close   <id> [--cc-session-id ID]        Gracefully close an agent (sends /exit + Enter, falls back to kill after 10s). Preferred over stop. Matches crew's agent_close MCP tool.
+  close   <id> [--cc-session-id ID]        Gracefully close an agent (/exit for Claude, SIGTERM for bridge runtimes, then verified cleanup). Preferred over stop. Matches crew's agent_close MCP tool.
   stop    <id> [--cc-session-id ID]        Hard-stop an agent (kills the screen session). Use only when the runtime is unresponsive. Matches crew's agent_stop MCP tool.
   agent-send <id> <text>                   Send keystrokes to an agent's screen.
   machine-register --json <path|->         Register a peer machine in this DB. JSON: {name, ssh_host, ssh_port?, notes?, skip_probe?}.
