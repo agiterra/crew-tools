@@ -154,7 +154,7 @@ export async function startServer(): Promise<void> {
         "Agents don't own rooms — they sit in them.\n" +
         "- To close a pane you no longer need: agent_detach first (if occupied), then pane_close.\n" +
         "- To stop watching an agent without closing the pane: agent_detach.\n" +
-        "- **To shut down an agent: prefer agent_close** — it sends `/exit` so the runtime exits cleanly and fires its SessionEnd hooks (e.g. ephemerals are removed from the wire dashboard immediately rather than greyed for an hour). Then pane_close if you want the pane gone too.\n" +
+        "- **To shut down an agent: prefer agent_close** — it uses the runtime's clean path (`/exit` for Claude Code, SIGTERM for bridge runtimes), verifies process-tree death, and fires runtime cleanup hooks when supported. Then pane_close if you want the pane gone too.\n" +
         "- agent_stop (hard kill) is for exceptional circumstances only — runtime is unresponsive, hung, or you specifically need to skip clean-shutdown hooks.\n" +
         "- NEVER close a pane you are sitting in — it will kill your process.",
     },
@@ -301,7 +301,7 @@ export async function startServer(): Promise<void> {
     {
       name: "agent_close",
       description:
-        "Gracefully close an agent. Sends `/exit` + Enter via screen so the runtime exits cleanly and fires its own SessionEnd hooks (which lets wire-aware adapters hard-delete ephemerals immediately rather than leaving them greyed for the reaper grace). Falls back to a hard kill if the runtime hasn't exited within 10s. The pane stays open — use pane_close if you want the pane gone too.\n\n**Prefer agent_close for normal shutdown.** Use agent_stop only when the runtime is unresponsive or you specifically need to skip clean-shutdown hooks.",
+        "Gracefully close an agent. Uses the runtime's clean shutdown path (`/exit` + Enter for Claude Code, SIGTERM to the process group for bridge runtimes), then verifies the tree is dead before deleting the row. Falls back to a hard kill if the runtime hasn't exited within 10s. The pane stays open — use pane_close if you want the pane gone too.\n\n**Prefer agent_close for normal shutdown.** Use agent_stop only when the runtime is unresponsive or you specifically need to skip clean-shutdown hooks.",
       inputSchema: {
         type: "object" as const,
         properties: {

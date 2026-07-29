@@ -209,6 +209,37 @@ async function reapTree(
 }
 
 /**
+ * Send SIGTERM to the agent process group and wait for a clean exit. Unlike
+ * reapTree, this gives runtimes with real signal handlers (notably Codex Wire
+ * bridge launchers) time to shut down their own app-server children before the
+ * caller decides whether to escalate to SIGKILL.
+ */
+async function terminateTree(
+  screenPid: number,
+  killPrefix: string,
+  timeoutMs: number,
+  run: (cmd: string) => Promise<string>,
+): Promise<number> {
+  const polls = Math.max(1, Math.ceil(timeoutMs / 250));
+  const snippet =
+    `c=$(pgrep -P ${screenPid} | head -1); ` +
+    `if [ -z "$c" ]; then echo "SURV=0"; else ` +
+    `g=$(ps -o pgid= -p "$c" | tr -d " "); ` +
+    `if [ -z "$g" ]; then echo "SURV=0"; else ` +
+    `${killPrefix} kill -TERM -"$g" 2>/dev/null; ` +
+    `i=0; while [ "$i" -lt ${polls} ]; do ` +
+    `n=$(pgrep -g "$g" 2>/dev/null | wc -l | tr -d " "); ` +
+    `if [ "$n" = "0" ]; then echo "SURV=0"; exit 0; fi; ` +
+    `sleep 0.25; i=$((i + 1)); ` +
+    `done; ` +
+    `echo "SURV=$(pgrep -g "$g" 2>/dev/null | wc -l | tr -d " ")"; ` +
+    `fi; fi`;
+  const out = await run(snippet);
+  const m = out.match(/SURV=(\d+)/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+/**
  * Kill a screen session owned by another UID (and/or on another host) — the
  * target-aware analogue of killSession. Reaps the whole agent process group,
  * then quits the screen wrapper. Returns surviving-process count (0 = clean).
@@ -221,6 +252,21 @@ export async function killRemoteSession(name: string, t: RemoteTarget): Promise<
   }
   await sshRun(t, `${remoteScreen(t)} -S ${name} -X quit; true`);
   return survivors;
+}
+
+/**
+ * Gracefully terminate a remote/cross-UID agent process group via SIGTERM.
+ * Does not quit the screen wrapper; callers should follow with killRemoteSession
+ * once the tree is confirmed dead or escalation is required.
+ */
+export async function terminateRemoteSessionTree(
+  name: string,
+  t: RemoteTarget,
+  timeoutMs = 10_000,
+): Promise<number> {
+  const pid = await getRemoteSessionPid(name, t);
+  if (!pid) return 0;
+  return terminateTree(pid, `sudo -n -u ${t.runAsUid}`, timeoutMs, (cmd) => sshRun(t, cmd));
 }
 
 /** PID of a named screen session on a remote host, or null. */
@@ -461,4 +507,18 @@ export async function killSession(name: string): Promise<number> {
   }
   await $`${SCREEN} -S ${name} -X quit`.quiet().nothrow();
   return survivors;
+}
+
+/**
+ * Gracefully terminate a local agent process group via SIGTERM. Does not quit
+ * the screen wrapper; callers should follow with killSession once the tree is
+ * confirmed dead or escalation is required.
+ */
+export async function terminateSessionTree(name: string, timeoutMs = 10_000): Promise<number> {
+  const pid = await getSessionPid(name);
+  if (!pid) return 0;
+  return terminateTree(pid, "", timeoutMs, async (cmd) => {
+    const r = await $`/bin/sh -c ${cmd}`.quiet().nothrow();
+    return r.stdout.toString();
+  });
 }

@@ -22,6 +22,7 @@ import { buildConfigDirSetup } from "./config-dir.js";
 // Default stays the per-user path for machines without the shared setup.
 const DEFAULT_DB = process.env.CREW_DB ?? join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
 const SCREEN_PREFIX = "wire-";
+const BRIDGE_TERM_TIMEOUT_MS = 10_000;
 
 function titleCase(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
@@ -243,6 +244,32 @@ export class Orchestrator {
   private async agentScreenAlive(agent: { screen_name: string; spawn_manifest: string | null; machine_name: string | null }): Promise<boolean> {
     const target = this.targetFor(agent);
     return target ? screen.isRemoteAlive(agent.screen_name, target) : screen.isAlive(agent.screen_name);
+  }
+
+  /** Runtimes whose normal shutdown is a typed slash command in the TUI. */
+  private runtimeUsesSlashExit(runtime: string): boolean {
+    return runtime === "claude-code";
+  }
+
+  /** Send SIGTERM to the runtime process group without quitting the screen wrapper. */
+  private async terminateAgentTree(
+    agent: { screen_name: string; spawn_manifest: string | null; machine_name: string | null },
+    target: screen.RemoteTarget | undefined,
+    timeoutMs: number,
+  ): Promise<number> {
+    return target
+      ? screen.terminateRemoteSessionTree(agent.screen_name, target, timeoutMs)
+      : screen.terminateSessionTree(agent.screen_name, timeoutMs);
+  }
+
+  /** Reap the runtime process group, then quit the screen wrapper. */
+  private async killAgentSession(
+    agent: { screen_name: string; spawn_manifest: string | null; machine_name: string | null },
+    target: screen.RemoteTarget | undefined,
+  ): Promise<number> {
+    return target
+      ? screen.killRemoteSession(agent.screen_name, target)
+      : screen.killSession(agent.screen_name);
   }
 
   /**
@@ -802,11 +829,10 @@ export class Orchestrator {
   /**
    * Close an agent gracefully.
    *
-   * Sends `/exit` + Enter to the agent's screen session. The runtime (Claude
-   * Code, Codex, etc.) handles the slash command and exits cleanly, which
-   * fires its own SessionEnd hooks — including any wire-disconnect cleanup
-   * that lets server-side state machines hard-delete ephemerals immediately
-   * instead of waiting on the reaper grace.
+   * Uses the runtime's clean shutdown path: `/exit` + Enter for Claude Code,
+   * SIGTERM to the process group for bridge runtimes such as Codex. Runtime
+   * hooks get a chance to run, then crew verifies the process tree is gone
+   * before deleting the row.
    *
    * Falls back to killing the screen if the runtime hasn't exited within
    * `timeoutMs` (default 10s). Caller gets the same end-state either way:
@@ -841,30 +867,43 @@ export class Orchestrator {
 
     const auxSurface = readAuxSurface(agent.spawn_manifest);
 
-    // Two sendKeys: type the slash command first, then press Enter. Splitting
-    // the keystrokes mirrors what a human types and avoids any runtime that
-    // might buffer-and-discard before the newline arrives.
     const target = this.targetFor(agent);
-    try {
-      if (target) {
-        await screen.sendRemoteKeys(agent.screen_name, "/exit", target);
-        await new Promise((r) => setTimeout(r, 100));
-        await screen.sendRemoteKeys(agent.screen_name, "\n", target);
-      } else {
-        await screen.sendKeys(agent.screen_name, "/exit");
-        await new Promise((r) => setTimeout(r, 100));
-        await screen.sendKeys(agent.screen_name, "\n");
+    if (this.runtimeUsesSlashExit(agent.runtime)) {
+      // Two sendKeys: type the slash command first, then press Enter. Splitting
+      // the keystrokes mirrors what a human types and avoids any runtime that
+      // might buffer-and-discard before the newline arrives.
+      try {
+        if (target) {
+          await screen.sendRemoteKeys(agent.screen_name, "/exit", target);
+          await new Promise((r) => setTimeout(r, 100));
+          await screen.sendRemoteKeys(agent.screen_name, "\n", target);
+        } else {
+          await screen.sendKeys(agent.screen_name, "/exit");
+          await new Promise((r) => setTimeout(r, 100));
+          await screen.sendKeys(agent.screen_name, "\n");
+        }
+      } catch (e) {
+        // Screen session may already be gone — fall through to cleanup.
+        console.error(`[crew] closeAgent: sendKeys failed for '${agent.id}': ${e}`);
       }
-    } catch (e) {
-      // Screen session may already be gone — fall through to cleanup.
-      console.error(`[crew] closeAgent: sendKeys failed for '${agent.id}': ${e}`);
-    }
 
-    // Wait for the runtime to exit on its own. Polls every 250ms.
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (!(await this.agentScreenAlive(agent))) break;
-      await new Promise((r) => setTimeout(r, 250));
+      // Wait for the runtime to exit on its own. Polls every 250ms.
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (!(await this.agentScreenAlive(agent))) break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    } else {
+      // Codex bridge stacks do not consume Claude's `/exit` command. Their
+      // clean path is SIGTERM to the screen child's process group; the bridge
+      // handler then tears down the app-server children before we quit screen.
+      const survivorsAfterTerm = await this.terminateAgentTree(agent, target, timeoutMs);
+      if (survivorsAfterTerm > 0) {
+        console.warn(
+          `[crew] closeAgent: '${agent.id}' runtime '${agent.runtime}' still had ` +
+            `${survivorsAfterTerm} process(es) after SIGTERM; escalating to hard reap.`,
+        );
+      }
     }
 
     // ALWAYS reap the process group + verify, even when the screen socket is
@@ -876,9 +915,7 @@ export class Orchestrator {
     // returns success, dashboard row vanishes, a 430MB claude keeps running;
     // madeleine/profiterole/fraisier, 2026-07-06). reap* returns the count of
     // processes still in the agent's group after SIGKILL.
-    const survivors = target
-      ? await screen.killRemoteSession(agent.screen_name, target)
-      : await screen.killSession(agent.screen_name);
+    const survivors = await this.killAgentSession(agent, target);
 
     if (survivors > 0) {
       // Fail LOUD and keep the row: a lingering, now-untracked process tree is
@@ -934,8 +971,25 @@ export class Orchestrator {
     const auxSurface = readAuxSurface(agent.spawn_manifest);
 
     const target = this.targetFor(agent);
-    if (target) await screen.killRemoteSession(agent.screen_name, target);
-    else await screen.killSession(agent.screen_name);
+    if (!this.runtimeUsesSlashExit(agent.runtime)) {
+      const survivorsAfterTerm = await this.terminateAgentTree(agent, target, BRIDGE_TERM_TIMEOUT_MS);
+      if (survivorsAfterTerm > 0) {
+        console.warn(
+          `[crew] stopAgent: '${agent.id}' runtime '${agent.runtime}' still had ` +
+            `${survivorsAfterTerm} process(es) after SIGTERM; escalating to hard reap.`,
+        );
+      }
+    }
+    const survivors = await this.killAgentSession(agent, target);
+    if (survivors > 0) {
+      console.error(
+        `[crew] stopAgent: '${agent.id}' left ${survivors} process(es) alive after SIGKILL — ` +
+          `NOT deleting its row (keeping it visible for manual reap).`,
+      );
+      throw new Error(
+        `stopAgent: '${agent.id}' process tree survived kill (${survivors} live) — row kept for diagnosis`,
+      );
+    }
     await this.cleanupAuxSurface(agent.id, auxSurface);
     // Leave a tombstone so agent_resume can reconstruct the spawn later.
     this.store.tombstoneAgent(agent);
