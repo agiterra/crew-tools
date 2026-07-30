@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import { CrewStore } from "./store";
-import { mkdtempSync, rmSync } from "fs";
+import { chmodSync, mkdtempSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -282,6 +282,63 @@ describe("migration", () => {
     } finally {
       if (prevDest === undefined) delete process.env.CREW_SVC_DEST;
       else process.env.CREW_SVC_DEST = prevDest;
+    }
+  });
+
+  test("CREW_RPC_DEST also opens readonly (a consumer configured the old way is still a consumer)", () => {
+    store.createTab("test");
+    const prev = process.env.CREW_RPC_DEST;
+    process.env.CREW_RPC_DEST = "crew-svc@patisserie";
+
+    try {
+      const reader = new CrewStore(dbPath);
+      expect(reader.readonly).toBe(true);
+      expect(reader.getTab("test")?.name).toBe("test");
+    } finally {
+      if (prev === undefined) delete process.env.CREW_RPC_DEST;
+      else process.env.CREW_RPC_DEST = prev;
+    }
+  });
+
+  // AGI-27: the permission probe is what makes tightening crews.db safe. A
+  // consumer nobody remembered to configure must degrade to readonly rather
+  // than throw out of the constructor on PRAGMA/migrate.
+  test("an existing db this uid cannot write opens readonly with no env config", () => {
+    store.createTab("test");
+    chmodSync(dbPath, 0o444);
+
+    try {
+      const reader = new CrewStore(dbPath);
+      expect(reader.readonly).toBe(true);
+      expect(reader.getTab("test")?.name).toBe("test");
+      expect(() => reader.createTab("write")).toThrow();
+    } finally {
+      chmodSync(dbPath, 0o644);
+    }
+  });
+
+  test("a MISSING db is still created read-write (absence is not unwritable)", () => {
+    const fresh = join(tmpDir, "fresh.db");
+    const created = new CrewStore(fresh);
+    expect(created.readonly).toBe(false);
+    expect(created.createTab("bootstrap").name).toBe("bootstrap");
+  });
+
+  test("explicit opts.readonly wins over the probe", () => {
+    store.createTab("test");
+    chmodSync(dbPath, 0o444);
+    try {
+      // Forcing readonly:false on an unwritable file must NOT be silently
+      // upgraded to readonly — the service wants to fail on the write, not
+      // quietly degrade into a reader.
+      const forced = new CrewStore(dbPath, { readonly: false });
+      expect(forced.readonly).toBe(false);
+      // NOTE: construction itself does NOT throw. On an already-migrated db the
+      // WAL pragma and the IF-NOT-EXISTS migrate steps perform no writes, so
+      // SQLite never takes a write lock. The failure surfaces on a real write.
+      expect(() => forced.createTab("write")).toThrow();
+    } finally {
+      chmodSync(dbPath, 0o644);
     }
   });
 });

@@ -6,10 +6,33 @@
  */
 
 import { Database } from "bun:sqlite";
+import { accessSync, constants, existsSync } from "fs";
 import { hostname } from "os";
 import { join } from "path";
 
 const DEFAULT_DB = process.env.CREW_DB ?? join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
+
+/**
+ * True when the db file exists but this uid cannot write it.
+ *
+ * This is the zero-config half of the readonly decision (AGI-27). The service
+ * owns crews.db and every other process routes writes through crew RPC, so a
+ * process that CANNOT write the file is by definition a consumer and must open
+ * readonly — otherwise the constructor's `PRAGMA journal_mode=WAL` + migrate()
+ * throw and take the caller down.
+ *
+ * Absence is deliberately NOT treated as unwritable: a missing db must still be
+ * creatable, or first-run bootstrap breaks.
+ */
+function existsButUnwritable(dbPath: string): boolean {
+  if (!existsSync(dbPath)) return false;
+  try {
+    accessSync(dbPath, constants.W_OK);
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 export type Tab = {
   name: string;
@@ -102,7 +125,18 @@ export class CrewStore {
   readonly readonly: boolean;
 
   constructor(dbPath: string = DEFAULT_DB, opts: { readonly?: boolean } = {}) {
-    this.readonly = opts.readonly ?? Boolean(process.env.CREW_SVC_DEST);
+    // Readonly when EITHER the caller is configured to route writes through
+    // crew RPC (both dest vars, not just the newer one — a consumer configured
+    // the old way is still a consumer) OR the file is simply not ours to write.
+    // The permission probe is what makes this safe to deploy: it covers every
+    // consumer on every uid and launch path, including ones nobody remembered
+    // to configure, so tightening crews.db degrades them to readonly instead of
+    // crashing them at construction.
+    const routesWritesViaRpc = Boolean(
+      process.env.CREW_SVC_DEST ?? process.env.CREW_RPC_DEST,
+    );
+    this.readonly = opts.readonly
+      ?? (routesWritesViaRpc || existsButUnwritable(dbPath));
     this.db = new Database(dbPath, this.readonly ? { readonly: true } : undefined);
     if (!this.readonly) {
       this.db.exec("PRAGMA journal_mode=WAL");
