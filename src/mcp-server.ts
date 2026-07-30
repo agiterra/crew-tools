@@ -76,7 +76,7 @@ export async function startServer(): Promise<void> {
       id: myAgent.id,
       name: myAgent.display_name,
       runtime: myAgent.runtime,
-      caller_session_id: await callerSession(),
+      caller_session_id: await callerContext(),
       cc_session_id: ccSessionId,
     }, `self-stamp ${myAgent.id} cc_session_id`)) {
       console.error(`[crew] self-stamped ${myAgent.id} cc_session_id=${ccSessionId.slice(0, 8)}\u2026`);
@@ -187,6 +187,22 @@ export async function startServer(): Promise<void> {
     const raw = process.env.ITERM_SESSION_ID;
     if (raw) return raw.split(":")[1];
     return undefined;
+  }
+
+  async function callerContext(): Promise<string | undefined> {
+    const sessionId = await callerSession();
+    const sty = process.env.STY;
+    if (!sty) return sessionId;
+    const dot = sty.indexOf(".");
+    if (dot < 0) return sessionId;
+    const screenName = sty.slice(dot + 1);
+    const screenPid = Number.parseInt(sty.slice(0, dot), 10);
+    return JSON.stringify({
+      terminal_session_id: sessionId,
+      screen_name: screenName || undefined,
+      screen_pid: Number.isFinite(screenPid) ? screenPid : undefined,
+      sty,
+    });
   }
 
   const mcp = new Server(
@@ -769,7 +785,7 @@ export async function startServer(): Promise<void> {
             id: a.id as string,
             name: a.name as string,
             runtime: a.runtime as string | undefined,
-            caller_session_id: await callerSession(),
+            caller_session_id: await callerContext(),
             cc_session_id: (a.cc_session_id as string | undefined) ?? ccSessionId ?? undefined,
           });
           break;

@@ -7,6 +7,9 @@
 
 import { Database } from "bun:sqlite";
 import { hostname } from "os";
+import { join } from "path";
+
+const DEFAULT_DB = process.env.CREW_DB ?? join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
 
 export type Tab = {
   name: string;
@@ -96,11 +99,15 @@ export type AgentTombstone = {
 
 export class CrewStore {
   private db: Database;
+  readonly readonly: boolean;
 
-  constructor(dbPath: string) {
-    this.db = new Database(dbPath);
-    this.db.exec("PRAGMA journal_mode=WAL");
-    this.migrate();
+  constructor(dbPath: string = DEFAULT_DB, opts: { readonly?: boolean } = {}) {
+    this.readonly = opts.readonly ?? Boolean(process.env.CREW_SVC_DEST);
+    this.db = new Database(dbPath, this.readonly ? { readonly: true } : undefined);
+    if (!this.readonly) {
+      this.db.exec("PRAGMA journal_mode=WAL");
+      this.migrate();
+    }
   }
 
   private migrate(): void {

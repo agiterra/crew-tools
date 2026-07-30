@@ -400,13 +400,36 @@ describe("spawn manifest + tombstones", () => {
       projectDir: "/tmp/bridge",
     });
 
-    await orch.closeAgent("bridge", undefined, 250);
+    const result = await orch.closeAgent("bridge", undefined, 250);
 
+    expect(result.fallbackUsed).toBe(false);
     expect(screenState.sendKeysLog).toEqual([]);
     expect(screenState.terminateSessionCalls).toEqual([{ name: "wire-bridge", timeoutMs: 250 }]);
     expect(screenState.killSessionCalls).toEqual(["wire-bridge"]);
     expect(orch.store.getAgent("bridge")).toBeNull();
     expect(orch.store.getLatestTombstone("bridge")).not.toBeNull();
+  });
+
+  test("closeAgent reports fallback when graceful slash-exit times out", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "slow-close" },
+      runtime: "claude-code",
+      projectDir: "/tmp/slow-close",
+    });
+    screenState.isAliveResult = true;
+    try {
+      const result = await orch.closeAgent("slow-close", undefined, 0);
+
+      expect(result.fallbackUsed).toBe(true);
+      expect(screenState.sendKeysLog).toEqual([
+        { name: "wire-slow-close", keys: "/exit" },
+        { name: "wire-slow-close", keys: "\n" },
+      ]);
+      expect(screenState.killSessionCalls).toEqual(["wire-slow-close"]);
+      expect(orch.store.getAgent("slow-close")).toBeNull();
+    } finally {
+      screenState.isAliveResult = false;
+    }
   });
 
   test("stopAgent terminates codex bridge runtimes before the final hard reap", async () => {
@@ -625,6 +648,33 @@ describe("resumeAgent", () => {
 });
 
 describe("registerAgent id-mismatch safety", () => {
+  test("uses caller-passed screen context when the service process has no STY", async () => {
+    const prevSty = process.env.STY;
+    delete process.env.STY;
+    screenState.isAliveResult = true;
+    try {
+      const agent = await orch.registerAgent({
+        id: "brioche",
+        displayName: "Brioche",
+        runtime: "codex",
+        callerSessionId: JSON.stringify({
+          terminal_session_id: "iterm-session-1",
+          screen_name: "wire-brioche",
+          screen_pid: 25789,
+          sty: "25789.wire-brioche",
+        }),
+      });
+
+      expect(agent.screen_name).toBe("wire-brioche");
+      expect(agent.screen_pid).toBe(25789);
+      expect(agent.pane).toBeNull();
+    } finally {
+      if (prevSty === undefined) delete process.env.STY;
+      else process.env.STY = prevSty;
+      screenState.isAliveResult = false;
+    }
+  });
+
   test("throws when caller id doesn't match the agent owning the screen", async () => {
     // Simulate Brioche running in screen 'wire-brioche' with an existing row
     await orch.launchAgent({ env: { AGENT_ID: "brioche", AGENT_NAME: "Brioche" } });

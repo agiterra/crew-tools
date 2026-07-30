@@ -72,6 +72,11 @@ export type SpawnManifest = {
   run_as_uid?: string;
 };
 
+export type CloseAgentResult = {
+  /** True when close had to move past the graceful path and reap the screen. */
+  fallbackUsed: boolean;
+};
+
 /** Escape a string for use in a shell command. */
 function shellEscape(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
@@ -107,6 +112,44 @@ function readAuxSurface(spawnManifest: string | null): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+type RegisterCallerContext = {
+  terminalSessionId?: string;
+  screenName?: string;
+  screenPid?: number;
+};
+
+function parseRegisterCallerContext(raw: string | undefined): RegisterCallerContext {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as {
+      terminal_session_id?: unknown;
+      screen_name?: unknown;
+      screen_pid?: unknown;
+      sty?: unknown;
+    };
+    if (parsed && typeof parsed === "object") {
+      let screenName = typeof parsed.screen_name === "string" ? parsed.screen_name : undefined;
+      let screenPid = typeof parsed.screen_pid === "number" && Number.isFinite(parsed.screen_pid) ? parsed.screen_pid : undefined;
+      if ((!screenName || !screenPid) && typeof parsed.sty === "string") {
+        const dot = parsed.sty.indexOf(".");
+        if (dot >= 0) {
+          screenName ??= parsed.sty.slice(dot + 1) || undefined;
+          const pid = Number.parseInt(parsed.sty.slice(0, dot), 10);
+          if (Number.isFinite(pid)) screenPid ??= pid;
+        }
+      }
+      return {
+        terminalSessionId: typeof parsed.terminal_session_id === "string" ? parsed.terminal_session_id : undefined,
+        screenName,
+        screenPid,
+      };
+    }
+  } catch {
+    // Backward compatibility: pre-v2.24 callers pass the terminal session id directly.
+  }
+  return { terminalSessionId: raw };
 }
 
 /**
@@ -728,8 +771,8 @@ export class Orchestrator {
 
   /**
    * Register an already-running agent (self-registration).
-   * The agent detects its own screen session from STY env var.
-   * If callerSessionId is provided, auto-links to the pane owning that session.
+   * The caller passes its screen/session context over RPC. If omitted, legacy
+   * same-process callers still fall back to STY.
    */
   async registerAgent(opts: {
     id: string;
@@ -740,15 +783,19 @@ export class Orchestrator {
   }): Promise<Agent> {
     const runtime = opts.runtime ?? "claude-code";
     const ccSessionId = opts.ccSessionId ?? getClaudeCodeSessionId() ?? undefined;
+    const callerContext = parseRegisterCallerContext(opts.callerSessionId);
 
-    // Detect screen session from STY (format: "pid.name")
-    const sty = process.env.STY;
-    if (!sty) throw new Error("not running in a screen session (STY not set)");
-    const [pidStr, ...nameParts] = sty.split(".");
-    const screenName = nameParts.join(".");
-    const screenPid = parseInt(pidStr, 10);
-    if (!screenName || isNaN(screenPid)) {
-      throw new Error(`cannot parse STY: ${sty}`);
+    let screenName = callerContext.screenName;
+    let screenPid = callerContext.screenPid;
+    if (!screenName || !screenPid) {
+      const sty = process.env.STY;
+      if (!sty) throw new Error("not running in a screen session (STY not set and caller screen context not supplied)");
+      const [pidStr, ...nameParts] = sty.split(".");
+      screenName = nameParts.join(".");
+      screenPid = parseInt(pidStr, 10);
+      if (!screenName || isNaN(screenPid)) {
+        throw new Error(`cannot parse STY: ${sty}`);
+      }
     }
 
     // Verify screen session is alive
@@ -768,16 +815,16 @@ export class Orchestrator {
     // for detached screens — the caller can agent_attach explicitly later.
     let callerPane: string | null = null;
     const attached = await screen.isAttached(screenName);
-    if (opts.callerSessionId && attached) {
+    if (callerContext.terminalSessionId && attached) {
       // Pane auto-link is COSMETIC; the identity row below is load-bearing.
       // autoRegisterPane enumerates iTerm via AppleScript, which fails from
       // any account outside the GUI user's session (-1728/-10810) — personas
       // on per-UID homes hit this on every self-register. Never let the
       // pane-link kill the registration; log and register pane-less.
       try {
-        callerPane = this.store.listPanes().find((p) => p.iterm_id === opts.callerSessionId)?.name ?? null;
+        callerPane = this.store.listPanes().find((p) => p.iterm_id === callerContext.terminalSessionId)?.name ?? null;
         if (!callerPane) {
-          callerPane = await this.autoRegisterPane(opts.callerSessionId);
+          callerPane = await this.autoRegisterPane(callerContext.terminalSessionId);
         }
       } catch (e) {
         console.error(
@@ -841,7 +888,7 @@ export class Orchestrator {
    * Prefer this over stopAgent for normal lifecycle. stopAgent is for cases
    * where the runtime is unresponsive or you specifically want a hard kill.
    */
-  async closeAgent(id: string, ccSessionId?: string, timeoutMs = 10_000): Promise<void> {
+  async closeAgent(id: string, ccSessionId?: string, timeoutMs = 10_000): Promise<CloseAgentResult> {
     let agent: Agent | null;
     if (ccSessionId) {
       agent = this.store.getAgentBySession(ccSessionId);
@@ -868,6 +915,7 @@ export class Orchestrator {
     const auxSurface = readAuxSurface(agent.spawn_manifest);
 
     const target = this.targetFor(agent);
+    let fallbackUsed = false;
     if (this.runtimeUsesSlashExit(agent.runtime)) {
       // Two sendKeys: type the slash command first, then press Enter. Splitting
       // the keystrokes mirrors what a human types and avoids any runtime that
@@ -889,15 +937,22 @@ export class Orchestrator {
 
       // Wait for the runtime to exit on its own. Polls every 250ms.
       const deadline = Date.now() + timeoutMs;
+      let aliveAfterGrace = true;
       while (Date.now() < deadline) {
-        if (!(await this.agentScreenAlive(agent))) break;
+        aliveAfterGrace = await this.agentScreenAlive(agent);
+        if (!aliveAfterGrace) break;
         await new Promise((r) => setTimeout(r, 250));
       }
+      if (aliveAfterGrace) {
+        aliveAfterGrace = await this.agentScreenAlive(agent);
+      }
+      fallbackUsed = aliveAfterGrace;
     } else {
       // Codex bridge stacks do not consume Claude's `/exit` command. Their
       // clean path is SIGTERM to the screen child's process group; the bridge
       // handler then tears down the app-server children before we quit screen.
       const survivorsAfterTerm = await this.terminateAgentTree(agent, target, timeoutMs);
+      fallbackUsed = survivorsAfterTerm > 0;
       if (survivorsAfterTerm > 0) {
         console.warn(
           `[crew] closeAgent: '${agent.id}' runtime '${agent.runtime}' still had ` +
@@ -934,6 +989,7 @@ export class Orchestrator {
 
     this.store.tombstoneAgent(agent);
     this.store.deleteAgentByScreen(agent.screen_name);
+    return { fallbackUsed };
   }
 
   /**
