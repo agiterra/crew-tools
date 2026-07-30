@@ -24,6 +24,7 @@ export type CrewRpcWriterOptions = {
 
 function resolveDest(opts: CrewRpcWriterOptions): string {
   if (opts.dest) return opts.dest;
+  if (process.env.CREW_SVC_DEST) return process.env.CREW_SVC_DEST;
   if (process.env.CREW_RPC_DEST) return process.env.CREW_RPC_DEST;
   const store = new CrewStore(opts.dbPath);
   return `crew-svc@${store.localMachineName()}`;

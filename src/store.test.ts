@@ -268,4 +268,20 @@ describe("migration", () => {
     store2.createTab("test");
     expect(store2.getTab("test")).not.toBeNull();
   });
+
+  test("CREW_SVC_DEST opens existing DB readonly for consumers", () => {
+    store.createTab("test");
+    const prevDest = process.env.CREW_SVC_DEST;
+    process.env.CREW_SVC_DEST = "crew-svc@patisserie";
+
+    try {
+      const reader = new CrewStore(dbPath);
+      expect(reader.readonly).toBe(true);
+      expect(reader.getTab("test")?.name).toBe("test");
+      expect(() => reader.createTab("write")).toThrow();
+    } finally {
+      if (prevDest === undefined) delete process.env.CREW_SVC_DEST;
+      else process.env.CREW_SVC_DEST = prevDest;
+    }
+  });
 });
