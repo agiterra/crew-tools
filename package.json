@@ -19,6 +19,7 @@
   "license": "MIT",
   "author": "Tim Garthwaite <https://github.com/mividtim>",
   "dependencies": {
+    "@agiterra/wire-tools": "agiterra/wire-tools#v2.17.1",
     "@modelcontextprotocol/sdk": "^1.29.0"
   }
 }

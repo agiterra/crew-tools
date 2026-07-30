@@ -12,3 +12,4 @@ export { pickName, isValidTheme, THEME_NAMES, backgroundImagePath, loadTheme, li
 export { startServer } from "./mcp-server.js";
 export { runCli } from "./cli.js";
 export { getClaudeCodeSessionId } from "./claude-session.js";
+export { createCrewRpcWriter, type CrewRpcWriter, type CrewRpcWriterOptions } from "./crew-rpc.js";
