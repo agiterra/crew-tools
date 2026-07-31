@@ -37,6 +37,11 @@ export const SCREEN = await findScreen();
 export type ScreenSession = {
   name: string;
   pid: number;
+  /**
+   * Raw state from `screen -ls`: "Attached", "Detached", "Remote or dead".
+   * Captured because the parser used to DISCARD it -- see isAlive.
+   */
+  state?: string;
 };
 
 /**
@@ -329,9 +334,9 @@ export async function listSessions(): Promise<ScreenSession[]> {
     const sessions: ScreenSession[] = [];
     for (const line of output.split("\n")) {
       // Format: "	12345.name	(Detached)" or "(Attached)"
-      const match = line.match(/^\t(\d+)\.(\S+)\t/);
+      const match = line.match(/^\t(\d+)\.(\S+)\t\s*(?:\(([^)]*)\))?/);
       if (match) {
-        sessions.push({ name: match[2], pid: parseInt(match[1]) });
+        sessions.push({ name: match[2], pid: parseInt(match[1]), state: match[3] });
       }
     }
     return sessions;
@@ -394,7 +399,30 @@ export async function isAttached(name: string): Promise<boolean> {
  * Check if a screen session is alive.
  */
 export async function isAlive(name: string): Promise<boolean> {
-  return (await getSessionPid(name)) !== null;
+  const pid = await getSessionPid(name);
+  if (pid === null) return false;
+
+  // A SOCKET IS NOT A SESSION. `screen -ls` lists dead sockets as
+  // "(Remote or dead)" and listSessions used to DISCARD the state field, so any
+  // leftover socket counted as alive. Measured 2026-07-31: 17 of 24 roster rows
+  // reported screen_alive with no live session, and the ED nearly double-staffed
+  // a ticket because a corpse still claimed it.
+  //
+  // The state label alone is NOT a safe discriminator -- "Remote or dead" is
+  // ambiguous by its own wording, and this repo fails OPEN on ambiguity because
+  // the opposite error (AGI-69) reported a LIVE agent as dead. The PID is
+  // unambiguous: no such process is PROVABLE death.
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    // EPERM means the process EXISTS but belongs to another uid -- these screens
+    // are owned by _ephemeral while callers may run as another user. That is
+    // ALIVE. Treating it as dead would resurrect exactly the AGI-69 harm.
+    if (e?.code === "EPERM") return true;
+    if (e?.code === "ESRCH") return false;
+    return true; // inconclusive -> fail OPEN, per the repo standing rule
+  }
 }
 
 /**
