@@ -8,8 +8,8 @@
  */
 
 import { $ } from "bun";
-import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
-import { join } from "path";
+import { accessSync, constants, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "path";
 
 // Resolve screen binary: prefer homebrew 5.x (color support) over macOS built-in 4.0.
 // macOS screen 4.0 and homebrew screen 5.x use DIFFERENT default socket directories
@@ -38,6 +38,114 @@ export type ScreenSession = {
   name: string;
   pid: number;
 };
+
+/**
+ * Explain WHY a launch produced no screen session.
+ *
+ * ★★★ WHY THIS EXISTS (AGI-43). `createSession` threw a bare
+ * "screen session '<name>' failed to start" for every failure. That message
+ * names a SYMPTOM and destroys the CAUSE:
+ *
+ *   - the launch script `rm -f`s itself on its first line (deliberate — it
+ *     embeds AGENT_PRIVATE_KEY), so there is nothing left to inspect;
+ *   - the command is an interactive TUI inside screen, so its stdout/stderr
+ *     CANNOT be redirected to a log without breaking every spawn;
+ *   - screen `-dmS` reports nothing about a child that exited.
+ *
+ * ★★ The message was ALSO read as a poll bug, and it is not one. Verified
+ * 2026-08-01: a trivial `sleep 60` through the identical mechanism is detected
+ * in ~200ms, and `screen -ls` lists a session regardless of what the program
+ * inside is doing — so "the agent sits at the dev-channel prompt during the
+ * poll window" cannot make it disappear. `pollSessionPid` returning null is a
+ * TRUE negative: the session really did exit. The defect was never the poll —
+ * it was that the launcher's reason went unrecorded, so an unreachable-path
+ * failure and a crashed-agent failure printed the same sentence.
+ *
+ * ⇒ We cannot capture the child's output, so we reconstruct what we still can:
+ * whether the thing we asked it to run was reachable AT ALL, checked as the
+ * uid that just tried to run it.
+ *
+ * ⚠️ NEVER interpolate `command` into the result. It carries AGENT_PRIVATE_KEY
+ * in its export prologue; an error string flows to logs, MCP responses and
+ * dashboards. Only paths matched out of it are echoed, never the raw text.
+ */
+export function diagnoseLaunchFailure(command: string): string {
+  // Absolute paths that look like something we were asked to EXECUTE. Extension
+  // -anchored on purpose: a bare `claude --flag` has no path to check, and
+  // saying so is more honest than silently finding nothing.
+  const candidates = [...new Set(command.match(/\/[A-Za-z0-9._\/-]+\.(?:sh|ts|js|mjs|py)\b/g) ?? [])];
+  if (candidates.length === 0) {
+    return "no absolute launcher path appears in the command, so reachability could NOT be checked — this is UNKNOWN, not a clean bill of health.";
+  }
+
+  const problems: string[] = [];
+  for (const p of candidates) {
+    // ★★★ REACHABILITY IS TESTED **BEFORE** EXISTENCE, AND THE ORDER IS THE
+    // WHOLE POINT. `existsSync` needs to traverse the path to answer, so behind
+    // an untraversable ancestor it returns FALSE for a file that is really
+    // there. My first cut checked existence first and reported "does not
+    // exist" for a 0755 launcher sitting inside a 0700 directory — the exact
+    // AGI-43 case, and a CONFIDENTLY WRONG cause that sends the reader hunting
+    // for a missing file. That is worse than the vague message this replaces:
+    // a wrong cause outranks no cause in how far it travels.
+    //
+    // ★ ACCESS IS A CONJUNCTION OVER THE WHOLE PATH. A launcher can be 0755 and
+    // still be unreachable because an ANCESTOR denies traversal — runtimes.json
+    // pointed at /Users/tim/.wire/*.sh with /Users/tim at 0750 and .wire at
+    // 0700. Checking only the file's own mode reports "fine" for a path this
+    // uid can never reach.
+    // ⚠️ accessSync throws for BOTH "no such directory" (ENOENT) and "permission
+    // denied" (EACCES), and those are OPPOSITE answers: one means the path is
+    // genuinely absent, the other means its existence is unknowable from here.
+    // Discriminating on the THROW alone collapses them — the same mistake as
+    // reading `screen -ls` exit 1 as a probe failure when it encodes "empty".
+    // Only the errno separates them.
+    let blocked: string | null = null;
+    let missingAncestor: string | null = null;
+    for (let d = dirname(p); ; d = dirname(d)) {
+      try {
+        accessSync(d, constants.X_OK);
+      } catch (err) {
+        // Structural cast, not NodeJS.ErrnoException: that namespace appears
+        // nowhere else in this repo and needs @types/node to resolve.
+        if ((err as { code?: string }).code === "ENOENT") missingAncestor = d;
+        else blocked = d;
+        break;
+      }
+      if (d === "/" || dirname(d) === d) break;
+    }
+    if (missingAncestor) {
+      problems.push(`${p}: does not exist (its parent directory ${missingAncestor} is itself absent — not a permission problem)`);
+      continue;
+    }
+    if (blocked) {
+      // Deliberately does NOT claim the file exists — from here that is
+      // unknowable, and asserting either way would be the same error again.
+      problems.push(
+        `${p}: this uid cannot traverse ${blocked} (ancestor denies +x). Whether the file exists is UNKNOWABLE from this uid — the file's own mode is irrelevant while an ancestor blocks the path`,
+      );
+      continue;
+    }
+    if (!existsSync(p)) {
+      // Only trustworthy now that every ancestor is known traversable.
+      problems.push(`${p}: does not exist (path is fully traversable by this uid, so this absence is real)`);
+      continue;
+    }
+    try {
+      accessSync(p, constants.X_OK);
+    } catch {
+      problems.push(`${p}: exists and is reachable, but is not executable by this uid`);
+    }
+  }
+
+  if (problems.length === 0) {
+    // ★ Reachable is not runnable. Say which question was answered — an
+    // unqualified "checked, fine" would read as "the launcher works".
+    return `every launcher path in the command exists and is executable by this uid (${candidates.join(", ")}), so the failure is INSIDE the command, not in reaching it.`;
+  }
+  // Report ALL of them: the first problem found is not necessarily the only one.
+  return `launcher unreachable — ${problems.join("; ")}`;
+}
 
 /**
  * Create a detached screen session running a command.
@@ -81,7 +189,14 @@ export async function createSession(
   // Poll instead.
   const pid = await pollSessionPid(name);
   if (pid === null) {
-    throw new Error(`screen session '${name}' failed to start`);
+    // The session is gone, so the child already exited. Say what we can still
+    // establish about WHY (see diagnoseLaunchFailure) instead of naming only
+    // the symptom — this sentence is usually the sole artifact of the failure.
+    throw new Error(
+      `screen session '${name}' failed to start (the session exited before it could be listed; ` +
+        `the poll is not at fault — a live session is listed regardless of what runs inside it). ` +
+        `Diagnosis: ${diagnoseLaunchFailure(command)}`,
+    );
   }
   return { name, pid };
 }
