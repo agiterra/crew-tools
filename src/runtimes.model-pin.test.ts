@@ -12,6 +12,15 @@ import { expandCommand } from "./runtimes";
 // machine with a local claude-code override it would assert about that override and
 // PASS while the built-in regressed. DEFAULTS is not exported; the file is the only
 // honest surface for "what does the built-in say".
+// ⚠️ SCOPE BOUNDARY, recorded so it is not mistaken for covered: this fixes the
+// LAUNCHER default only. Per-seat model selection via the Agent tool ('sonnet',
+// 'opus') resolves in the harness/API layer, NOT here — no shared code path. On
+// 2026-08-02 three seats given an IDENTICAL 'sonnet' override read back two
+// different ids (claude-sonnet-5 vs claude-sonnet-4-5-20250929). That is either
+// non-deterministic alias resolution or unreliable self-reporting, and NOTHING in
+// this file addresses either. Measured: Agent-tool seats are in-process contexts,
+// not OS processes (a lane with 8 seats shows 1 claude process), so there is no
+// ps-equivalent independent check for them.
 const SRC = readFileSync(join(import.meta.dir, "runtimes.ts"), "utf8");
 const claudeCmd = SRC.match(
   /"claude-code"\s*:\s*\{\s*command:\s*"([^"]+)"/,
