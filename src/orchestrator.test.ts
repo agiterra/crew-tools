@@ -20,6 +20,10 @@ const screenState = {
   screens: {} as Record<string, { queue: string[]; fallback: string }>,
   sendKeysLog: [] as Array<{ name: string; keys: string }>,
   sendKeysHook: null as ((name: string, keys: string) => void) | null,
+  // When set, readOutput/readRemoteOutput call this first — lets a test make
+  // reads THROW (distinct from reads returning empty; the confirm counts them
+  // separately since the 2026-08-04 RCA).
+  readOutputHook: undefined as (() => void) | undefined,
   killSessionCalls: [] as string[],
   killSessionSurvivors: 0,
   terminateSessionCalls: [] as Array<{ name: string; timeoutMs: number }>,
@@ -40,6 +44,7 @@ mock.module("./screen", () => ({
     screenState.sendKeysHook?.(name, keys);
   },
   readOutput: async (name: string) => {
+    screenState.readOutputHook?.();
     const s = screenState.screens[name];
     if (!s) return "";
     return s.queue.length > 0 ? s.queue.shift()! : s.fallback;
@@ -61,6 +66,7 @@ mock.module("./screen", () => ({
     screenState.sendKeysHook?.(name, keys);
   },
   readRemoteOutput: async (name: string) => {
+    screenState.readOutputHook?.();
     const s = screenState.screens[name];
     if (!s) return "";
     return s.queue.length > 0 ? s.queue.shift()! : s.fallback;
@@ -128,6 +134,7 @@ beforeEach(() => {
   screenState.screens = {};
   screenState.sendKeysLog.length = 0;
   screenState.sendKeysHook = null;
+  screenState.readOutputHook = undefined;
   screenState.killSessionCalls.length = 0;
   screenState.killSessionSurvivors = 0;
   screenState.terminateSessionCalls.length = 0;
@@ -700,12 +707,29 @@ describe("registerAgent id-mismatch safety", () => {
 });
 
 describe("nearest-ancestor .env sourcing (cc-launch.sh fold)", () => {
+  test("claude-code spawns get CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false; caller override wins; codex untouched", async () => {
+    // Tim's fleet-wide directive 2026-08-04: suggestion chrome reads as
+    // operator input in hardcopies and volunteered policy waivers into lanes.
+    await orch.launchAgent({ env: { AGENT_ID: "nosugg" } });
+    expect(createSessionCalls.at(-1)!.command).toMatch(/CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION='?false'?/);
+
+    await orch.launchAgent({ env: { AGENT_ID: "yessugg", CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "true" } });
+    expect(createSessionCalls.at(-1)!.command).toMatch(/CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION='?true'?/);
+    expect(createSessionCalls.at(-1)!.command).not.toMatch(/CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION='?false'?/);
+
+    await orch.launchAgent({ env: { AGENT_ID: "codexy" }, runtime: "codex" });
+    expect(createSessionCalls.at(-1)!.command).not.toContain("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION");
+  });
+
   test("launch command sources .env after the env exports, before the runtime command", async () => {
     await orch.launchAgent({ env: { AGENT_ID: "envy" } });
 
     const cmd = createSessionCalls[0]!.command;
     expect(cmd).toContain(SOURCE_NEAREST_ENV);
-    const exportsIdx = cmd.indexOf("export AGENT_ID");
+    // Anchor on AGENT_ID= (not "export AGENT_ID"): crew injects its own
+    // claude-code defaults (CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION) ahead of the
+    // caller env, so AGENT_ID is no longer first in the export list.
+    const exportsIdx = cmd.indexOf("AGENT_ID=");
     const sourceIdx = cmd.indexOf(SOURCE_NEAREST_ENV);
     expect(exportsIdx).toBeGreaterThan(-1);
     // .env values must win a collision with the forwarded env map —
@@ -816,6 +840,67 @@ describe("autoConfirmDevChannel — verify-after-confirm", () => {
     const row = orch.store.getAgent("halfboot");
     expect(row?.status_name).toBe("dev-channel-confirm-failed");
     expect(row?.status_desc).toContain("nothing will confirm it");
+  });
+
+  test("TWO sequential dialogs (trust, then dev-channel) both get confirmed", async () => {
+    // The 2026-08-04 RCA hazard: dialogs share the marker and appear in
+    // sequence; a confirm that returns on first clear leaves dialog #2
+    // standing and the channel plugin never loads.
+    const TRUST_SCREEN = "Quick safety check: Is this a project you trust?\n  Enter to confirm · Esc to cancel";
+    screenState.screens["dvc"] = { queue: [TRUST_SCREEN], fallback: MARKER_SCREEN };
+    screenState.sendKeysHook = (name, keys) => {
+      if (name === "dvc" && keys === "\r" && crs() >= 2) {
+        screenState.screens["dvc"]!.fallback = BOOTED_SCREEN;
+      }
+    };
+
+    const ok = await autoConfirmDevChannel("dvc", "twodialogs", { appearMs: 3_000, clearMs: 800 });
+
+    expect(ok).toBe(true);
+    expect(crs()).toBe(2); // one Enter per dialog
+  });
+
+  test("booted WITH channel banner → boot-gate-ok status (outcome recorded, not just ceremony)", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "bannered" } });
+    const BOOTED_WITH_CHANNEL = "▎ Channels (experimental) messages from plugin:wire@agiterra inject directly\n❯ \n  ⏵⏵ bypass permissions on";
+    screenState.screens["dvc"] = { queue: [MARKER_SCREEN], fallback: BOOTED_WITH_CHANNEL };
+
+    const ok = await autoConfirmDevChannel("dvc", "bannered", {
+      store: orch.store, agentId: "bannered", appearMs: 2_000, clearMs: 800,
+    });
+
+    expect(ok).toBe(true);
+    const row = orch.store.getAgent("bannered");
+    expect(row?.status_name).toBe("boot-gate-ok");
+    expect(row?.status_desc).toContain("channel banner present");
+  });
+
+  test("booted WITHOUT channel banner → wire-channel-absent status (the wire-blind half-boot, loud)", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "blindboot" } });
+    screenState.screens["dvc"] = { queue: [], fallback: BOOTED_SCREEN };
+
+    const ok = await autoConfirmDevChannel("dvc", "blindboot", {
+      store: orch.store, agentId: "blindboot", appearMs: 2_000,
+    });
+
+    expect(ok).toBe(true); // session IS up — but the status says what's missing
+    const row = orch.store.getAgent("blindboot");
+    expect(row?.status_name).toBe("wire-channel-absent");
+    expect(row?.status_desc).toContain("wire-blind");
+  });
+
+  test("read failures are counted distinctly in the failure detail (no swallowed-error ambiguity)", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "readfail" } });
+    screenState.readOutputHook = () => { throw new Error("boom"); };
+
+    const ok = await autoConfirmDevChannel("dvc", "readfail", {
+      store: orch.store, agentId: "readfail", appearMs: 500, clearMs: 200,
+    });
+
+    expect(ok).toBe(false);
+    const row = orch.store.getAgent("readfail");
+    expect(row?.status_desc).toMatch(/\d+ threw/);
+    screenState.readOutputHook = undefined;
   });
 
   test("prompt stuck through all retries → false + status records the stuck prompt", async () => {

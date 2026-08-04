@@ -36,6 +36,13 @@ describe("claude-code DEFAULT model pin (asserted against the source literal)", 
     expect(claudeCmd!.toLowerCase()).not.toContain("fable");
   });
 
+  test("ACCEPT: the built-in defers to CLAUDE_EFFORT (explicit flag beats ambient env inheritance)", () => {
+    // 2026-08-04 RCA defect C: no launcher passed --effort, so lanes inherited
+    // whatever CLAUDE_EFFORT sat in the ORCHESTRATOR's process env — nobody's
+    // per-spawn intent was consumed.
+    expect(claudeCmd).toContain("--effort ${CLAUDE_EFFORT:-");
+  });
+
   test("ACCEPT: the built-in defers to CLAUDE_MODEL", () => {
     expect(claudeCmd).toContain("${CLAUDE_MODEL:-");
   });

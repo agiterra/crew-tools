@@ -181,65 +181,113 @@ export async function autoConfirmDevChannel(
   opts: { store?: CrewStore; agentId?: string; appearMs?: number; clearMs?: number; remote?: screen.RemoteTarget } = {},
 ): Promise<boolean> {
   const marker = "Enter to confirm";
-  // CC renders its normal input UI only after the dev-channel gate, so
-  // either footer hint appearing without the marker means no prompt is
-  // coming this boot.
-  const bootedWithoutPrompt = (buf: string) =>
-    !buf.includes(marker) && (buf.includes("? for shortcuts") || buf.includes("⏵⏵"));
+  // CC's boot can present SEVERAL sequential "Enter to confirm" dialogs sharing
+  // one marker: folder-trust, dev-channel consent, and (2026-08-04) the
+  // Fable-usage-credits modal. The OLD logic returned true on the FIRST
+  // marker-clear — accepting dialog #1 and leaving dialog #2 standing, with the
+  // dev-channel plugin silently never loading (2026-08-04 RCA). So: keep
+  // confirming until the normal input UI renders with no marker, up to a
+  // dialog cap. Pressing Enter takes each dialog's highlighted default, which
+  // is the sane unattended choice for all three known dialogs (trust the
+  // seeded project dir; enable the requested channel; continue on the
+  // non-credit model).
+  const footer = (buf: string) => buf.includes("? for shortcuts") || buf.includes("⏵⏵");
+  const channelBanner = (buf: string) => buf.includes("Channels (experimental)");
   // Screen accessors — remote (ssh + sudo -u) for a cross-machine agent, else local.
   const read = () => (opts.remote ? screen.readRemoteOutput(screenName, opts.remote) : screen.readOutput(screenName));
   const sendByte = (b: string) => (opts.remote ? screen.sendRemoteKeys(screenName, b, opts.remote) : screen.sendKeys(screenName, b));
   const appearDeadline = Date.now() + (opts.appearMs ?? 120_000);
+  const maxDialogs = 4;
 
-  let seen = false;
-  while (Date.now() < appearDeadline) {
-    try {
-      const buf = await read();
-      if (buf.includes(marker)) { seen = true; break; }
-      if (bootedWithoutPrompt(buf)) return true;
-    } catch {
-      // screen may be momentarily unavailable during startup; retry
+  // Diagnostics: a swallowed read error and an empty buffer are DIFFERENT
+  // failures, but the old single message ("neither rendered") collapsed them —
+  // which cost hours of misdiagnosis in the 2026-08-04 RCA. Count each.
+  let readsThrew = 0;
+  let readsEmpty = 0;
+  let readsNoUi = 0;
+  let dialogsConfirmed = 0;
+  let stuck = false;
+
+  const status = (name: string, detail: string) => {
+    if (opts.store && opts.agentId) {
+      try {
+        opts.store.updateAgentStatus(opts.agentId, name, detail);
+      } catch {
+        // status write is best-effort; console output below still fires
+      }
     }
+  };
+
+  while (Date.now() < appearDeadline && dialogsConfirmed < maxDialogs) {
+    let buf: string;
+    try {
+      buf = await read();
+    } catch {
+      readsThrew++;
+      await new Promise((r) => setTimeout(r, 250));
+      continue;
+    }
+    if (buf.trim() === "") {
+      readsEmpty++;
+      await new Promise((r) => setTimeout(r, 250));
+      continue;
+    }
+    if (buf.includes(marker)) {
+      // Let the render settle before the keypress — a terminator inside CC's
+      // paste-coalescing window can be swallowed (the same class that bites
+      // agent_send). Then alternate CR/LF across retries
+      // (reference-cc-screen-stuff-submit-bytes).
+      await new Promise((r) => setTimeout(r, 600));
+      const bytes = ["\r", "\n", "\r"];
+      let cleared = false;
+      for (let attempt = 0; attempt < bytes.length && !cleared; attempt++) {
+        try {
+          await sendByte(bytes[attempt]);
+        } catch {
+          // transient send failure — the clear-poll below times out and we retry
+        }
+        const clearDeadline = Date.now() + (opts.clearMs ?? 5_000);
+        while (Date.now() < clearDeadline) {
+          await new Promise((r) => setTimeout(r, 250));
+          try {
+            const b2 = await read();
+            if (!b2.includes(marker)) { cleared = true; break; }
+          } catch {
+            readsThrew++;
+          }
+        }
+      }
+      if (!cleared) { stuck = true; break; }
+      dialogsConfirmed++;
+      continue; // another dialog may follow — keep watching until the footer
+    }
+    if (footer(buf)) {
+      // Booted through all dialogs. Verify the OUTCOME, not just the ceremony:
+      // the channel banner is CC's own statement that channel injection is on.
+      // Its absence after a clean boot is exactly the wire-blind half-boot the
+      // 2026-08-04 fleet outage was made of — say so loudly and durably.
+      const hasChannel = channelBanner(buf);
+      if (hasChannel) {
+        status(
+          "boot-gate-ok",
+          `dialogs confirmed: ${dialogsConfirmed}; channel banner present on ${screenName}`,
+        );
+      } else {
+        const detail = `session UI up after ${dialogsConfirmed} dialog(s) but NO channel banner on ${screenName} — channel plugin likely NOT loaded; agent may be wire-blind (registered on the broker with no client behind it)`;
+        console.warn(`[crew] boot-gate WARNING for ${label}: ${detail}`);
+        status("wire-channel-absent", detail);
+      }
+      return true;
+    }
+    readsNoUi++;
     await new Promise((r) => setTimeout(r, 250));
   }
 
-  if (seen) {
-    // Let the marker's render settle before the first keypress — a terminator
-    // inside CC's paste-coalescing window can be swallowed (the same class that
-    // bites agent_send). Then alternate CR/LF across retries: if CR is coalesced
-    // or dropped on a loaded box, LF may land (reference-cc-screen-stuff-submit-bytes).
-    await new Promise((r) => setTimeout(r, 600));
-    const bytes = ["\r", "\n", "\r"];
-    for (let attempt = 0; attempt < bytes.length; attempt++) {
-      try {
-        await sendByte(bytes[attempt]);
-      } catch {
-        // transient send failure — the clear-poll below times out and we retry
-      }
-      const clearDeadline = Date.now() + (opts.clearMs ?? 5_000);
-      while (Date.now() < clearDeadline) {
-        await new Promise((r) => setTimeout(r, 250));
-        try {
-          const buf = await read();
-          if (!buf.includes(marker)) return true;
-        } catch {
-          // transient read failure; keep polling
-        }
-      }
-    }
-  }
-
-  const detail = seen
-    ? `dev-channel prompt did not clear after 3 submit attempts (CR/LF alternated) on ${screenName}`
-    : `neither dev-channel prompt nor input UI rendered within the window on ${screenName} — if the prompt shows later, nothing will confirm it`;
+  const detail = stuck
+    ? `a boot dialog did not clear after 3 submit attempts (CR/LF alternated) on ${screenName} (${dialogsConfirmed} prior dialog(s) confirmed)`
+    : `no input UI within the window on ${screenName} — reads: ${readsThrew} threw, ${readsEmpty} empty, ${readsNoUi} content-without-UI, ${dialogsConfirmed} dialog(s) confirmed. If the UI shows later, nothing will confirm it`;
   console.warn(`[crew] dev-channel auto-confirm FAILED for ${label}: ${detail}`);
-  if (opts.store && opts.agentId) {
-    try {
-      opts.store.updateAgentStatus(opts.agentId, "dev-channel-confirm-failed", detail);
-    } catch {
-      // status write is best-effort; the warn above already fired
-    }
-  }
+  status("dev-channel-confirm-failed", detail);
   return false;
 }
 
@@ -411,9 +459,19 @@ export class Orchestrator {
       command += ` ${opts.extraFlags}`;
     }
 
-    // Forward env into the launched process. Verbatim — no synthesis, no
-    // built-ins. The orchestrator owns identity and config semantics.
-    const envExports = `export ${Object.entries(opts.env)
+    // Forward env into the launched process. Verbatim, with ONE crew-owned
+    // exception: claude-code spawns get CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
+    // unless the caller says otherwise. Spawned engineers are IPC-driven, not
+    // humans at a keyboard — CC's grayed suggestion chrome reads as operator
+    // input in hardcopies (a 2026-07-02 fleet freeze; 2026-08-04: three
+    // suggestions in one day proposing exactly the unsafe shortcut — merge
+    // before gates, skip FV, waive the model pin — into lanes gating a prod
+    // fix). Operator directive: Tim, 2026-08-04, fleet-wide.
+    const spawnEnv: Record<string, string> =
+      runtime === "claude-code"
+        ? { CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "false", ...opts.env }
+        : { ...opts.env };
+    const envExports = `export ${Object.entries(spawnEnv)
       .map(([k, v]) => `${k}=${shellEscape(v)}`)
       .join(" ")}`;
     // Per-agent CLAUDE_CONFIG_DIR (Phase 2 increment #2). After
@@ -460,10 +518,15 @@ export class Orchestrator {
       ? await screen.createRemoteSession(screenName, fullCommand, remoteTarget)
       : await screen.createSession(screenName, fullCommand);
 
-    // Auto-confirm the dev-channel prompt. Fire-and-forget — helper polls
-    // the screen buffer until the prompt marker appears, then sends CR.
-    // See autoConfirmDevChannel comment for why polling beats setTimeout.
-    void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id, remote: remoteTarget });
+    // Auto-confirm claude-code boot dialogs. Fire-and-forget — helper polls
+    // the screen buffer, confirms EVERY sequential dialog, then verifies the
+    // channel banner (outcome, not ceremony). claude-code ONLY: running this
+    // against codex spawns (which never render claude UI) produced 111
+    // guaranteed-FAILED log lines that drowned the real signal and corrupted
+    // the 2026-08-04 RCA's denominator.
+    if (runtime === "claude-code") {
+      void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id, remote: remoteTarget });
+    }
 
     // Best-effort: if the caller asked to be split next to the new agent,
     // and the backend supports per-caller splits (cmux today, iTerm2
