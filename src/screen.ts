@@ -330,19 +330,26 @@ export async function sendRemoteKeys(name: string, text: string, t: RemoteTarget
 export async function listSessions(): Promise<ScreenSession[]> {
   try {
     const result = await $`${SCREEN} -ls`.quiet().nothrow();
-    const output = result.stdout.toString();
-    const sessions: ScreenSession[] = [];
-    for (const line of output.split("\n")) {
-      // Format: "	12345.name	(Detached)" or "(Attached)"
-      const match = line.match(/^\t(\d+)\.(\S+)\t\s*(?:\(([^)]*)\))?/);
-      if (match) {
-        sessions.push({ name: match[2], pid: parseInt(match[1]), state: match[3] });
-      }
-    }
-    return sessions;
+    return parseScreenList(result.stdout.toString());
   } catch {
     return [];
   }
+}
+
+/**
+ * Parse `screen -ls` output. Exported for tests — the state field used to be
+ * silently discarded here, which is how dead sockets counted as live sessions.
+ */
+export function parseScreenList(output: string): ScreenSession[] {
+  const sessions: ScreenSession[] = [];
+  for (const line of output.split("\n")) {
+    // Format: "	12345.name	(Detached)" or "(Attached)" or "(Remote or dead)"
+    const match = line.match(/^\t(\d+)\.(\S+)\t\s*(?:\(([^)]*)\))?/);
+    if (match) {
+      sessions.push({ name: match[2], pid: parseInt(match[1]), state: match[3] });
+    }
+  }
+  return sessions;
 }
 
 /**
@@ -412,16 +419,24 @@ export async function isAlive(name: string): Promise<boolean> {
   // ambiguous by its own wording, and this repo fails OPEN on ambiguity because
   // the opposite error (AGI-69) reported a LIVE agent as dead. The PID is
   // unambiguous: no such process is PROVABLE death.
+  return pidLooksAlive(pid);
+}
+
+/**
+ * Signal-0 probe. Exported for tests. EPERM means the process EXISTS but
+ * belongs to another uid -- these screens are owned by _ephemeral while callers
+ * may run as another user. That is ALIVE; treating it as dead would resurrect
+ * exactly the AGI-69 harm. ESRCH is provable death. Anything else is
+ * inconclusive -> fail OPEN, per the repo standing rule.
+ */
+export function pidLooksAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch (e: any) {
-    // EPERM means the process EXISTS but belongs to another uid -- these screens
-    // are owned by _ephemeral while callers may run as another user. That is
-    // ALIVE. Treating it as dead would resurrect exactly the AGI-69 harm.
     if (e?.code === "EPERM") return true;
     if (e?.code === "ESRCH") return false;
-    return true; // inconclusive -> fail OPEN, per the repo standing rule
+    return true;
   }
 }
 
