@@ -89,9 +89,14 @@ mock.module("./screen", () => ({
   sshRun: async () => "",
   getRemoteSessionPid: async () => null,
   pollRemoteSessionPid: async () => null,
+  // Post-spawn verify chain (v2.26.0). Tests inject channelProbe/argvReader
+  // explicitly; these defaults make un-injected background chains resolve
+  // immediately instead of polling their full windows against a dead mock.
+  channelPluginAlive: async () => false,
+  sessionClaudeArgv: async () => null,
 }));
 
-const { Orchestrator, SOURCE_NEAREST_ENV, autoConfirmDevChannel } = await import("./orchestrator");
+const { Orchestrator, SOURCE_NEAREST_ENV, autoConfirmDevChannel, askedFromCommand, verifySpawnArgv } = await import("./orchestrator");
 
 function makeTerminal(): TerminalBackend {
   return {
@@ -1021,5 +1026,143 @@ describe("sendToAgent — two-phase submit-verify + alternate-byte (v2.20.0)", (
     expect(r.landed).toBe(true);
     const keys = bytesTo(scr);
     expect(keys.every((k) => k !== "\r" && k !== "\n")).toBe(true); // no submit sent
+  });
+});
+
+describe("askedFromCommand — the ask derives from the command, not a duplicated constant", () => {
+  const RUNTIME_CMD =
+    "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions --model ${CLAUDE_MODEL:-claude-opus-4-8} --effort ${CLAUDE_EFFORT:-high}";
+
+  test("env pin resolves exactly as the shell will", () => {
+    const asked = askedFromCommand(RUNTIME_CMD, { CLAUDE_MODEL: "claude-fable-5[1m]", CLAUDE_EFFORT: "medium" });
+    expect(asked.model).toBe("claude-fable-5[1m]");
+    expect(asked.effort).toBe("medium");
+    expect(asked.channels).toBe(true);
+  });
+
+  test("no env pin falls to the template default", () => {
+    const asked = askedFromCommand(RUNTIME_CMD, {});
+    expect(asked.model).toBe("claude-opus-4-8");
+    expect(asked.effort).toBe("high");
+  });
+
+  test("empty-string env falls to the default (matching ${VAR:-} shell semantics)", () => {
+    const asked = askedFromCommand(RUNTIME_CMD, { CLAUDE_MODEL: "" });
+    expect(asked.model).toBe("claude-opus-4-8");
+  });
+
+  test("extraFlags repeating a flag win (last occurrence, the CLI's rule)", () => {
+    const asked = askedFromCommand(`${RUNTIME_CMD} --model claude-sonnet-5`, { CLAUDE_MODEL: "claude-opus-5" });
+    expect(asked.model).toBe("claude-sonnet-5");
+  });
+
+  test("a command that never asks asserts nothing", () => {
+    const asked = askedFromCommand("claude --permission-mode bypassPermissions", {});
+    expect(asked.model).toBeUndefined();
+    expect(asked.effort).toBeUndefined();
+    expect(asked.channels).toBe(false);
+  });
+
+  test("shellEscaped literal is compared unquoted (what execve sees)", () => {
+    const asked = askedFromCommand("claude --model 'claude-fable-5[1m]'", {});
+    expect(asked.model).toBe("claude-fable-5[1m]");
+  });
+});
+
+describe("verifySpawnArgv — asked-vs-got against the ACTING argv", () => {
+  const ARGV_FULL =
+    "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions --model claude-opus-5 --effort medium You are a lane";
+
+  test("match over boot-gate-ok appends 'argv verified' to the healthy status", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "avok" } });
+    orch.store.updateAgentStatus("avok", "boot-gate-ok", "dialogs confirmed: 1");
+
+    await verifySpawnArgv("dvc", "avok", { model: "claude-opus-5", effort: "medium", channels: true }, {
+      store: orch.store, agentId: "avok", argvReader: async () => ARGV_FULL,
+    });
+
+    const row = orch.store.getAgent("avok");
+    expect(row?.status_name).toBe("boot-gate-ok");
+    expect(row?.status_desc).toContain("argv verified: model=claude-opus-5 effort=medium channels=present");
+  });
+
+  test("model mismatch → argv-mismatch, loud, asked and got both named", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "avmm" } });
+    orch.store.updateAgentStatus("avmm", "boot-gate-ok", "dialogs confirmed: 1");
+
+    await verifySpawnArgv("dvc", "avmm", { model: "claude-fable-5[1m]", channels: true }, {
+      store: orch.store, agentId: "avmm", argvReader: async () => ARGV_FULL,
+    });
+
+    const row = orch.store.getAgent("avmm");
+    expect(row?.status_name).toBe("argv-mismatch");
+    expect(row?.status_desc).toContain("asked 'claude-fable-5[1m]'");
+    expect(row?.status_desc).toContain("got 'claude-opus-5'");
+  });
+
+  test("channels asked but flag absent → argv-mismatch naming the wire-void precondition", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "avch" } });
+
+    await verifySpawnArgv("dvc", "avch", { channels: true }, {
+      store: orch.store, agentId: "avch",
+      argvReader: async () => "claude --permission-mode bypassPermissions --model claude-opus-5",
+    });
+
+    const row = orch.store.getAgent("avch");
+    expect(row?.status_name).toBe("argv-mismatch");
+    expect(row?.status_desc).toContain("wire-void precondition");
+  });
+
+  test("unreadable argv over boot-gate-ok → argv-unreadable (a probe fact, not a mismatch claim)", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "avun" } });
+    orch.store.updateAgentStatus("avun", "boot-gate-ok", "dialogs confirmed: 1");
+
+    await verifySpawnArgv("dvc", "avun", { model: "claude-opus-5" }, {
+      store: orch.store, agentId: "avun", argvReader: async () => null, appearMs: 100,
+    });
+
+    const row = orch.store.getAgent("avun");
+    expect(row?.status_name).toBe("argv-unreadable");
+    expect(row?.status_desc).toContain("NOT verified");
+  });
+
+  test("unreadable argv NEVER overwrites a standing alarm", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "avalarm" } });
+    orch.store.updateAgentStatus("avalarm", "wire-channel-absent", "no banner, no process");
+
+    await verifySpawnArgv("dvc", "avalarm", { model: "claude-opus-5" }, {
+      store: orch.store, agentId: "avalarm", argvReader: async () => null, appearMs: 100,
+    });
+
+    const row = orch.store.getAgent("avalarm");
+    expect(row?.status_name).toBe("wire-channel-absent");
+    expect(row?.status_desc).toBe("no banner, no process");
+  });
+
+  test("a MATCH never upgrades a standing alarm either (summaries only upgrade status — refuse)", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "avkeep" } });
+    orch.store.updateAgentStatus("avkeep", "wire-channel-absent", "no banner, no process");
+
+    await verifySpawnArgv("dvc", "avkeep", { model: "claude-opus-5", channels: true }, {
+      store: orch.store, agentId: "avkeep", argvReader: async () => ARGV_FULL,
+    });
+
+    const row = orch.store.getAgent("avkeep");
+    expect(row?.status_name).toBe("wire-channel-absent");
+    expect(row?.status_desc).toBe("no banner, no process");
+  });
+
+  test("a field the spawn never asked for is not asserted", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "avnone" } });
+    orch.store.updateAgentStatus("avnone", "boot-gate-ok", "dialogs confirmed: 0");
+
+    await verifySpawnArgv("dvc", "avnone", { channels: true }, {
+      store: orch.store, agentId: "avnone",
+      argvReader: async () => "claude --dangerously-load-development-channels plugin:wire@agiterra --resume abc",
+    });
+
+    const row = orch.store.getAgent("avnone");
+    expect(row?.status_name).toBe("boot-gate-ok");
+    expect(row?.status_desc).toContain("model=(not asked)");
   });
 });

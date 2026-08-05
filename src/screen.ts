@@ -350,6 +350,33 @@ export async function channelPluginAlive(name: string, t?: RemoteTarget): Promis
   return r.exitCode === 0;
 }
 
+/**
+ * Read the ACTING argv of the claude process inside a screen session — the
+ * asked-vs-got read-back's "got" side (AGI-78). Same tty-anchored discovery as
+ * channelPluginAlive; returns the full argv line of the claude process on the
+ * session's tty, or null when no such process is visible (which is a fact about
+ * the PROBE or timing, never evidence the process is absent).
+ */
+export async function sessionClaudeArgv(name: string, t?: RemoteTarget): Promise<string | null> {
+  const script = [
+    `spid=$(pgrep -f "SCREEN.*-dmS ${name} " | head -1)`,
+    `[ -n "$spid" ] || exit 1`,
+    `c=$(pgrep -P "$spid" | head -1)`,
+    `[ -n "$c" ] || exit 1`,
+    `tty=$(ps -o tty= -p "$c" | tr -d " ")`,
+    `[ -n "$tty" ] && [ "$tty" != "??" ] || exit 1`,
+    `ps -Ao tty=,args= | awk -v t="$tty" '$1==t' | sed -E 's/^[^ ]+[[:space:]]+//' | grep -E '^(/[^ ]*/)?claude( |$)' | head -1`,
+  ].join("; ");
+  let out: string;
+  if (t) {
+    out = await sshRun(t, script);
+  } else {
+    out = (await $`/bin/sh -c ${script}`.quiet().nothrow()).stdout.toString();
+  }
+  const line = out.trim();
+  return line === "" ? null : line;
+}
+
 /** Send keystrokes to a remote session (e.g. the dev-channel confirm CR). */
 export async function sendRemoteKeys(name: string, text: string, t: RemoteTarget): Promise<void> {
   // base64 the payload so CRs / metachars survive the SSH + sudo + screen hop.

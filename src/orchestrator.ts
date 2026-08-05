@@ -342,6 +342,134 @@ export async function autoConfirmDevChannel(
   return false;
 }
 
+/**
+ * Extract what a launch command ASKS for (AGI-78 asked-vs-got). Resolves
+ * shell-default tokens (`${CLAUDE_MODEL:-claude-opus-4-8}`) against the spawn
+ * env exactly the way the shell will, so the expectation derives from the ONE
+ * source (the runtime command) instead of a duplicated constant that drifts.
+ *
+ * Last occurrence wins — the same rule the CLI applies when extraFlags repeat a
+ * flag. Callers must pass a command WITHOUT the prompt appended: a prompt is
+ * quoted free text and can contain literal "--model".
+ *
+ * A field the command never asks for comes back undefined and is NOT asserted —
+ * a read-back verifies the ask, it does not invent one.
+ */
+export function askedFromCommand(
+  commandWithoutPrompt: string,
+  env: Record<string, string>,
+): { model?: string; effort?: string; channels: boolean } {
+  const resolve = (token: string): string | undefined => {
+    let m = token.match(/^\$\{(\w+):-(.+)\}$/);
+    if (m) return env[m[1]!] !== undefined && env[m[1]!] !== "" ? env[m[1]!] : m[2];
+    m = token.match(/^\$\{(\w+)\}$/) ?? token.match(/^\$(\w+)$/);
+    if (m) return env[m[1]!];
+    // shellEscape'd literals arrive quoted; strip one layer so the comparison
+    // is against what execve will actually see.
+    const q = token.match(/^'(.*)'$/) ?? token.match(/^"(.*)"$/);
+    return q ? q[1] : token;
+  };
+  const last = (flag: string): string | undefined => {
+    const all = [...commandWithoutPrompt.matchAll(new RegExp(`${flag}[= ](\\S+)`, "g"))];
+    const tok = all.at(-1)?.[1];
+    return tok === undefined ? undefined : resolve(tok);
+  };
+  return {
+    model: last("--model"),
+    effort: last("--effort"),
+    channels: commandWithoutPrompt.includes("--dangerously-load-development-channels"),
+  };
+}
+
+/**
+ * Post-spawn asked-vs-got read-back (AGI-78): compare the ask against the argv
+ * the process ACTUALLY got — never against a re-read of the source config,
+ * which certifies itself. Four durable outcomes:
+ *
+ *  - mismatch            → status "argv-mismatch", LOUD, asked+got per field
+ *  - argv unreadable     → status "argv-unreadable" ONLY over a healthy status;
+ *                          unreadable is a fact about the PROBE, not the process,
+ *                          and must never overwrite a louder alarm
+ *  - match, healthy row  → "boot-gate-ok" detail gains "argv verified: …"
+ *  - match, alarmed row  → alarm PRESERVED (a later success note must not
+ *                          upgrade a standing alarm), verification logged only
+ */
+export async function verifySpawnArgv(
+  screenName: string,
+  label: string,
+  asked: { model?: string; effort?: string; channels?: boolean },
+  opts: {
+    store?: CrewStore;
+    agentId?: string;
+    remote?: screen.RemoteTarget;
+    /** Injectable argv source (tests). Default: screen.sessionClaudeArgv. */
+    argvReader?: () => Promise<string | null>;
+    appearMs?: number;
+  } = {},
+): Promise<void> {
+  if (!opts.store || !opts.agentId) return;
+  const read = opts.argvReader ?? (() => screen.sessionClaudeArgv(screenName, opts.remote));
+  const appearMs = opts.appearMs ?? 30_000;
+  const deadline = Date.now() + appearMs;
+  let argv: string | null = null;
+  let threw = 0;
+  for (;;) {
+    try {
+      argv = await read();
+    } catch {
+      threw++;
+    }
+    if (argv !== null || Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  const row = opts.store.getAgent(opts.agentId);
+  const prior = row?.status_name ?? "none";
+
+  if (argv === null) {
+    const detail = `could not read the claude argv for ${screenName} within ${Math.round(appearMs / 1000)}s (${threw} probe(s) threw) — asked-vs-got NOT verified. This is a fact about the probe, not the process.`;
+    console.warn(`[crew] argv read-back UNREADABLE for ${label}: ${detail}`);
+    if (prior === "boot-gate-ok") {
+      opts.store.updateAgentStatus(opts.agentId, "argv-unreadable", `${detail} Prior status was boot-gate-ok: ${row?.status_desc ?? ""}`);
+    }
+    return;
+  }
+
+  const lastTok = (flag: string) => [...argv!.matchAll(new RegExp(`${flag}[= ](\\S+)`, "g"))].at(-1)?.[1];
+  const got = {
+    model: lastTok("--model"),
+    effort: lastTok("--effort"),
+    channels: argv.includes("--dangerously-load-development-channels"),
+  };
+
+  const mismatches: string[] = [];
+  if (asked.model !== undefined && got.model !== asked.model) {
+    mismatches.push(`model: asked '${asked.model}', got ${got.model === undefined ? "NO --model flag" : `'${got.model}'`}`);
+  }
+  if (asked.effort !== undefined && got.effort !== asked.effort) {
+    mismatches.push(`effort: asked '${asked.effort}', got ${got.effort === undefined ? "NO --effort flag" : `'${got.effort}'`}`);
+  }
+  if (asked.channels && !got.channels) {
+    mismatches.push(`channels: asked --dangerously-load-development-channels, flag ABSENT from argv (the wire-void precondition)`);
+  }
+
+  if (mismatches.length > 0) {
+    const detail = `SPAWN ARGV MISMATCH on ${screenName} — ${mismatches.join("; ")}. The argv is the acting read; a nearer .env, a baked default, or a stripped flag outranked the ask. Prior boot status (${prior}): ${row?.status_desc ?? ""}`;
+    console.warn(`[crew] argv read-back MISMATCH for ${label}: ${detail}`);
+    opts.store.updateAgentStatus(opts.agentId, "argv-mismatch", detail);
+    return;
+  }
+
+  const verified = `argv verified: model=${got.model ?? "(not asked)"} effort=${got.effort ?? "(not asked)"} channels=${got.channels ? "present" : "(not asked)"}`;
+  if (prior === "boot-gate-ok") {
+    opts.store.updateAgentStatus(opts.agentId, "boot-gate-ok", `${row?.status_desc ?? ""}; ${verified}`);
+  } else {
+    // A standing alarm (wire-channel-absent, argv-…, confirm-failed) outranks a
+    // success note — report the verification without erasing the alarm.
+    console.warn(`[crew] argv read-back for ${label}: ${verified} (status left as-is: ${prior})`);
+  }
+}
+
 export class Orchestrator {
   readonly store: CrewStore;
   readonly terminal: TerminalBackend;
@@ -502,7 +630,10 @@ export class Orchestrator {
     // Build launch command. Template variables expand from env + PROJECT_DIR.
     const projectDir = opts.projectDir ?? process.cwd();
     const templateVars = { ...opts.env, PROJECT_DIR: projectDir };
-    let command = getLaunchCommand(runtime, templateVars);
+    // Kept separate from `command`: the asked-vs-got extractor must never see
+    // the prompt (quoted free text that can contain literal "--model").
+    const baseCommand = getLaunchCommand(runtime, templateVars);
+    let command = baseCommand;
     if (opts.prompt) {
       command += ` ${shellEscape(opts.prompt)}`;
     }
@@ -576,7 +707,13 @@ export class Orchestrator {
     // guaranteed-FAILED log lines that drowned the real signal and corrupted
     // the 2026-08-04 RCA's denominator.
     if (runtime === "claude-code") {
-      void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id, remote: remoteTarget });
+      // Chain, don't race: both steps write the ONE status slot, and the argv
+      // read-back's rules (mismatch outranks ok; never upgrade an alarm) only
+      // hold if the gate's verdict lands first.
+      const asked = askedFromCommand(`${baseCommand} ${opts.extraFlags ?? ""}`, spawnEnv);
+      void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id, remote: remoteTarget })
+        .then(() => verifySpawnArgv(screenName, id, asked, { store: this.store, agentId: id, remote: remoteTarget }))
+        .catch((e) => console.warn(`[crew] post-spawn verify chain failed for '${id}': ${e}`));
     }
 
     // Best-effort: if the caller asked to be split next to the new agent,
@@ -841,8 +978,16 @@ export class Orchestrator {
       ? await screen.createRemoteSession(screenName, fullCommand, resumeTarget)
       : await screen.createSession(screenName, fullCommand);
 
-    // Auto-confirm dev-channel prompt — same polling helper as launchAgent.
-    void autoConfirmDevChannel(screenName, `resumed ${opts.id}`, { store: this.store, agentId: opts.id, remote: resumeTarget });
+    // Auto-confirm dev-channel prompt — same polling helper as launchAgent,
+    // then the asked-vs-got read-back. NOTE the resume command asks only for
+    // channels (+ whatever extraFlags carry): a bare resume pins no model or
+    // effort, so the read-back asserts none — j:719's silent flag-loss class is
+    // a POLICY question for AGI-78, not something a verifier may invent an
+    // expectation for.
+    const resumeAsked = askedFromCommand(command, mergedEnv);
+    void autoConfirmDevChannel(screenName, `resumed ${opts.id}`, { store: this.store, agentId: opts.id, remote: resumeTarget })
+      .then(() => verifySpawnArgv(screenName, `resumed ${opts.id}`, resumeAsked, { store: this.store, agentId: opts.id, remote: resumeTarget }))
+      .catch((e) => console.warn(`[crew] post-resume verify chain failed for '${opts.id}': ${e}`));
 
     // Write a fresh manifest for the resumed agent so it can be resumed
     // again later. Channels flow into the manifest only here (launchAgent
