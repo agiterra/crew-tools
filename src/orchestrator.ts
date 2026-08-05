@@ -178,7 +178,17 @@ function parseRegisterCallerContext(raw: string | undefined): RegisterCallerCont
 export async function autoConfirmDevChannel(
   screenName: string,
   label: string,
-  opts: { store?: CrewStore; agentId?: string; appearMs?: number; clearMs?: number; remote?: screen.RemoteTarget } = {},
+  opts: {
+    store?: CrewStore;
+    agentId?: string;
+    appearMs?: number;
+    clearMs?: number;
+    remote?: screen.RemoteTarget;
+    /** Injectable channel-process witness (tests). Default: screen.channelPluginAlive. */
+    channelProbe?: () => Promise<boolean>;
+    /** How long to poll the process witness after a banner miss. */
+    channelProbeMs?: number;
+  } = {},
 ): Promise<boolean> {
   const marker = "Enter to confirm";
   // CC's boot can present SEVERAL sequential "Enter to confirm" dialogs sharing
@@ -207,6 +217,18 @@ export async function autoConfirmDevChannel(
   let readsNoUi = 0;
   let dialogsConfirmed = 0;
   let stuck = false;
+  // The channel banner is a TRANSIENT splash element. A lane boots with its whole
+  // brief auto-submitted, so output starts streaming the moment the input UI is up
+  // and the banner can scroll off between two polls — sampling only the frame
+  // where the footer first appears produced false wire-channel-absent verdicts on
+  // BOTH post-redeploy lanes on 2026-08-04 (pastizz, cavallucci: wire provably
+  // live — signed IPC deliveries + channel plugin process on the session tty —
+  // while the row said "not loaded"). So: credit a banner sighting on ANY sampled
+  // frame, including dialog frames and clear-polls.
+  let bannerSeen = false;
+  const noteBanner = (buf: string) => {
+    if (channelBanner(buf)) bannerSeen = true;
+  };
 
   const status = (name: string, detail: string) => {
     if (opts.store && opts.agentId) {
@@ -232,6 +254,7 @@ export async function autoConfirmDevChannel(
       await new Promise((r) => setTimeout(r, 250));
       continue;
     }
+    noteBanner(buf);
     if (buf.includes(marker)) {
       // Let the render settle before the keypress — a terminator inside CC's
       // paste-coalescing window can be swallowed (the same class that bites
@@ -251,6 +274,7 @@ export async function autoConfirmDevChannel(
           await new Promise((r) => setTimeout(r, 250));
           try {
             const b2 = await read();
+            noteBanner(b2);
             if (!b2.includes(marker)) { cleared = true; break; }
           } catch {
             readsThrew++;
@@ -266,14 +290,41 @@ export async function autoConfirmDevChannel(
       // the channel banner is CC's own statement that channel injection is on.
       // Its absence after a clean boot is exactly the wire-blind half-boot the
       // 2026-08-04 fleet outage was made of — say so loudly and durably.
-      const hasChannel = channelBanner(buf);
-      if (hasChannel) {
+      noteBanner(buf);
+      if (bannerSeen) {
         status(
           "boot-gate-ok",
-          `dialogs confirmed: ${dialogsConfirmed}; channel banner present on ${screenName}`,
+          `dialogs confirmed: ${dialogsConfirmed}; channel banner observed on ${screenName}`,
+        );
+        return true;
+      }
+      // Banner missed on every sampled frame. That is a fact about SAMPLING, not
+      // about the channel — ask the process table before declaring wire-blind:
+      // a loaded channel plugin is a live process on the session's tty, and a
+      // process is a durable witness where a splash line is a transient pixel.
+      // No store/agentId → the verdict has no consumer; skip the probe entirely
+      // rather than spend up to 10s computing a status nobody records.
+      if (!opts.store || !opts.agentId) return true;
+      const probe = opts.channelProbe ?? (() => screen.channelPluginAlive(screenName, opts.remote));
+      const probeDeadline = Date.now() + (opts.channelProbeMs ?? 10_000);
+      let witnessed = false;
+      let probesThrew = 0;
+      for (;;) {
+        try {
+          witnessed = await probe();
+        } catch {
+          probesThrew++;
+        }
+        if (witnessed || Date.now() >= probeDeadline) break;
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      if (witnessed) {
+        status(
+          "boot-gate-ok",
+          `dialogs confirmed: ${dialogsConfirmed}; channel banner not observed on any sampled frame (it can scroll off before a sample lands) but the wire channel plugin process is LIVE on ${screenName}'s tty — channel verified by process witness`,
         );
       } else {
-        const detail = `session UI up after ${dialogsConfirmed} dialog(s) but NO channel banner on ${screenName} — channel plugin likely NOT loaded; agent may be wire-blind (registered on the broker with no client behind it)`;
+        const detail = `session UI up after ${dialogsConfirmed} dialog(s) but NO channel banner on any sampled frame of ${screenName} AND no wire channel plugin process on its tty (${probesThrew} probe(s) threw) — channel plugin likely NOT loaded; agent may be wire-blind (registered on the broker with no client behind it)`;
         console.warn(`[crew] boot-gate WARNING for ${label}: ${detail}`);
         status("wire-channel-absent", detail);
       }

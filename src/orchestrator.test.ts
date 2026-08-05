@@ -872,21 +872,75 @@ describe("autoConfirmDevChannel — verify-after-confirm", () => {
     expect(ok).toBe(true);
     const row = orch.store.getAgent("bannered");
     expect(row?.status_name).toBe("boot-gate-ok");
-    expect(row?.status_desc).toContain("channel banner present");
+    expect(row?.status_desc).toContain("channel banner observed");
   });
 
-  test("booted WITHOUT channel banner → wire-channel-absent status (the wire-blind half-boot, loud)", async () => {
+  test("banner on an EARLY frame only (scrolled off by footer time) → boot-gate-ok", async () => {
+    // The 2026-08-04 false-negative shape: a lane boots with its brief
+    // auto-submitted, output streams immediately, and the transient splash
+    // banner is gone from the frame where the footer first appears. Both
+    // post-redeploy lanes (pastizz, cavallucci) were marked wire-channel-absent
+    // this way while their channel plugin was provably live.
+    await orch.launchAgent({ env: { AGENT_ID: "earlybanner" } });
+    const DIALOG_WITH_BANNER =
+      "▎ Channels (experimental) messages from plugin:wire@agiterra inject directly\n" + MARKER_SCREEN;
+    screenState.screens["dvc"] = { queue: [DIALOG_WITH_BANNER], fallback: BOOTED_SCREEN };
+
+    const ok = await autoConfirmDevChannel("dvc", "earlybanner", {
+      store: orch.store, agentId: "earlybanner", appearMs: 2_000, clearMs: 800,
+      channelProbe: async () => { throw new Error("probe must not run when the banner was seen"); },
+    });
+
+    expect(ok).toBe(true);
+    const row = orch.store.getAgent("earlybanner");
+    expect(row?.status_name).toBe("boot-gate-ok");
+    expect(row?.status_desc).toContain("channel banner observed");
+  });
+
+  test("no banner on any frame but channel plugin process LIVE → boot-gate-ok via process witness", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "witnessed" } });
+    screenState.screens["dvc"] = { queue: [], fallback: BOOTED_SCREEN };
+
+    const ok = await autoConfirmDevChannel("dvc", "witnessed", {
+      store: orch.store, agentId: "witnessed", appearMs: 2_000,
+      channelProbe: async () => true, channelProbeMs: 1_000,
+    });
+
+    expect(ok).toBe(true);
+    const row = orch.store.getAgent("witnessed");
+    expect(row?.status_name).toBe("boot-gate-ok");
+    expect(row?.status_desc).toContain("process witness");
+  });
+
+  test("booted WITHOUT channel banner AND no plugin process → wire-channel-absent (the wire-blind half-boot, loud)", async () => {
     await orch.launchAgent({ env: { AGENT_ID: "blindboot" } });
     screenState.screens["dvc"] = { queue: [], fallback: BOOTED_SCREEN };
 
     const ok = await autoConfirmDevChannel("dvc", "blindboot", {
       store: orch.store, agentId: "blindboot", appearMs: 2_000,
+      channelProbe: async () => false, channelProbeMs: 0,
     });
 
     expect(ok).toBe(true); // session IS up — but the status says what's missing
     const row = orch.store.getAgent("blindboot");
     expect(row?.status_name).toBe("wire-channel-absent");
     expect(row?.status_desc).toContain("wire-blind");
+    expect(row?.status_desc).toContain("no wire channel plugin process");
+  });
+
+  test("probe that THROWS is counted, not treated as a verdict → wire-channel-absent with probe count", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "probefail" } });
+    screenState.screens["dvc"] = { queue: [], fallback: BOOTED_SCREEN };
+
+    const ok = await autoConfirmDevChannel("dvc", "probefail", {
+      store: orch.store, agentId: "probefail", appearMs: 2_000,
+      channelProbe: async () => { throw new Error("ps unavailable"); }, channelProbeMs: 0,
+    });
+
+    expect(ok).toBe(true);
+    const row = orch.store.getAgent("probefail");
+    expect(row?.status_name).toBe("wire-channel-absent");
+    expect(row?.status_desc).toMatch(/[1-9]\d* probe\(s\) threw/);
   });
 
   test("read failures are counted distinctly in the failure detail (no swallowed-error ambiguity)", async () => {

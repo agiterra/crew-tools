@@ -314,6 +314,42 @@ export async function readRemoteOutput(name: string, t: RemoteTarget): Promise<s
   return out.trimEnd();
 }
 
+/**
+ * Receive-path witness for the boot gate: is the wire CHANNEL plugin (loaded via
+ * --dangerously-load-development-channels) running for this screen session?
+ *
+ * A loaded channel is a live `bun run --cwd .../cache/agiterra/wire/<ver>`
+ * process on the session's tty. The tty is the discriminator — the plugin's argv
+ * carries no agent tag, but every screen session owns exactly one pts and the
+ * plugin runs on it (verified 2026-08-04: cavallucci's claude on ttys013 with
+ * the wire plugin alive on ttys013 while the banner check reported the channel
+ * absent). The trailing slash in "cache/agiterra/wire/" is load-bearing: it
+ * excludes the wire-ipc plugin (cache/agiterra/wire-ipc/), which is the SEND
+ * half and proves nothing about receive.
+ *
+ * Reads only the process table (world-readable argv), so no sudo locally;
+ * remote targets go through sshRun like every other cross-machine probe.
+ */
+export async function channelPluginAlive(name: string, t?: RemoteTarget): Promise<boolean> {
+  const script = [
+    // Trailing space after the name: guards prefix collisions (a session named
+    // "wire-x" must not match "wire-x2"); screen argv always continues past -dmS <name>.
+    `spid=$(pgrep -f "SCREEN.*-dmS ${name} " | head -1)`,
+    `[ -n "$spid" ] || exit 1`,
+    `c=$(pgrep -P "$spid" | head -1)`,
+    `[ -n "$c" ] || exit 1`,
+    `tty=$(ps -o tty= -p "$c" | tr -d " ")`,
+    `[ -n "$tty" ] && [ "$tty" != "??" ] || exit 1`,
+    `ps -Ao tty=,args= | awk -v t="$tty" '$1==t' | grep -qF "cache/agiterra/wire/"`,
+  ].join("; ");
+  if (t) {
+    const out = await sshRun(t, `(${script}) && echo CHANNEL-ALIVE`);
+    return out.includes("CHANNEL-ALIVE");
+  }
+  const r = await $`/bin/sh -c ${script}`.quiet().nothrow();
+  return r.exitCode === 0;
+}
+
 /** Send keystrokes to a remote session (e.g. the dev-channel confirm CR). */
 export async function sendRemoteKeys(name: string, text: string, t: RemoteTarget): Promise<void> {
   // base64 the payload so CRs / metachars survive the SSH + sudo + screen hop.
