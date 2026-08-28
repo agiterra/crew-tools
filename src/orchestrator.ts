@@ -470,6 +470,175 @@ export async function verifySpawnArgv(
   }
 }
 
+/**
+ * Remediation hint only — NEVER a control-flow input. Named here so the one
+ * environment-specific string in this file is greppable and overridable rather
+ * than buried in a message template.
+ */
+const TRUSTED_PROJECT_ROOT_HINT = process.env.CREW_TRUSTED_PROJECT_ROOT ?? "/opt/fabrica/fabrica-v3";
+
+/** Broker roster row — only the two fields this read-back is entitled to read. */
+type WireRosterRow = { id?: unknown; connection_status?: unknown };
+
+/**
+ * Post-spawn INBOUND-wire read-back: ask the BROKER whether the agent we just
+ * spawned is actually holding an inbound connection.
+ *
+ * Why this exists when the boot gate already checks the channel: the boot gate
+ * credits a banner sighting on any sampled frame and returns boot-gate-ok
+ * WITHOUT reaching the process witness. But "Channels (experimental)" reflects
+ * the FLAG, not a loaded MCP server — Claude Code gates plugin and MCP-server
+ * loading on PROJECT TRUST, so a spawn into an untrusted cwd prints the banner,
+ * passes the gate, and never starts the wire MCP server. No process holds the
+ * inbound SSE and the lane is deaf while every local surface reads healthy.
+ * That is the class that let a lane run 3h14m wire-blind, unreported.
+ *
+ * The broker is the only party that can answer this: presence in its roster
+ * plus connection_status is the one witness that a client is actually attached.
+ * A local probe can only ever see the flag or the process, never the socket.
+ *
+ * Deliberately HTTP, not a wire-tools import: crew/wire/knowledge must not
+ * import each other (feedback-crew-knowledge-wire-no-cross-refs). This extends
+ * the boot gate's already-documented wire awareness (see screen.ts
+ * channelPluginAlive) without adding the forbidden dependency edge.
+ *
+ * There is no fixed settle delay. The window IS the settle: a freshly spawned
+ * agent legitimately reads absent-then-connected, so this polls and only
+ * alarms if the agent has still not connected when the window closes.
+ *
+ * Four durable outcomes, same precedence contract as {@link verifySpawnArgv}:
+ *
+ *  - absent from roster      → status "wire-inbound-absent",       LOUD
+ *  - present, not connected  → status "wire-inbound-disconnected", LOUD
+ *  - roster unreadable       → "wire-inbound-unreadable" ONLY over a healthy
+ *                              status — unreadable is a fact about the PROBE,
+ *                              and must never overwrite a louder alarm
+ *  - connected, healthy row  → "boot-gate-ok" detail gains "wire inbound verified: …"
+ *  - connected, alarmed row  → alarm PRESERVED, verification logged only
+ */
+export async function verifyWireInbound(
+  screenName: string,
+  label: string,
+  opts: {
+    store?: CrewStore;
+    agentId?: string;
+    /** cwd the agent was spawned into — reported because it is the usual cause. */
+    projectDir?: string;
+    wireUrl?: string;
+    /** Injectable roster source (tests). Default: GET {wireUrl}/agents. */
+    agentsReader?: () => Promise<unknown>;
+    windowMs?: number;
+    pollMs?: number;
+  } = {},
+): Promise<void> {
+  // No store/agentId → the verdict has no consumer; skip rather than spend the
+  // window computing a status nobody records. Same rule as the boot gate.
+  if (!opts.store || !opts.agentId) return;
+  const agentId = opts.agentId;
+  const wireUrl = opts.wireUrl ?? process.env.WIRE_URL ?? "http://localhost:9800";
+  const read =
+    opts.agentsReader ??
+    (async () => {
+      const res = await fetch(`${wireUrl}/agents`, { signal: AbortSignal.timeout(5_000) });
+      if (!res.ok) throw new Error(`GET ${wireUrl}/agents → HTTP ${res.status}`);
+      return await res.json();
+    });
+  // CREW_WIRE_READBACK_WINDOW_MS tunes how long a lane is allowed to take to
+  // hold its inbound connection before this alarms. Raise it on a slow or
+  // heavily-loaded fleet; it is the settle window, not a timeout on the agent.
+  const envWindow = Number(process.env.CREW_WIRE_READBACK_WINDOW_MS);
+  const windowMs = opts.windowMs ?? (Number.isFinite(envWindow) && envWindow > 0 ? envWindow : 60_000);
+  // Keep production at a 2s cadence but stay responsive for short windows.
+  const pollMs = opts.pollMs ?? Math.min(2_000, Math.max(50, Math.floor(windowMs / 4)));
+  const deadline = Date.now() + windowMs;
+
+  // Track the LAST decided observation, so the alarm reports what we actually
+  // saw rather than a default. `seen` distinguishes "roster read, agent not in
+  // it" from "roster never read" — collapsing those is how an unreadable probe
+  // gets reported as a dead agent.
+  let reads = 0;
+  let threw = 0;
+  let lastError = "";
+  let seenInRoster = false;
+  let lastStatus: string | undefined;
+  let connected = false;
+
+  for (;;) {
+    let roster: unknown;
+    try {
+      roster = await read();
+      // A shape change must fail LOUD as a probe fault, not be tolerated into
+      // a false "absent" verdict about the agent.
+      if (!Array.isArray(roster)) {
+        throw new Error(`expected a JSON array of agents, got ${roster === null ? "null" : typeof roster}`);
+      }
+      reads++;
+      const row = (roster as WireRosterRow[]).find((a) => a && a.id === agentId);
+      if (row) {
+        seenInRoster = true;
+        lastStatus = typeof row.connection_status === "string" ? row.connection_status : undefined;
+        if (lastStatus === "connected") {
+          connected = true;
+        }
+      }
+    } catch (e) {
+      threw++;
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+    if (connected || Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+
+  const row = opts.store.getAgent(agentId);
+  const prior = row?.status_name ?? "none";
+  const waited = Math.round(windowMs / 1000);
+  const where = `cwd at spawn: ${opts.projectDir ?? "(not recorded)"}`;
+  // One remediation block, shared by both alarms — the cause is the same.
+  const remedy =
+    `Most likely cause: that cwd is NOT a trusted project for the uid the lane runs as. Claude Code gates plugin and MCP-server loading on project trust, so the wire MCP server never starts and nothing holds the inbound SSE. ` +
+    `The --dangerously-load-development-channels flag proves nothing here: the banner reflects the FLAG, not a loaded server. ` +
+    `Remediation: respawn into the trusted root ${TRUSTED_PROJECT_ROOT_HINT}, or add a trusted entry for that cwd under the run-as uid's ~/.claude.json, then re-run this read-back.`;
+
+  if (connected) {
+    const verified = `wire inbound verified: broker roster shows '${agentId}' connection_status=connected (${wireUrl})`;
+    if (prior === "boot-gate-ok") {
+      opts.store.updateAgentStatus(agentId, "boot-gate-ok", `${row?.status_desc ?? ""}; ${verified}`);
+    } else {
+      // A standing alarm outranks a success note — report the verification
+      // without erasing the alarm.
+      console.warn(`[crew] wire inbound read-back for ${label}: ${verified} (status left as-is: ${prior})`);
+    }
+    return;
+  }
+
+  if (reads === 0) {
+    const detail =
+      `could not read the Wire broker roster at ${wireUrl}/agents within ${waited}s (${threw} probe(s) threw; last: ${lastError}) — inbound wire NOT verified for '${agentId}'. This is a fact about the probe, not the agent.`;
+    console.warn(`[crew] wire inbound read-back UNREADABLE for ${label}: ${detail}`);
+    if (prior === "boot-gate-ok") {
+      opts.store.updateAgentStatus(agentId, "wire-inbound-unreadable", `${detail} Prior status was boot-gate-ok: ${row?.status_desc ?? ""}`);
+    }
+    return;
+  }
+
+  if (!seenInRoster) {
+    const detail =
+      `WIRE INBOUND BLIND on ${screenName} — agent '${agentId}' is NOT in the broker roster at ${wireUrl}/agents ${waited}s after spawn (${reads} clean read(s), ${threw} threw). ` +
+      `The lane is running with NO inbound Wire: nothing can reach it, and it will not report that itself. ${where}. ${remedy} ` +
+      `Prior boot status (${prior}): ${row?.status_desc ?? ""}`;
+    console.warn(`[crew] wire inbound read-back ABSENT for ${label}: ${detail}`);
+    opts.store.updateAgentStatus(agentId, "wire-inbound-absent", detail);
+    return;
+  }
+
+  const detail =
+    `WIRE INBOUND DOWN on ${screenName} — agent '${agentId}' IS in the broker roster at ${wireUrl}/agents but connection_status='${lastStatus ?? "(absent field)"}', not 'connected', ${waited}s after spawn (${reads} clean read(s), ${threw} threw). ` +
+    `A registered agent with no live inbound connection is deaf in the direction that matters: its own sends can succeed while nothing reaches it. ${where}. ${remedy} ` +
+    `Prior boot status (${prior}): ${row?.status_desc ?? ""}`;
+  console.warn(`[crew] wire inbound read-back DISCONNECTED for ${label}: ${detail}`);
+  opts.store.updateAgentStatus(agentId, "wire-inbound-disconnected", detail);
+}
+
 export class Orchestrator {
   readonly store: CrewStore;
   readonly terminal: TerminalBackend;
@@ -713,6 +882,10 @@ export class Orchestrator {
       const asked = askedFromCommand(`${baseCommand} ${opts.extraFlags ?? ""}`, spawnEnv);
       void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id, remote: remoteTarget })
         .then(() => verifySpawnArgv(screenName, id, asked, { store: this.store, agentId: id, remote: remoteTarget }))
+        // Last link: the flag can be present and the argv correct while the wire
+        // MCP server never started (untrusted cwd). Only the broker can see that,
+        // so this runs after the local gates and outranks their verdict.
+        .then(() => verifyWireInbound(screenName, id, { store: this.store, agentId: id, projectDir }))
         .catch((e) => console.warn(`[crew] post-spawn verify chain failed for '${id}': ${e}`));
     }
 

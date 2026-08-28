@@ -28,7 +28,29 @@ const screenState = {
   killSessionSurvivors: 0,
   terminateSessionCalls: [] as Array<{ name: string; timeoutMs: number }>,
   terminateSessionSurvivors: 0,
+  // Scriptable ACTING argv for the post-spawn read-back chain. null = the probe
+  // saw nothing (the argv-unreadable path).
+  argvResult: null as string | null,
 };
+
+// Wire broker stub. The inbound read-back's default reader is an HTTP GET
+// against a REAL broker on localhost:9800 — a test suite must never touch that,
+// so global fetch is replaced here for the whole file. Tests script the roster;
+// anything not scripted answers with an empty roster.
+const wireState = {
+  roster: [] as Array<{ id: string; connection_status?: string }>,
+  /** When set, the stubbed fetch throws it (probe-fault path). */
+  failWith: null as string | null,
+  /** Non-array body to exercise the shape-change guard. */
+  bodyOverride: undefined as unknown,
+  calls: [] as string[],
+};
+globalThis.fetch = (async (input: unknown) => {
+  wireState.calls.push(String(input));
+  if (wireState.failWith) throw new Error(wireState.failWith);
+  const body = wireState.bodyOverride !== undefined ? wireState.bodyOverride : wireState.roster;
+  return { ok: true, status: 200, json: async () => body } as unknown as Response;
+}) as unknown as typeof fetch;
 mock.module("./screen", () => ({
   createSession: async (name: string, command: string) => {
     createSessionCalls.push({ name, command });
@@ -93,10 +115,10 @@ mock.module("./screen", () => ({
   // explicitly; these defaults make un-injected background chains resolve
   // immediately instead of polling their full windows against a dead mock.
   channelPluginAlive: async () => false,
-  sessionClaudeArgv: async () => null,
+  sessionClaudeArgv: async () => screenState.argvResult,
 }));
 
-const { Orchestrator, SOURCE_NEAREST_ENV, autoConfirmDevChannel, askedFromCommand, verifySpawnArgv } = await import("./orchestrator");
+const { Orchestrator, SOURCE_NEAREST_ENV, autoConfirmDevChannel, askedFromCommand, verifySpawnArgv, verifyWireInbound } = await import("./orchestrator");
 
 function makeTerminal(): TerminalBackend {
   return {
@@ -144,6 +166,11 @@ beforeEach(() => {
   screenState.killSessionSurvivors = 0;
   screenState.terminateSessionCalls.length = 0;
   screenState.terminateSessionSurvivors = 0;
+  screenState.argvResult = null;
+  wireState.roster = [];
+  wireState.failWith = null;
+  wireState.bodyOverride = undefined;
+  wireState.calls.length = 0;
 });
 
 afterAll(() => {
@@ -1165,4 +1192,186 @@ describe("verifySpawnArgv — asked-vs-got against the ACTING argv", () => {
     expect(row?.status_name).toBe("boot-gate-ok");
     expect(row?.status_desc).toContain("model=(not asked)");
   });
+});
+
+describe("verifyWireInbound — the BROKER's view of the inbound connection", () => {
+  const FAST = { windowMs: 200, pollMs: 50 };
+
+  test("connected over boot-gate-ok appends 'wire inbound verified' to the healthy status", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "wiok" } });
+    orch.store.updateAgentStatus("wiok", "boot-gate-ok", "dialogs confirmed: 1");
+
+    await verifyWireInbound("dvc", "wiok", {
+      store: orch.store, agentId: "wiok", ...FAST,
+      agentsReader: async () => [{ id: "wiok", connection_status: "connected" }],
+    });
+
+    const row = orch.store.getAgent("wiok");
+    expect(row?.status_name).toBe("boot-gate-ok");
+    expect(row?.status_desc).toContain("wire inbound verified");
+    expect(row?.status_desc).toContain("connection_status=connected");
+  });
+
+  test("absent from the roster → wire-inbound-absent, LOUD, naming the cwd and the remediation", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "wiabs" } });
+    orch.store.updateAgentStatus("wiabs", "boot-gate-ok", "dialogs confirmed: 1");
+
+    await verifyWireInbound("wire-wiabs", "wiabs", {
+      store: orch.store, agentId: "wiabs", ...FAST,
+      projectDir: "/opt/fabrica/fabrica-v3/fabrica-v3-api",
+      agentsReader: async () => [{ id: "someone-else", connection_status: "connected" }],
+    });
+
+    const row = orch.store.getAgent("wiabs");
+    expect(row?.status_name).toBe("wire-inbound-absent");
+    expect(row?.status_desc).toContain("WIRE INBOUND BLIND");
+    expect(row?.status_desc).toContain("'wiabs'");
+    expect(row?.status_desc).toContain("cwd at spawn: /opt/fabrica/fabrica-v3/fabrica-v3-api");
+    expect(row?.status_desc).toContain("project trust");
+    expect(row?.status_desc).toContain("/opt/fabrica/fabrica-v3");
+  });
+
+  test("present but NOT connected → wire-inbound-disconnected, naming the status it actually saw", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "widis" } });
+    orch.store.updateAgentStatus("widis", "boot-gate-ok", "dialogs confirmed: 1");
+
+    await verifyWireInbound("wire-widis", "widis", {
+      store: orch.store, agentId: "widis", ...FAST,
+      projectDir: "/",
+      agentsReader: async () => [{ id: "widis", connection_status: "disconnected" }],
+    });
+
+    const row = orch.store.getAgent("widis");
+    expect(row?.status_name).toBe("wire-inbound-disconnected");
+    expect(row?.status_desc).toContain("WIRE INBOUND DOWN");
+    expect(row?.status_desc).toContain("connection_status='disconnected'");
+    expect(row?.status_desc).toContain("cwd at spawn: /");
+  });
+
+  test("a transient absent-then-connected does NOT alarm — the window is the settle", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "wisettle" } });
+    orch.store.updateAgentStatus("wisettle", "boot-gate-ok", "dialogs confirmed: 1");
+
+    let n = 0;
+    await verifyWireInbound("dvc", "wisettle", {
+      store: orch.store, agentId: "wisettle", windowMs: 5_000, pollMs: 10,
+      agentsReader: async () => (++n < 3 ? [] : [{ id: "wisettle", connection_status: "connected" }]),
+    });
+
+    const row = orch.store.getAgent("wisettle");
+    expect(row?.status_name).toBe("boot-gate-ok");
+    expect(row?.status_desc).toContain("wire inbound verified");
+    expect(n).toBe(3);
+  });
+
+  test("roster unreadable over boot-gate-ok → wire-inbound-unreadable (a probe fact, not an agent verdict)", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "wiunr" } });
+    orch.store.updateAgentStatus("wiunr", "boot-gate-ok", "dialogs confirmed: 1");
+
+    await verifyWireInbound("dvc", "wiunr", {
+      store: orch.store, agentId: "wiunr", ...FAST,
+      agentsReader: async () => { throw new Error("connect ECONNREFUSED 127.0.0.1:9800"); },
+    });
+
+    const row = orch.store.getAgent("wiunr");
+    expect(row?.status_name).toBe("wire-inbound-unreadable");
+    expect(row?.status_desc).toContain("NOT verified");
+    expect(row?.status_desc).toContain("ECONNREFUSED");
+    // The crucial distinction: an unreachable BROKER must never be reported as
+    // a wire-blind AGENT.
+    expect(row?.status_desc).not.toContain("WIRE INBOUND BLIND");
+  });
+
+  test("a non-array roster body is a probe fault, never a false 'absent'", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "wishape" } });
+    orch.store.updateAgentStatus("wishape", "boot-gate-ok", "dialogs confirmed: 1");
+
+    await verifyWireInbound("dvc", "wishape", {
+      store: orch.store, agentId: "wishape", ...FAST,
+      agentsReader: async () => ({ agents: [] }),
+    });
+
+    const row = orch.store.getAgent("wishape");
+    expect(row?.status_name).toBe("wire-inbound-unreadable");
+    expect(row?.status_desc).toContain("expected a JSON array of agents, got object");
+  });
+
+  test("unreadable NEVER overwrites a standing alarm", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "wialarm" } });
+    orch.store.updateAgentStatus("wialarm", "wire-channel-absent", "no banner, no process");
+
+    await verifyWireInbound("dvc", "wialarm", {
+      store: orch.store, agentId: "wialarm", ...FAST,
+      agentsReader: async () => { throw new Error("boom"); },
+    });
+
+    const row = orch.store.getAgent("wialarm");
+    expect(row?.status_name).toBe("wire-channel-absent");
+    expect(row?.status_desc).toBe("no banner, no process");
+  });
+
+  test("a CONNECTED read never upgrades a standing alarm either", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "wikeep" } });
+    orch.store.updateAgentStatus("wikeep", "argv-mismatch", "model: asked X, got Y");
+
+    await verifyWireInbound("dvc", "wikeep", {
+      store: orch.store, agentId: "wikeep", ...FAST,
+      agentsReader: async () => [{ id: "wikeep", connection_status: "connected" }],
+    });
+
+    const row = orch.store.getAgent("wikeep");
+    expect(row?.status_name).toBe("argv-mismatch");
+    expect(row?.status_desc).toBe("model: asked X, got Y");
+  });
+
+  test("no store/agentId → no consumer, the roster is never read at all", async () => {
+    let called = 0;
+    await verifyWireInbound("dvc", "nobody", {
+      ...FAST,
+      agentsReader: async () => { called++; return []; },
+    });
+    expect(called).toBe(0);
+  });
+
+  // The case that motivated the gate: croquant ran 3h14m wire-blind after being
+  // spawned into an UNTRUSTED cwd. Driven through launchAgent — the caller —
+  // so this proves the chain is WIRED, not just that the function works.
+  test("ACCEPTANCE: an untrusted-cwd spawn trips the gate end-to-end via launchAgent", async () => {
+    process.env.CREW_WIRE_READBACK_WINDOW_MS = "150";
+    try {
+      // Boot gate passes: footer + channel banner both on the frame. The flag is
+      // present and CC says "Channels (experimental)" — exactly the healthy-
+      // looking half-boot an untrusted cwd produces.
+      screenState.screens["wire-croquant"] = {
+        queue: [],
+        fallback: "Channels (experimental)\n? for shortcuts",
+      };
+      screenState.argvResult =
+        "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions --model claude-opus-4-8 --effort high";
+      // The broker never sees it: no MCP server started, so nothing registered.
+      wireState.roster = [{ id: "brioche", connection_status: "connected" }];
+
+      await orch.launchAgent({
+        env: { AGENT_ID: "croquant" },
+        projectDir: "/opt/fabrica/fabrica-v3/fabrica-v3-api",
+      });
+
+      // The chain is fire-and-forget; wait for its verdict to land.
+      const deadline = Date.now() + 15_000;
+      let row = orch.store.getAgent("croquant");
+      while (Date.now() < deadline && row?.status_name !== "wire-inbound-absent") {
+        await new Promise((r) => setTimeout(r, 50));
+        row = orch.store.getAgent("croquant");
+      }
+
+      expect(row?.status_name).toBe("wire-inbound-absent");
+      expect(row?.status_desc).toContain("WIRE INBOUND BLIND on wire-croquant");
+      expect(row?.status_desc).toContain("cwd at spawn: /opt/fabrica/fabrica-v3/fabrica-v3-api");
+      expect(row?.status_desc).toContain("respawn into the trusted root /opt/fabrica/fabrica-v3");
+      // And it went to the real endpoint, not a stub left in the chain.
+      expect(wireState.calls.some((u) => u.endsWith("/agents"))).toBe(true);
+    } finally {
+      delete process.env.CREW_WIRE_READBACK_WINDOW_MS;
+    }
+  }, 30_000);
 });
