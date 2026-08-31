@@ -43,54 +43,24 @@ export async function createCrewRpcWriter(opts: CrewRpcWriterOptions = {}): Prom
   const dest = resolveDest(opts);
   const defaultTimeoutMs = opts.defaultTimeoutMs ?? 60_000;
 
-  // grok-wire-bridge already holds AGENT_ID's Wire SSE. A long-lived second
-  // WireConnection is another dashboard session. crew-service HTTP MCP is
-  // READ-ONLY (AGI-27) and cannot spawn. Under GROK_WIRE_BRIDGE=1 open a
-  // one-shot SSE per RPC and close it after — no persistent extra session.
-  const oneshot = process.env.GROK_WIRE_BRIDGE === "1";
-
-  const makeClient = () =>
-    new RpcClient({
-      url,
-      agentId,
-      signingKey: privateKey,
-      defaultTimeoutMs,
-    });
-
-  if (oneshot) {
-    const run = async (
-      target: string,
-      method: string,
-      params: unknown,
-      timeoutMs?: number,
-    ): Promise<unknown> => {
-      const client = makeClient();
-      const conn = new WireConnection({
-        url,
-        agentId,
-        agentName: agentId,
-        keyPair: { publicKey, privateKey },
-        ccSessionId: `crew-rpc-oneshot-${process.pid}-${Date.now()}`,
-        deliver: async ({ raw }) => {
-          client.handleEvent(raw);
-        },
-      });
-      await conn.start();
-      try {
-        return await client.request(target, method, params, timeoutMs);
-      } finally {
-        await conn.stop();
-      }
-    };
-    return {
-      dest,
-      request: (method, params, timeoutMs) => run(dest, method, params, timeoutMs),
-      requestTo: (target, method, params, timeoutMs) => run(target, method, params, timeoutMs),
-      stop: async () => {},
-    };
+  // grok-wire-bridge already holds AGENT_ID's Wire SSE. A second
+  // WireConnection as the same id — even one-shot — is still two SSEs
+  // (dashboard multi-session; RPC replies land on the bridge session).
+  // crew-service HTTP MCP is READ-ONLY (AGI-27). Spawn RPC must ride the
+  // existing bridge connection, not open another SSE.
+  if (process.env.GROK_WIRE_BRIDGE === "1") {
+    throw new Error(
+      "GROK_WIRE_BRIDGE=1: do not open a second Wire SSE as AGENT_ID. " +
+      "Spawn/RPC must use grok-wire-bridge's existing connection (or crew-service HTTP writes when those land).",
+    );
   }
 
-  const client = makeClient();
+  const client = new RpcClient({
+    url,
+    agentId,
+    signingKey: privateKey,
+    defaultTimeoutMs,
+  });
   const conn = new WireConnection({
     url,
     agentId,
