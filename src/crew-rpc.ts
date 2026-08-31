@@ -41,12 +41,56 @@ export async function createCrewRpcWriter(opts: CrewRpcWriterOptions = {}): Prom
   const privateKey = await importPrivateKey(privateKeyB64);
   const publicKey = await derivePublicKeyB64(privateKey);
   const dest = resolveDest(opts);
-  const client = new RpcClient({
-    url,
-    agentId,
-    signingKey: privateKey,
-    defaultTimeoutMs: opts.defaultTimeoutMs ?? 60_000,
-  });
+  const defaultTimeoutMs = opts.defaultTimeoutMs ?? 60_000;
+
+  // grok-wire-bridge already holds AGENT_ID's Wire SSE. A long-lived second
+  // WireConnection is another dashboard session. crew-service HTTP MCP is
+  // READ-ONLY (AGI-27) and cannot spawn. Under GROK_WIRE_BRIDGE=1 open a
+  // one-shot SSE per RPC and close it after — no persistent extra session.
+  const oneshot = process.env.GROK_WIRE_BRIDGE === "1";
+
+  const makeClient = () =>
+    new RpcClient({
+      url,
+      agentId,
+      signingKey: privateKey,
+      defaultTimeoutMs,
+    });
+
+  if (oneshot) {
+    const run = async (
+      target: string,
+      method: string,
+      params: unknown,
+      timeoutMs?: number,
+    ): Promise<unknown> => {
+      const client = makeClient();
+      const conn = new WireConnection({
+        url,
+        agentId,
+        agentName: agentId,
+        keyPair: { publicKey, privateKey },
+        ccSessionId: `crew-rpc-oneshot-${process.pid}-${Date.now()}`,
+        deliver: async ({ raw }) => {
+          client.handleEvent(raw);
+        },
+      });
+      await conn.start();
+      try {
+        return await client.request(target, method, params, timeoutMs);
+      } finally {
+        await conn.stop();
+      }
+    };
+    return {
+      dest,
+      request: (method, params, timeoutMs) => run(dest, method, params, timeoutMs),
+      requestTo: (target, method, params, timeoutMs) => run(target, method, params, timeoutMs),
+      stop: async () => {},
+    };
+  }
+
+  const client = makeClient();
   const conn = new WireConnection({
     url,
     agentId,
