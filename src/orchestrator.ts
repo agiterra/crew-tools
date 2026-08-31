@@ -98,6 +98,12 @@ export const SOURCE_NEAREST_ENV =
   `if [ -f "$d/.env" ]; then set -a; . "$d/.env"; set +a; break; fi; ` +
   `d=$(dirname "$d"); done`;
 
+// Claude Code loads project_dir/.claude/settings.local.json and will disable
+// github/datadog/render MCP if a previous session wrote it. Gitignore only
+// stops commit. Codex/Grok ignore the file. Wipe on Claude spawn/resume only;
+// do not recreate. (Brioche 590667)
+export const WIPE_CLAUDE_SETTINGS_LOCAL = "rm -f .claude/settings.local.json && ";
+
 /**
  * Extract the recorded aux_surface (caller-workspace split) id from a
  * persisted spawn manifest, if any. Returns undefined when the manifest
@@ -829,7 +835,8 @@ export class Orchestrator {
     // SOURCE_NEAREST_ENV so a .env-provided CLAUDE_CONFIG_DIR wins the
     // snippet's unset-guard, same precedence as every other env var.
     const configDirSetup = runtime === "claude-code" ? ` && ${buildConfigDirSetup(id, projectDir)}` : "";
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${SOURCE_NEAREST_ENV}${configDirSetup} && ${command}`;
+    const wipe = runtime === "claude-code" ? WIPE_CLAUDE_SETTINGS_LOCAL : "";
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipe}${envExports} && ${SOURCE_NEAREST_ENV}${configDirSetup} && ${command}`;
 
     // Create screen session — local, or on a remote host when opts.machine
     // names a non-local machine (cross-machine spawn: ssh + sudo -u <run_as_uid>).
@@ -1129,7 +1136,7 @@ export class Orchestrator {
     // resume a PRE-isolation agent (transcript in the shared ~/.claude),
     // pass env.CLAUDE_CONFIG_DIR=$HOME/.claude — the snippet's unset-guard
     // then no-ops.
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${envExports} && ${SOURCE_NEAREST_ENV} && ${buildConfigDirSetup(opts.id, projectDir)} && ${command}`;
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${WIPE_CLAUDE_SETTINGS_LOCAL}${envExports} && ${SOURCE_NEAREST_ENV} && ${buildConfigDirSetup(opts.id, projectDir)} && ${command}`;
 
     // Resume is same-HOST only, but may cross UIDs: a crew-service
     // `_ephemeral` spawn resumes under its original account (tombstone

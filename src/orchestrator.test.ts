@@ -118,7 +118,7 @@ mock.module("./screen", () => ({
   sessionClaudeArgv: async () => screenState.argvResult,
 }));
 
-const { Orchestrator, SOURCE_NEAREST_ENV, autoConfirmDevChannel, askedFromCommand, verifySpawnArgv, verifyWireInbound } = await import("./orchestrator");
+const { Orchestrator, SOURCE_NEAREST_ENV, WIPE_CLAUDE_SETTINGS_LOCAL, autoConfirmDevChannel, askedFromCommand, verifySpawnArgv, verifyWireInbound } = await import("./orchestrator");
 
 function makeTerminal(): TerminalBackend {
   return {
@@ -751,6 +751,24 @@ describe("nearest-ancestor .env sourcing (cc-launch.sh fold)", () => {
 
     await orch.launchAgent({ env: { AGENT_ID: "codexy" }, runtime: "codex" });
     expect(createSessionCalls.at(-1)!.command).not.toContain("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION");
+  });
+
+
+  test("claude-code spawn/resume wipes .claude/settings.local.json; codex does not", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "wipe-cc" } });
+    const cc = createSessionCalls.at(-1)!.command;
+    expect(cc).toContain(WIPE_CLAUDE_SETTINGS_LOCAL);
+    expect(cc.indexOf("cd ")).toBeLessThan(cc.indexOf(WIPE_CLAUDE_SETTINGS_LOCAL));
+
+    await orch.launchAgent({ env: { AGENT_ID: "wipe-cx" }, runtime: "codex" });
+    expect(createSessionCalls.at(-1)!.command).not.toContain(WIPE_CLAUDE_SETTINGS_LOCAL);
+
+    await orch.resumeAgent({
+      id: "wipe-resume",
+      ccSessionId: "11111111-2222-3333-4444-555555555555",
+      projectDir: "/tmp/wipe-resume-wd",
+    });
+    expect(createSessionCalls.at(-1)!.command).toContain(WIPE_CLAUDE_SETTINGS_LOCAL);
   });
 
   test("launch command sources .env after the env exports, before the runtime command", async () => {
