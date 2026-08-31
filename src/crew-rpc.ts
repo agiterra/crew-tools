@@ -1,3 +1,5 @@
+import { createConnection } from "net";
+import { join } from "path";
 import {
   RpcClient,
   WireConnection,
@@ -43,16 +45,48 @@ export async function createCrewRpcWriter(opts: CrewRpcWriterOptions = {}): Prom
   const dest = resolveDest(opts);
   const defaultTimeoutMs = opts.defaultTimeoutMs ?? 60_000;
 
-  // grok-wire-bridge already holds AGENT_ID's Wire SSE. A second
-  // WireConnection as the same id — even one-shot — is still two SSEs
-  // (dashboard multi-session; RPC replies land on the bridge session).
-  // crew-service HTTP MCP is READ-ONLY (AGI-27). Spawn RPC must ride the
-  // existing bridge connection, not open another SSE.
+  // grok-wire already holds AGENT_ID's Wire SSE. Do not open another.
+  // MCP children send RPC through the sidecar unix hatch, which signs
+  // rpc.request on the existing connection and correlates rpc.reply.
   if (process.env.GROK_WIRE_BRIDGE === "1") {
-    throw new Error(
-      "GROK_WIRE_BRIDGE=1: do not open a second Wire SSE as AGENT_ID. " +
-      "Spawn/RPC must use grok-wire-bridge's existing connection (or crew-service HTTP writes when those land).",
-    );
+    const sock =
+      process.env.GROK_RPC_SOCK ??
+      join(process.env.HOME ?? "/tmp", ".wire", "grok-bridge", `${agentId}.rpc.sock`);
+    const destFixed = dest;
+    const call = (target: string, method: string, params: unknown, timeoutMs?: number) =>
+      new Promise<unknown>((resolve, reject) => {
+        const c = createConnection(sock);
+        let buf = "";
+        const timer = setTimeout(() => {
+          c.destroy();
+          reject(new Error(`GROK_RPC_SOCK ${method} to ${target} timed out after ${timeoutMs ?? 120000}ms`));
+        }, timeoutMs ?? 120_000);
+        c.on("error", (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+        c.on("data", (chunk) => {
+          buf += chunk.toString();
+          if (!buf.includes("\n")) return;
+          clearTimeout(timer);
+          try {
+            const msg = JSON.parse(buf.split("\n")[0]) as { ok?: boolean; result?: unknown; error?: string };
+            if (msg.ok) resolve(msg.result);
+            else reject(new Error(msg.error ?? "rpc-hatch error"));
+          } catch (e) {
+            reject(e as Error);
+          } finally {
+            c.end();
+          }
+        });
+        c.write(JSON.stringify({ dest: target, method, params, timeoutMs: timeoutMs ?? 120000 }) + "\n");
+      });
+    return {
+      dest: destFixed,
+      request: (method, params, timeoutMs) => call(destFixed, method, params, timeoutMs),
+      requestTo: (target, method, params, timeoutMs) => call(target, method, params, timeoutMs),
+      stop: async () => {},
+    };
   }
 
   const client = new RpcClient({
