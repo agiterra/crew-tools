@@ -380,11 +380,18 @@ export async function sessionClaudeArgv(name: string, t?: RemoteTarget): Promise
 /** Send keystrokes to a remote session (e.g. the dev-channel confirm CR). */
 export async function sendRemoteKeys(name: string, text: string, t: RemoteTarget): Promise<void> {
   // base64 the payload so CRs / metachars survive the SSH + sudo + screen hop.
-  const b64 = Buffer.from(text).toString("base64");
-  await sshRun(
-    t,
-    `${remoteScreen(t)} -S ${name} -X stuff "$(printf %s ${b64} | base64 -d)"`,
-  );
+  // Chunked like the local path: `screen -X stuff` silently drops the WHOLE payload past ~750
+  // bytes (measured 2026-09-02 on homebrew screen as _ephemeral: 700 lands, 800 lands nothing,
+  // exit 0). A 1000-char agent_send through this path returned landed:false with nothing typed
+  // (Brioche 595941). STUFF_CHUNK (256) is well under the cap; a short settle keeps order.
+  for (let i = 0; i < text.length; i += STUFF_CHUNK) {
+    const b64 = Buffer.from(text.slice(i, i + STUFF_CHUNK)).toString("base64");
+    await sshRun(
+      t,
+      `${remoteScreen(t)} -S ${name} -X stuff "$(printf %s ${b64} | base64 -d)"`,
+    );
+    if (i + STUFF_CHUNK < text.length) await new Promise((r) => setTimeout(r, 30));
+  }
 }
 
 /**
