@@ -389,6 +389,13 @@ export async function startServer(): Promise<void> {
         properties: {
           id: { type: "string", description: "Agent ID" },
           cc_session_id: { type: "string", description: "Claude Code session ID — disambiguates when multiple instances share an agent ID (e.g. during handoff)" },
+          override_reason: {
+            type: "string",
+            description:
+              "Written justification (>=10 chars) for a hard stop with NO fired alarm on the target within the restart-guard window. " +
+              "crew-service's restart-guard ALARM GATE denies a spawner's alarm-less agent_stop unless this is present; it is recorded on the stop. " +
+              "Not needed when a fresh alarm exists or the caller is the operator/ED.",
+          },
         },
         required: ["id"],
       },
@@ -804,7 +811,11 @@ export async function startServer(): Promise<void> {
           result = await crewRpc("crew.agent_close", { id: a.id, cc_session_id: a.cc_session_id }, 120_000);
           break;
         case "agent_stop":
-          result = await crewRpc("crew.agent_stop", { id: a.id }, 120_000);
+          result = await crewRpc(
+            "crew.agent_stop",
+            { id: a.id, ...(a.cc_session_id ? { cc_session_id: a.cc_session_id } : {}), ...(a.override_reason ? { override_reason: a.override_reason } : {}) },
+            120_000,
+          );
           break;
         case "agent_list": {
           let agents = await orchestrator.listAgents();

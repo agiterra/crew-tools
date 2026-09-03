@@ -29,7 +29,7 @@ Commands:
                                            Use '-' to read from stdin (preferred for secrets like AGENT_PRIVATE_KEY).
   resume  --json <path|->                  Resume a stopped agent.
   close   <id> [--cc-session-id ID]        Gracefully close an agent (/exit for Claude, SIGTERM for bridge runtimes, then verified cleanup). Preferred over stop. Matches crew's agent_close MCP tool.
-  stop    <id> [--cc-session-id ID]        Hard-stop an agent (kills the screen session). Use only when the runtime is unresponsive. Matches crew's agent_stop MCP tool.
+  stop    <id> [--override-reason "why"]  Hard-stop an agent (kills the screen session). Use only when the runtime is unresponsive. Matches crew's agent_stop MCP tool.
   agent-send <id> <text>                   Send keystrokes to an agent's screen.
   machine-register --json <path|->         Register a peer machine in this DB. JSON: {name, ssh_host, ssh_port?, notes?, skip_probe?}.
                                            Used by reciprocal pairing — laptop SSHes mini and runs this to add itself.
@@ -154,8 +154,11 @@ export async function runCli(argv: string[]): Promise<CliResult> {
       const id = rest[0];
       if (!id) return { exit: 1, stderr: "stop requires <id>\n" };
       const flags = parseFlags(rest.slice(1));
+      // --override-reason: the restart-guard ALARM GATE denies a spawner's alarm-less hard stop without a
+      // written reason (>=10 chars); the reason is recorded on the stop. Brioche 597955 (2026-09-03).
+      const overrideReason = flags["override-reason"]?.trim();
       try {
-        const result = await withCrewRpc((request) => request("crew.agent_stop", { id }, 120_000));
+        const result = await withCrewRpc((request) => request("crew.agent_stop", { id, ...(overrideReason ? { override_reason: overrideReason } : {}) }, 120_000));
         return { exit: 0, stdout: `${JSON.stringify(result)}\n` };
       } catch (e) {
         return { exit: 2, stderr: `stop failed: ${(e as Error).message}\n` };
