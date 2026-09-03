@@ -6,6 +6,7 @@
  */
 
 import { join } from "path";
+import { randomUUID } from "crypto";
 import { CrewStore, type Agent, type Tab, type Pane, type AgentTombstone, type Machine } from "./store.js";
 import * as screen from "./screen.js";
 import type { TerminalBackend } from "./terminal.js";
@@ -809,6 +810,13 @@ export class Orchestrator {
     // the prompt (quoted free text that can contain literal "--model").
     const baseCommand = getLaunchCommand(runtime, templateVars);
     let command = baseCommand;
+    // Stamp the Claude Code session id at launch (`--session-id <uuid>`) and record
+    // it on the row: nothing else ever did for spawned lanes — every lane row in
+    // crews.db carried cc_session_id=NULL (2026-09-03, zaletto), so agent_resume
+    // never had anything to --resume and silently rebuilt a fresh context. The
+    // registering-agent path (registerAgent) reads its own id; spawns get one here.
+    const ccSessionId = runtime === "claude-code" ? randomUUID() : undefined;
+    if (ccSessionId) command += ` --session-id ${ccSessionId}`;
     if (opts.prompt) {
       command += ` ${shellEscape(opts.prompt)}`;
     }
@@ -977,6 +985,7 @@ export class Orchestrator {
       runtime,
       screen_name: screenName,
       screen_pid: session.pid,
+      cc_session_id: ccSessionId,
       badge: opts.badge,
       ttl_idle_minutes: opts.ttlIdleMinutes,
       spawn_manifest: JSON.stringify(manifest),
@@ -1122,9 +1131,20 @@ export class Orchestrator {
     // --resume is only added when we have a cc_session_id to resume; if the
     // original agent never booted a CC session (cc_session_id=null in the
     // tombstone) we launch fresh from the manifest instead.
-    let command =
-      `claude --dangerously-load-development-channels ${shellEscape(channels)} ` +
-      `--permission-mode bypassPermissions`;
+    // Rebuild from the SAME runtime template launchAgent used (~/.wire/runtimes.json
+    // or the built-in default), then append --resume. The template is where the
+    // fleet's flags live — --mcp-config (per-lane browser/wallet MCP), model and
+    // effort pins, --disallowedTools, --append-system-prompt — and a hand-built
+    // bare command dropped every one of them (2026-09-03: a resumed lane came up
+    // with no Playwright server and no pins; Brioche 597983). An explicit or
+    // manifest channels list replaces the template's channel argument.
+    let command = getLaunchCommand(runtime, { ...mergedEnv, PROJECT_DIR: projectDir });
+    if (opts.channels ?? manifest?.channels) {
+      const flag = `--dangerously-load-development-channels ${shellEscape(channels)}`;
+      const re = /--dangerously-load-development-channels\s+(?:'[^']*'|"[^"]*"|\S+)/;
+      // A template that is a launcher script carries no channels flag; append it then.
+      command = re.test(command) ? command.replace(re, flag) : `${command} ${flag}`;
+    }
     if (ccSessionId) command += ` --resume ${shellEscape(ccSessionId)}`;
     if (extraFlags) command += ` ${extraFlags}`;
 
@@ -1159,11 +1179,8 @@ export class Orchestrator {
       : await screen.createSession(screenName, fullCommand);
 
     // Auto-confirm dev-channel prompt — same polling helper as launchAgent,
-    // then the asked-vs-got read-back. NOTE the resume command asks only for
-    // channels (+ whatever extraFlags carry): a bare resume pins no model or
-    // effort, so the read-back asserts none — j:719's silent flag-loss class is
-    // a POLICY question for AGI-78, not something a verifier may invent an
-    // expectation for.
+    // then the asked-vs-got read-back. The resume command now carries the
+    // template's pins, so the read-back asserts exactly what launchAgent would.
     const resumeAsked = askedFromCommand(command, mergedEnv);
     void autoConfirmDevChannel(screenName, `resumed ${opts.id}`, { store: this.store, agentId: opts.id, remote: resumeTarget })
       .then(() => verifySpawnArgv(screenName, `resumed ${opts.id}`, resumeAsked, { store: this.store, agentId: opts.id, remote: resumeTarget }))

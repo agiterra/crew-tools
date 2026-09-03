@@ -663,6 +663,40 @@ describe("resumeAgent", () => {
     ).rejects.toThrow(/no tombstone for 'never-existed'/);
   });
 
+  test("launchAgent stamps --session-id <uuid> and records it; resume of that agent passes --resume <same uuid>", async () => {
+    // 2026-09-03: every spawned lane row had cc_session_id=NULL, so agent_resume
+    // could never carry context. The id is minted at launch, on the command AND the row.
+    await orch.launchAgent({ env: { AGENT_ID: "stamped" }, projectDir: "/tmp/stamped" });
+    const row = orch.store.getAgent("stamped");
+    expect(row!.cc_session_id).toMatch(/^[0-9a-f-]{36}$/);
+    const launchCmd = createSessionCalls[0]!.command;
+    expect(launchCmd).toContain(` --session-id ${row!.cc_session_id}`);
+    screenState.isAliveResult = true;
+    try { await orch.stopAgent("stamped"); } finally { screenState.isAliveResult = false; }
+    createSessionCalls.length = 0;
+    const resumed = await orch.resumeAgent({ id: "stamped" });
+    expect(resumed.cc_session_id).toBe(row!.cc_session_id);
+    const resumeCmd = createSessionCalls[0]!.command;
+    expect(resumeCmd).toContain(`--resume '${row!.cc_session_id}'`);
+    expect(resumeCmd).not.toContain("--session-id");
+  });
+
+  test("resume rebuilds from the runtime template launch used, not a bare hand-built command", async () => {
+    // Brioche 597983: a resumed lane came up without its --mcp-config browser
+    // server and without model/effort pins because resume hand-built
+    // `claude --dangerously-load-development-channels … --permission-mode …`.
+    // The base command (everything after the last `&& `, before the session
+    // flag) must be identical between launch and resume, whatever the template.
+    await orch.launchAgent({ env: { AGENT_ID: "tmpl" }, projectDir: "/tmp/tmpl" });
+    const base = (cmd: string) => cmd.slice(cmd.lastIndexOf("&& ") + 3).replace(/ --(session-id|resume) .*$/, "");
+    const launchBase = base(createSessionCalls[0]!.command);
+    screenState.isAliveResult = true;
+    try { await orch.stopAgent("tmpl"); } finally { screenState.isAliveResult = false; }
+    createSessionCalls.length = 0;
+    await orch.resumeAgent({ id: "tmpl" });
+    expect(base(createSessionCalls[0]!.command)).toBe(launchBase);
+  });
+
   test("resumes from tombstone with null cc_session_id by launching fresh (no --resume flag)", async () => {
     // Agent that /exit'd before CC wrote a session file — tombstone has
     // manifest but no cc_session_id. Brioche's verification case #9.
@@ -670,7 +704,10 @@ describe("resumeAgent", () => {
       env: { AGENT_ID: "never-booted" },
       projectDir: "/tmp/nb",
     });
-    // Leave cc_session_id as NULL — simulate an agent that never booted CC.
+    // launchAgent now stamps a session id; null it to simulate an agent that
+    // never booted CC (the row is what stopAgent copies into the tombstone).
+    (orch.store as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db
+      .prepare("UPDATE agents SET cc_session_id = NULL WHERE id = ?").run("never-booted");
     screenState.isAliveResult = true;
     try { await orch.stopAgent("never-booted"); } finally { screenState.isAliveResult = false; }
     createSessionCalls.length = 0;
@@ -717,6 +754,7 @@ describe("registerAgent id-mismatch safety", () => {
   test("throws when caller id doesn't match the agent owning the screen", async () => {
     // Simulate Brioche running in screen 'wire-brioche' with an existing row
     await orch.launchAgent({ env: { AGENT_ID: "brioche", AGENT_NAME: "Brioche" } });
+    const stamped = orch.store.getAgent("brioche")!.cc_session_id;
 
     const prevSty = process.env.STY;
     process.env.STY = "99999.wire-brioche";
@@ -729,7 +767,7 @@ describe("registerAgent id-mismatch safety", () => {
       // Brioche's row must be untouched
       const row = orch.store.getAgent("brioche");
       expect(row).not.toBeNull();
-      expect(row!.cc_session_id).toBeNull();
+      expect(row!.cc_session_id).toBe(stamped);
     } finally {
       if (prevSty === undefined) delete process.env.STY;
       else process.env.STY = prevSty;
