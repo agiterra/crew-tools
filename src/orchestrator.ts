@@ -18,6 +18,9 @@ import { getClaudeCodeSessionId } from "./claude-session.js";
 import { assertClaudeCredentialLive } from "./credentials.js";
 import { buildConfigDirSetup } from "./config-dir.js";
 
+/** The agent/lane id contract, enforced by launchAgent. Mirrored by wallet-browser-register.sh and lane-reap.sh. */
+export const AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
 // CREW_DB overrides for the machine-shared database (one crews.db per
 // machine, e.g. /opt/agiterra/crew/crews.db group-fabrica — Tim 2026-07-02).
 // Default stays the per-user path for machines without the shared setup.
@@ -775,6 +778,11 @@ export class Orchestrator {
   }): Promise<Agent> {
     const id = opts.env.AGENT_ID;
     if (!id) throw new Error("env.AGENT_ID is required");
+    // LANE ID CONTRACT — one regex, enforced at spawn so a bad id fails HERE with a reason, not 150 s later in
+    // a downstream consumer (2026-09-04, ENG-3980: the wallet-browser registrar refused `crumiri_` and the lane saw
+    // only an opaque Playwright error). Mirrors: wallet-browser-register.sh, lane-reap.sh. Path segment, screen
+    // name, spool filename, Wire id and `wallet-vault-<id>` are all safe for this charset.
+    if (!AGENT_ID_RE.test(id)) throw new Error(`env.AGENT_ID '${id}' is not a valid agent id — must match ${AGENT_ID_RE} (lowercase letters, digits, '-' and '_'; 1–64 chars; starts with a letter or digit)`);
     const displayName = opts.env.AGENT_NAME ?? id;
 
     // Wire identity is the caller's responsibility. crew-tools knows

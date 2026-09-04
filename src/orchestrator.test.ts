@@ -1431,3 +1431,12 @@ describe("verifyWireInbound — the BROKER's view of the inbound connection", ()
     }
   }, 30_000);
 });
+
+describe("launchAgent id contract", () => {
+  test("underscore-suffixed and hyphenated ids are accepted; dots, uppercase, leading '-' and >64 chars are refused at spawn", async () => {
+    const { AGENT_ID_RE } = await import("./orchestrator");
+    for (const ok of ["crumiri_", "bocconotti-2", "a", "kx-1a2b3c4d", "wire-grok", "0lane"]) expect(AGENT_ID_RE.test(ok)).toBe(true);
+    for (const bad of ["Bad.Name", "Crumiri", "-lead", "_lead", "", "x".repeat(65), "sp ace", "über"]) expect(AGENT_ID_RE.test(bad)).toBe(false);
+    await expect(orch.launchAgent({ env: { AGENT_ID: "Bad.Name" } })).rejects.toThrow(/not a valid agent id/);
+  });
+});
