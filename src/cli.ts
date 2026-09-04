@@ -128,6 +128,12 @@ export async function runCli(argv: string[]): Promise<CliResult> {
           cc_session_id: opts.cc_session_id ?? opts.ccSessionId,
           project_dir: opts.project_dir ?? opts.projectDir,
           env: opts.env,
+          // extra_flags/badge/channels were silently dropped here (Brioche 599051: a resume with
+          // extra_flags "--debug" came up without it). Forward every field the service accepts.
+          extra_flags: opts.extra_flags ?? opts.extraFlags,
+          badge: opts.badge,
+          channels: opts.channels,
+          run_as_uid: opts.run_as_uid ?? opts.runAsUid,
         }, 120_000));
         return { exit: 0, stdout: `${JSON.stringify(result)}\n` };
       } catch (e) {
