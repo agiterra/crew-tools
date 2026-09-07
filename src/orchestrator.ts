@@ -844,6 +844,11 @@ export class Orchestrator {
       runtime === "claude-code"
         ? { CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "false", ...opts.env }
         : { ...opts.env };
+    // Per-lane TMPDIR in the PROCESS env so a lane's mktemp/tempfile scratch (and every Bash-tool call, which
+    // does not persist a sourced env) lands under one sweepable lane dir — lane-reap retires it. Claude lanes
+    // launched via crew-service never sourced lane-env.sh's export; this is the choke point (Brioche 2026-09-05,
+    // pasticciotti). Caller-set TMPDIR wins. Dir is created in the launch command below.
+    if (!spawnEnv.TMPDIR) { const _t = `/tmp/agiterra-lane-${id}`; spawnEnv.TMPDIR = _t; spawnEnv.TMP = _t; spawnEnv.TEMP = _t; }
     const envExports = `export ${Object.entries(spawnEnv)
       .map(([k, v]) => `${k}=${shellEscape(v)}`)
       .join(" ")}`;
@@ -852,7 +857,8 @@ export class Orchestrator {
     // snippet's unset-guard, same precedence as every other env var.
     const configDirSetup = runtime === "claude-code" ? ` && ${buildConfigDirSetup(id, projectDir)}` : "";
     const wipe = runtime === "claude-code" ? WIPE_CLAUDE_SETTINGS_LOCAL : "";
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipe}${envExports} && ${SOURCE_NEAREST_ENV}${configDirSetup} && ${command}`;
+    const _mkTmp = spawnEnv.TMPDIR ? `mkdir -p ${shellEscape(spawnEnv.TMPDIR)} 2>/dev/null; chmod 700 ${shellEscape(spawnEnv.TMPDIR)} 2>/dev/null; ` : "";
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipe}${_mkTmp}${envExports} && ${SOURCE_NEAREST_ENV}${configDirSetup} && ${command}`;
 
     // Create screen session — local, or on a remote host when opts.machine
     // names a non-local machine (cross-machine spawn: ssh + sudo -u <run_as_uid>).
@@ -1146,6 +1152,7 @@ export class Orchestrator {
     // bare command dropped every one of them (2026-09-03: a resumed lane came up
     // with no Playwright server and no pins; Brioche 597983). An explicit or
     // manifest channels list replaces the template's channel argument.
+    if (!mergedEnv.TMPDIR) { const _t = `/tmp/agiterra-lane-${opts.id}`; mergedEnv.TMPDIR = _t; mergedEnv.TMP = _t; mergedEnv.TEMP = _t; }
     let command = getLaunchCommand(runtime, { ...mergedEnv, PROJECT_DIR: projectDir });
     if (opts.channels ?? manifest?.channels) {
       const flag = `--dangerously-load-development-channels ${shellEscape(channels)}`;
@@ -1164,7 +1171,8 @@ export class Orchestrator {
     // resume a PRE-isolation agent (transcript in the shared ~/.claude),
     // pass env.CLAUDE_CONFIG_DIR=$HOME/.claude — the snippet's unset-guard
     // then no-ops.
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${WIPE_CLAUDE_SETTINGS_LOCAL}${envExports} && ${SOURCE_NEAREST_ENV} && ${buildConfigDirSetup(opts.id, projectDir)} && ${command}`;
+    const _mkTmpR = mergedEnv.TMPDIR ? `mkdir -p ${shellEscape(mergedEnv.TMPDIR)} 2>/dev/null; chmod 700 ${shellEscape(mergedEnv.TMPDIR)} 2>/dev/null; ` : "";
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${WIPE_CLAUDE_SETTINGS_LOCAL}${_mkTmpR}${envExports} && ${SOURCE_NEAREST_ENV} && ${buildConfigDirSetup(opts.id, projectDir)} && ${command}`;
 
     // Resume is same-HOST only, but may cross UIDs: a crew-service
     // `_ephemeral` spawn resumes under its original account (tombstone

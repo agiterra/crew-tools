@@ -186,6 +186,8 @@ describe("launchAgent env forwarding", () => {
     expect(createSessionCalls).toHaveLength(1);
     const cmd = createSessionCalls[0]!.command;
     expect(cmd).toContain("AGENT_ID='test-agent'");
+    expect(cmd).toContain("TMPDIR='/tmp/agiterra-lane-test-agent'"); // per-lane TMPDIR at spawn (pasticciotti)
+    expect(cmd).toContain("mkdir -p '/tmp/agiterra-lane-test-agent'");
     expect(cmd).toContain("AGENT_NAME='Test Agent'");
   });
 
