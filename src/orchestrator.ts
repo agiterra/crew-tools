@@ -102,6 +102,17 @@ export const SOURCE_NEAREST_ENV =
   `if [ -f "$d/.env" ]; then set -a; . "$d/.env"; set +a; break; fi; ` +
   `d=$(dirname "$d"); done`;
 
+// ENG-3719: every FV lane runs its OWN isolated compose stack, but the nearest .env
+// (fabrica-v3/.env, laptop-era) exports a SHARED-DB LOCAL_DATABASE_URL and could gain
+// DB_CONN_STRING/APP_CACHE_URL/QUEUE_URL \u2014 and SOURCE_NEAREST_ENV sources it with `.env
+// wins`, so a lane silently inherits the shared endpoint and bypasses its isolated stack
+// (Brioche 605254/605273: the api reads DB_CONN_STRING/config, not LOCAL_DATABASE_URL, so
+// clearing these is safe for every lane's api/worker and forces config/local.json \u2014 the
+// isolated stack \u2014 to win). Runs right AFTER SOURCE_NEAREST_ENV so it clears exactly the
+// inherited shared endpoints, nothing else.
+export const NEUTRALIZE_INHERITED_DB_OVERRIDES =
+  ` && unset LOCAL_DATABASE_URL DB_CONN_STRING APP_CACHE_URL QUEUE_URL`;
+
 // Claude Code loads project_dir/.claude/settings.local.json and will disable
 // github/datadog/render MCP if a previous session wrote it. Gitignore only
 // stops commit. Codex/Grok ignore the file. Wipe on Claude spawn/resume only;
@@ -858,7 +869,7 @@ export class Orchestrator {
     const configDirSetup = runtime === "claude-code" ? ` && ${buildConfigDirSetup(id, projectDir)}` : "";
     const wipe = runtime === "claude-code" ? WIPE_CLAUDE_SETTINGS_LOCAL : "";
     const _mkTmp = spawnEnv.TMPDIR ? `mkdir -p ${shellEscape(spawnEnv.TMPDIR)} 2>/dev/null; chmod 700 ${shellEscape(spawnEnv.TMPDIR)} 2>/dev/null; ` : "";
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipe}${_mkTmp}${envExports} && ${SOURCE_NEAREST_ENV}${configDirSetup} && ${command}`;
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipe}${_mkTmp}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES}${configDirSetup} && ${command}`;
 
     // Create screen session — local, or on a remote host when opts.machine
     // names a non-local machine (cross-machine spawn: ssh + sudo -u <run_as_uid>).
@@ -1172,7 +1183,7 @@ export class Orchestrator {
     // pass env.CLAUDE_CONFIG_DIR=$HOME/.claude — the snippet's unset-guard
     // then no-ops.
     const _mkTmpR = mergedEnv.TMPDIR ? `mkdir -p ${shellEscape(mergedEnv.TMPDIR)} 2>/dev/null; chmod 700 ${shellEscape(mergedEnv.TMPDIR)} 2>/dev/null; ` : "";
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${WIPE_CLAUDE_SETTINGS_LOCAL}${_mkTmpR}${envExports} && ${SOURCE_NEAREST_ENV} && ${buildConfigDirSetup(opts.id, projectDir)} && ${command}`;
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${WIPE_CLAUDE_SETTINGS_LOCAL}${_mkTmpR}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES} && ${buildConfigDirSetup(opts.id, projectDir)} && ${command}`;
 
     // Resume is same-HOST only, but may cross UIDs: a crew-service
     // `_ephemeral` spawn resumes under its original account (tombstone

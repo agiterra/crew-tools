@@ -189,6 +189,10 @@ describe("launchAgent env forwarding", () => {
     expect(cmd).toContain("TMPDIR='/tmp/agiterra-lane-test-agent'"); // per-lane TMPDIR at spawn (pasticciotti)
     expect(cmd).toContain("mkdir -p '/tmp/agiterra-lane-test-agent'");
     expect(cmd).toContain("AGENT_NAME='Test Agent'");
+    // ENG-3719: shared-DB endpoints inherited from the nearest .env are cleared AFTER it is sourced,
+    // so a lane's isolated stack (config/local.json) wins and cannot be silently bypassed.
+    expect(cmd).toContain("unset LOCAL_DATABASE_URL DB_CONN_STRING APP_CACHE_URL QUEUE_URL");
+    expect(cmd.indexOf("set +a")).toBeLessThan(cmd.indexOf("unset LOCAL_DATABASE_URL"));
   });
 
   test("throws when env.AGENT_ID is missing", async () => {
