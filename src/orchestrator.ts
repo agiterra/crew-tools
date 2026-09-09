@@ -898,10 +898,12 @@ export class Orchestrator {
     // verify the credential in the home the agent will actually run under
     // (remote: /Users/<run_as_uid>; local: this process's $HOME) BEFORE spawning.
     if (runtime === "claude-code") {
+      // CLAUDE_ACCOUNT=<slot> → check the per-slot copy the lane will actually link to.
+      const account = spawnEnv.CLAUDE_ACCOUNT || undefined;
       await assertClaudeCredentialLive(
         remoteTarget
-          ? { kind: "remote", target: remoteTarget }
-          : { kind: "local", home: process.env.HOME ?? "" },
+          ? { kind: "remote", target: remoteTarget, account }
+          : { kind: "local", home: process.env.HOME ?? "", account },
       );
     }
 
@@ -1195,10 +1197,12 @@ export class Orchestrator {
 
     // Fail closed on a dead credential — same guard as launchAgent, in the
     // home the agent will actually run under.
+    // A lane's account choice rides its manifest env (sticky in the lane dir too).
+    const resumeAccount = mergedEnv.CLAUDE_ACCOUNT || undefined;
     await assertClaudeCredentialLive(
       resumeTarget
-        ? { kind: "remote", target: resumeTarget }
-        : { kind: "local", home: process.env.HOME ?? "" },
+        ? { kind: "remote", target: resumeTarget, account: resumeAccount }
+        : { kind: "local", home: process.env.HOME ?? "", account: resumeAccount },
     );
 
     const session = resumeTarget

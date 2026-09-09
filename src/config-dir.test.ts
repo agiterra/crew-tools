@@ -122,3 +122,63 @@ describe("buildConfigDirSetup (executed against a fake home)", () => {
     rmSync(home, { recursive: true, force: true });
   });
 });
+
+describe("buildConfigDirSetup — per-lane account choice (CLAUDE_ACCOUNT)", () => {
+  function fakeHome(withSlot?: string): string {
+    const home = mkdtempSync(join(tmpdir(), "crew-configdir-acct-"));
+    mkdirSync(join(home, ".claude", "accounts"), { recursive: true });
+    writeFileSync(join(home, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "main" } }));
+    if (withSlot) writeFileSync(join(home, ".claude", "accounts", `${withSlot}.credentials.json`), JSON.stringify({ claudeAiOauth: { accessToken: withSlot } }));
+    return home;
+  }
+  function run(home: string, agentId: string, env: Record<string, string>): { status: number; stderr: string } {
+    try {
+      execSync(buildConfigDirSetup(agentId, "/tmp/proj"), { shell: "/bin/sh", env: { HOME: home, PATH: process.env.PATH, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+      return { status: 0, stderr: "" };
+    } catch (e) {
+      const err = e as { status?: number; stderr?: Buffer };
+      return { status: err.status ?? -1, stderr: err.stderr?.toString() ?? "" };
+    }
+  }
+
+  test("CLAUDE_ACCOUNT=<slot> links the lane to the per-slot copy and records the choice", () => {
+    const home = fakeHome("personal");
+    expect(run(home, "gateau", { CLAUDE_ACCOUNT: "personal" }).status).toBe(0);
+    const dir = join(home, ".claude-agents", "gateau");
+    expect(readlinkSync(join(dir, ".credentials.json"))).toBe(join(home, ".claude", "accounts", "personal.credentials.json"));
+    expect(readFileSync(join(dir, ".claude-account"), "utf-8")).toBe("personal");
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test("fails CLOSED (exit 94) when the chosen slot has no fanned copy — never falls back to main", () => {
+    const home = fakeHome();
+    const r = run(home, "gateau", { CLAUDE_ACCOUNT: "tim" });
+    expect(r.status).toBe(94);
+    expect(r.stderr).toContain("refusing to spawn on the wrong account");
+    expect(existsSync(join(home, ".claude-agents", "gateau", ".credentials.json"))).toBe(false);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test("rejects a shell-unsafe slot name (exit 94)", () => {
+    const home = fakeHome("personal");
+    expect(run(home, "gateau", { CLAUDE_ACCOUNT: "../.." }).status).toBe(94);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test("sticky: a resume WITHOUT the env var keeps the recorded account", () => {
+    const home = fakeHome("personal");
+    expect(run(home, "gateau", { CLAUDE_ACCOUNT: "personal" }).status).toBe(0);
+    expect(run(home, "gateau", {}).status).toBe(0);
+    expect(readlinkSync(join(home, ".claude-agents", "gateau", ".credentials.json"))).toBe(join(home, ".claude", "accounts", "personal.credentials.json"));
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test("no CLAUDE_ACCOUNT and no record → main copy, exactly as before", () => {
+    const home = fakeHome("personal");
+    expect(run(home, "gateau", {}).status).toBe(0);
+    const dir = join(home, ".claude-agents", "gateau");
+    expect(readlinkSync(join(dir, ".credentials.json"))).toBe(join(home, ".claude", ".credentials.json"));
+    expect(existsSync(join(dir, ".claude-account"))).toBe(false);
+    rmSync(home, { recursive: true, force: true });
+  });
+});

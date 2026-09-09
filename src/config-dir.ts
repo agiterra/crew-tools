@@ -94,7 +94,23 @@ export function buildConfigDirSetup(agentId: string, projectDir: string): string
     // credential AND the CLAUDE_CODE_OAUTH_TOKEN env, so it silently expires and
     // 401s the agent while the real ~/.claude credential is perfectly valid
     // (profiterole canary, 2026-07-06 — expired 07-03 copy in a reused dir).
-    `if [ -e "$HOME/.claude/.credentials.json" ]; then ` +
+    // Per-lane ACCOUNT choice (Tim 2026-09-09): CLAUDE_ACCOUNT=<slot> in the spawn env
+    // links the lane to the fan's per-slot copy ~/.claude/accounts/<slot>.credentials.json
+    // (agiterra-credential-sync writes one per slot in the root store) instead of the
+    // home's pinned/active main copy — so a lane can draw on the OTHER subscription's
+    // quota. The choice is recorded in the lane dir (.claude-account) and is STICKY: a
+    // resume without the env var keeps it (cred-symlink-heal honours the file too).
+    // FAIL CLOSED when the chosen slot has no fanned copy: a lane silently launched on
+    // the wrong account defeats the only reason the account was chosen.
+    `if [ -z "\${CLAUDE_ACCOUNT:-}" ] && [ -f "$CLAUDE_CONFIG_DIR/.claude-account" ]; then CLAUDE_ACCOUNT=$(cat "$CLAUDE_CONFIG_DIR/.claude-account"); fi; ` +
+    `if [ -n "\${CLAUDE_ACCOUNT:-}" ]; then ` +
+    `case "$CLAUDE_ACCOUNT" in *[!a-z0-9-]*) echo "[crew] CLAUDE_ACCOUNT '$CLAUDE_ACCOUNT' is not a slot name (a-z0-9-)" >&2; exit 94;; esac; ` +
+    `if [ ! -e "$HOME/.claude/accounts/$CLAUDE_ACCOUNT.credentials.json" ]; then ` +
+    `echo "[crew] CLAUDE_ACCOUNT '$CLAUDE_ACCOUNT': no fanned copy at $HOME/.claude/accounts/$CLAUDE_ACCOUNT.credentials.json (unknown slot, or the credential fan has not written it) — refusing to spawn on the wrong account" >&2; exit 94; ` +
+    `fi; ` +
+    `ln -sf "$HOME/.claude/accounts/$CLAUDE_ACCOUNT.credentials.json" "$CLAUDE_CONFIG_DIR/.credentials.json" || exit 91; ` +
+    `printf %s "$CLAUDE_ACCOUNT" > "$CLAUDE_CONFIG_DIR/.claude-account" || exit 91; ` +
+    `elif [ -e "$HOME/.claude/.credentials.json" ]; then ` +
     `ln -sf "$HOME/.claude/.credentials.json" "$CLAUDE_CONFIG_DIR/.credentials.json" || exit 91; ` +
     `fi; ` +
     `for e in ${entries}; do ` +

@@ -42,10 +42,24 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import { sshRun, type RemoteTarget } from "./screen.js";
 
-/** Where a claude-code agent will read its subscription credential. */
+/**
+ * Where a claude-code agent will read its subscription credential. `account`
+ * (spawn env CLAUDE_ACCOUNT=<slot>) points at the fan's per-slot copy
+ * `~/.claude/accounts/<slot>.credentials.json` instead of the home's main copy —
+ * the file the config-dir snippet will actually link the lane to.
+ */
 export type CredentialTarget =
-  | { kind: "local"; home: string }
-  | { kind: "remote"; target: RemoteTarget };
+  | { kind: "local"; home: string; account?: string }
+  | { kind: "remote"; target: RemoteTarget; account?: string };
+
+/** Relative path (under <home>) of the credential file a target reads. */
+function credentialRel(account: string | undefined): string {
+  if (account !== undefined && account !== "") {
+    if (!/^[a-z0-9-]+$/.test(account)) throw new Error(`crew: CLAUDE_ACCOUNT '${account}' is not a slot name (a-z0-9-)`);
+    return `.claude/accounts/${account}.credentials.json`;
+  }
+  return ".claude/.credentials.json";
+}
 
 export type CredentialStatus = { live: true } | { live: false; reason: string };
 
@@ -102,9 +116,10 @@ export function credentialStatus(
 
 /** Absolute path to the credential file for a target (used in messages). */
 export function credentialPath(target: CredentialTarget): string {
+  const rel = credentialRel(target.account);
   return target.kind === "local"
-    ? join(target.home, ".claude", ".credentials.json")
-    : `/Users/${target.target.runAsUid}/.claude/.credentials.json`;
+    ? join(target.home, rel)
+    : `/Users/${target.target.runAsUid}/${rel}`;
 }
 
 /** Absolute path to the durable setup-token for a target. */
@@ -161,12 +176,15 @@ export async function assertClaudeCredentialLive(target: CredentialTarget): Prom
   const status = credentialStatus(content);
   if (!status.live) {
     // A dead fanned credential is only provable death when no durable
-    // setup-token backs the home (the token wins inside claude-code).
-    if (await hasSetupToken(target)) return;
+    // setup-token backs the home (the token wins inside claude-code). A setup-token
+    // does NOT rescue an explicit account choice: it would put the lane on the
+    // token's account, not the one asked for.
+    if (!target.account && (await hasSetupToken(target))) return;
+    const acct = target.account ? ` (CLAUDE_ACCOUNT=${target.account})` : "";
     throw new Error(
-      `crew: refusing to spawn claude-code — Claude credential ${status.reason} at ${credentialPath(target)}, ` +
-        `and no setup-token at ${setupTokenPath(target)}. ` +
-        `Re-run agiterra-credential-sync (or re-login the anchor). Override with CREW_SKIP_CRED_CHECK=1.`,
+      `crew: refusing to spawn claude-code — Claude credential${acct} ${status.reason} at ${credentialPath(target)}` +
+        (target.account ? ". " : `, and no setup-token at ${setupTokenPath(target)}. `) +
+        `Re-run agiterra-credential-sync (or re-login the anchor${target.account ? " for that slot" : ""}). Override with CREW_SKIP_CRED_CHECK=1.`,
     );
   }
 }

@@ -135,3 +135,24 @@ describe("local readCredential + assertClaudeCredentialLive", () => {
     );
   });
 });
+
+describe("credentialPath — per-lane account (CLAUDE_ACCOUNT)", () => {
+  test("account → the fan's per-slot copy, local and remote", () => {
+    expect(credentialPath({ kind: "local", home: "/Users/x", account: "tim" })).toBe("/Users/x/.claude/accounts/tim.credentials.json");
+    expect(credentialPath({ kind: "remote", target: { sshHost: "h", runAsUid: "_ephemeral" } as any, account: "personal" })).toBe("/Users/_ephemeral/.claude/accounts/personal.credentials.json");
+  });
+  test("rejects a non-slot account name", () => {
+    expect(() => credentialPath({ kind: "local", home: "/Users/x", account: "../x" })).toThrow(/not a slot name/);
+  });
+  test("an expired per-slot copy fails closed even when a setup-token backs the home", async () => {
+    const home = mkdtempSync(join(tmpdir(), "crew-cred-acct-"));
+    mkdirSync(join(home, ".claude", "accounts"), { recursive: true });
+    writeFileSync(join(home, ".claude-oauth-token"), "sk-ant-oat01-durable");
+    writeFileSync(join(home, ".claude", "accounts", "tim.credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "t", expiresAt: Date.now() - HOUR } }));
+    await expect(assertClaudeCredentialLive({ kind: "local", home, account: "tim" })).rejects.toThrow(/CLAUDE_ACCOUNT=tim/);
+    // without the account the same home is LIVE (setup-token) — the account is what removes the rescue
+    writeFileSync(join(home, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "t", expiresAt: Date.now() - HOUR } }));
+    await expect(assertClaudeCredentialLive({ kind: "local", home })).resolves.toBeUndefined();
+    rmSync(home, { recursive: true, force: true });
+  });
+});
