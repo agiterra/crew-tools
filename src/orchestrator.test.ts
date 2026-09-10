@@ -1,5 +1,5 @@
-import { describe, test, expect, beforeEach, afterAll, mock } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { describe, test, expect, beforeEach, afterEach, afterAll, mock } from "bun:test";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { execSync } from "child_process";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -31,6 +31,8 @@ const screenState = {
   // Scriptable ACTING argv for the post-spawn read-back chain. null = the probe
   // saw nothing (the argv-unreadable path).
   argvResult: null as string | null,
+  sshRunCalls: [] as Array<{ target: unknown; command: string }>,
+  sshRunResult: "",
 };
 
 // Wire broker stub. The inbound read-back's default reader is an HTTP GET
@@ -106,9 +108,13 @@ mock.module("./screen", () => ({
     createSessionCalls.push({ name, command });
     return { name, pid: 12345 };
   },
-  // Imported by credentials.ts (remote credential read). Unused in these tests
-  // (CREW_SKIP_CRED_CHECK short-circuits) but the mock must satisfy the import.
-  sshRun: async () => "",
+  // Imported by credentials.ts (remote credential read) and by the codex-spawn
+  // teardown (cross-uid rm). Recorded so a test can assert the exact command,
+  // and scriptable so it can replay a remote rm that did / did not succeed.
+  sshRun: async (target: unknown, command: string) => {
+    screenState.sshRunCalls.push({ target, command });
+    return screenState.sshRunResult;
+  },
   getRemoteSessionPid: async () => null,
   pollRemoteSessionPid: async () => null,
   // Post-spawn verify chain (v2.26.0). Tests inject channelProbe/argvReader
@@ -167,6 +173,8 @@ beforeEach(() => {
   screenState.terminateSessionCalls.length = 0;
   screenState.terminateSessionSurvivors = 0;
   screenState.argvResult = null;
+  screenState.sshRunCalls.length = 0;
+  screenState.sshRunResult = "";
   wireState.roster = [];
   wireState.failWith = null;
   wireState.bodyOverride = undefined;
@@ -1444,5 +1452,175 @@ describe("launchAgent id contract", () => {
     for (const ok of ["crumiri_", "bocconotti-2", "a", "kx-1a2b3c4d", "wire-grok", "0lane"]) expect(AGENT_ID_RE.test(ok)).toBe(true);
     for (const bad of ["Bad.Name", "Crumiri", "-lead", "_lead", "", "x".repeat(65), "sp ace", "über"]) expect(AGENT_ID_RE.test(bad)).toBe(false);
     await expect(orch.launchAgent({ env: { AGENT_ID: "Bad.Name" } })).rejects.toThrow(/not a valid agent id/);
+  });
+});
+
+
+describe("codex-spawn teardown (AGI-74)", () => {
+  /**
+   * A codex spawn's CODEX_HOME is `$HOME/.wire/codex-spawn/<id>/` with its
+   * thread pointer beside it (wire-codex index.ts:74-79, codex-launch.sh:118).
+   * Build that shape under a temp HOME and assert close/stop remove exactly
+   * the torn-down agent's pair.
+   */
+  let fakeHome: string;
+  let spawnRoot: string;
+  let realHome: string | undefined;
+
+  function seedSpawn(id: string): { dir: string; thread: string } {
+    const dir = join(spawnRoot, id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.toml"), `# ${id}\n`);
+    mkdirSync(join(dir, "sessions"), { recursive: true });
+    writeFileSync(join(dir, "sessions", "rollout.jsonl"), "{}\n");
+    const thread = join(spawnRoot, `${id}.thread.json`);
+    writeFileSync(thread, JSON.stringify({ threadId: "t-" + id }) + "\n");
+    return { dir, thread };
+  }
+
+  beforeEach(() => {
+    fakeHome = mkdtempSync(join(tmpdir(), "codex-home-"));
+    spawnRoot = join(fakeHome, ".wire", "codex-spawn");
+    mkdirSync(spawnRoot, { recursive: true });
+    realHome = process.env.HOME;
+  });
+
+  afterEach(() => {
+    if (realHome === undefined) delete process.env.HOME;
+    else process.env.HOME = realHome;
+    try { chmodSync(spawnRoot, 0o700); } catch {}
+    try { rmSync(fakeHome, { recursive: true, force: true }); } catch {}
+  });
+
+  test("closeAgent removes the codex home + thread file for THAT agent only", async () => {
+    const target = seedSpawn("galette");
+    const sibling = seedSpawn("parrozzo");
+    const persona = seedSpawn("fondant");
+
+    await orch.launchAgent({ env: { AGENT_ID: "galette" }, runtime: "codex", projectDir: "/tmp/galette" });
+
+    process.env.HOME = fakeHome;
+    await orch.closeAgent("galette", undefined, 250);
+
+    expect(existsSync(target.dir)).toBe(false);
+    expect(existsSync(target.thread)).toBe(false);
+    // Scoped: a live sibling and the persona's own home are untouched.
+    expect(existsSync(sibling.dir)).toBe(true);
+    expect(existsSync(sibling.thread)).toBe(true);
+    expect(existsSync(persona.dir)).toBe(true);
+    expect(orch.store.getAgent("galette")).toBeNull();
+  });
+
+  test("stopAgent (and therefore the idle reaper) removes them too", async () => {
+    const target = seedSpawn("bavarois");
+    const sibling = seedSpawn("kouign");
+
+    await orch.launchAgent({ env: { AGENT_ID: "bavarois" }, runtime: "codex", projectDir: "/tmp/bavarois" });
+
+    process.env.HOME = fakeHome;
+    await orch.stopAgent("bavarois");
+
+    expect(existsSync(target.dir)).toBe(false);
+    expect(existsSync(target.thread)).toBe(false);
+    expect(existsSync(sibling.dir)).toBe(true);
+  });
+
+  test("claude-code runtime is a no-op, not an error", async () => {
+    // Same-named dir planted deliberately: a claude agent never owns one, so
+    // teardown must not touch it even when the names line up.
+    const planted = seedSpawn("cc-agent");
+
+    await orch.launchAgent({ env: { AGENT_ID: "cc-agent" }, runtime: "claude-code", projectDir: "/tmp/cc" });
+
+    process.env.HOME = fakeHome;
+    await orch.closeAgent("cc-agent", undefined, 0);
+
+    expect(existsSync(planted.dir)).toBe(true);
+    expect(existsSync(planted.thread)).toBe(true);
+    expect(orch.store.getAgent("cc-agent")).toBeNull();
+  });
+
+  test("missing codex home is a no-op and the close still succeeds", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "never-ran" }, runtime: "codex", projectDir: "/tmp/never" });
+
+    process.env.HOME = fakeHome;
+    await orch.closeAgent("never-ran", undefined, 250);
+
+    expect(existsSync(join(spawnRoot, "never-ran"))).toBe(false);
+    expect(orch.store.getAgent("never-ran")).toBeNull();
+  });
+
+  test("an unremovable home is logged loudly with the path and never blocks the close", async () => {
+    const stuck = seedSpawn("stuck");
+    await orch.launchAgent({ env: { AGENT_ID: "stuck" }, runtime: "codex", projectDir: "/tmp/stuck" });
+
+    // Read+execute only on the parent: unlink inside it fails with EACCES.
+    chmodSync(spawnRoot, 0o500);
+    const logs: string[] = [];
+    const orig = console.error;
+    console.error = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+    process.env.HOME = fakeHome;
+    try {
+      await orch.closeAgent("stuck", undefined, 250);
+    } finally {
+      console.error = orig;
+      chmodSync(spawnRoot, 0o700);
+    }
+
+    expect(existsSync(stuck.dir)).toBe(true);
+    const failure = logs.find((l) => l.includes("codex-spawn teardown FAILED"));
+    expect(failure).toBeDefined();
+    expect(failure).toContain(stuck.dir);
+    // The agent is still fully torn down — a leaked dir never keeps a row alive.
+    expect(orch.store.getAgent("stuck")).toBeNull();
+    expect(orch.store.getLatestTombstone("stuck")).not.toBeNull();
+  });
+
+  test("a run_as_uid agent is torn down in THAT uid's home, under sudo -u", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "ephem" },
+      runtime: "codex",
+      projectDir: "/tmp/ephem",
+      runAsUid: "_ephemeral",
+    });
+    screenState.sshRunResult =
+      "PRE /Users/_ephemeral/.wire/codex-spawn/ephem\n" +
+      "PRE /Users/_ephemeral/.wire/codex-spawn/ephem.thread.json\n" +
+      "CREW_TEARDOWN_DONE\n";
+
+    await orch.closeAgent("ephem", undefined, 250);
+
+    const teardown = screenState.sshRunCalls.map((c) => c.command).find((c) => c.includes("codex-spawn"));
+    expect(teardown).toBeDefined();
+    expect(teardown).toContain("sudo -n -u _ephemeral");
+    expect(teardown).toContain("P1='/Users/_ephemeral/.wire/codex-spawn/ephem'");
+    expect(teardown).toContain("P2='/Users/_ephemeral/.wire/codex-spawn/ephem.thread.json'");
+    expect(teardown).not.toContain("*");
+    expect(orch.store.getAgent("ephem")).toBeNull();
+  });
+
+  test("a remote rm that leaves the home behind is reported, close still completes", async () => {
+    await orch.launchAgent({
+      env: { AGENT_ID: "ephem2" },
+      runtime: "codex",
+      projectDir: "/tmp/ephem2",
+      runAsUid: "_ephemeral",
+    });
+    screenState.sshRunResult =
+      "PRE /Users/_ephemeral/.wire/codex-spawn/ephem2\n" +
+      "REMAIN /Users/_ephemeral/.wire/codex-spawn/ephem2\n" +
+      "CREW_TEARDOWN_DONE\n";
+    const logs: string[] = [];
+    const orig = console.error;
+    console.error = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+    try {
+      await orch.closeAgent("ephem2", undefined, 250);
+    } finally {
+      console.error = orig;
+    }
+
+    const failure = logs.find((l) => l.includes("codex-spawn teardown FAILED"));
+    expect(failure).toContain("/Users/_ephemeral/.wire/codex-spawn/ephem2");
+    expect(orch.store.getAgent("ephem2")).toBeNull();
   });
 });

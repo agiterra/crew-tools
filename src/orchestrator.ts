@@ -17,6 +17,7 @@ import { pickName, backgroundImagePath, loadTheme, updateTheme, listThemes } fro
 import { getClaudeCodeSessionId } from "./claude-session.js";
 import { assertClaudeCredentialLive } from "./credentials.js";
 import { buildConfigDirSetup } from "./config-dir.js";
+import { removeCodexSpawnHome } from "./codex-spawn.js";
 
 /** The agent/lane id contract, enforced by launchAgent. Mirrored by wallet-browser-register.sh and lane-reap.sh. */
 export const AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -1473,6 +1474,7 @@ export class Orchestrator {
     }
 
     await this.cleanupAuxSurface(agent.id, auxSurface);
+    await this.cleanupCodexSpawn(agent, target);
 
     this.store.tombstoneAgent(agent);
     this.store.deleteAgentByScreen(agent.screen_name);
@@ -1534,6 +1536,7 @@ export class Orchestrator {
       );
     }
     await this.cleanupAuxSurface(agent.id, auxSurface);
+    await this.cleanupCodexSpawn(agent, target);
     // Leave a tombstone so agent_resume can reconstruct the spawn later.
     this.store.tombstoneAgent(agent);
     this.store.deleteAgentByScreen(agent.screen_name);
@@ -1553,6 +1556,45 @@ export class Orchestrator {
       await this.terminal.closeSession(auxSurface);
     } catch (e) {
       console.error(`[crew] cleanupAuxSurface: failed to close '${auxSurface}' for agent '${agentId}': ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /**
+   * Remove the agent's per-agent CODEX_HOME and its `<id>.thread.json` (AGI-74).
+   *
+   * Shared by closeAgent, stopAgent and therefore the idle reaper (reap() ->
+   * stopAgent). A claude-code agent has no such directory, so this is a silent
+   * no-op for it; a missing directory is normal too (never-started spawn,
+   * already-pruned home).
+   *
+   * Scoped to THIS agent's two derived paths — see codex-spawn.ts for the
+   * no-glob rule and how CODEX_HOME resolves per spawn path (the dir lives in
+   * the HOME of the uid the agent ran as, i.e. /Users/<run_as_uid> for a
+   * cross-uid spawn). Failure is logged loudly with the path and never raised:
+   * a leaked 48 MB home must not keep a dead agent's row alive.
+   */
+  private async cleanupCodexSpawn(agent: Agent, target: screen.RemoteTarget | undefined): Promise<void> {
+    let manifest: SpawnManifest | null = null;
+    try {
+      manifest = agent.spawn_manifest ? (JSON.parse(agent.spawn_manifest) as SpawnManifest) : null;
+    } catch {
+      manifest = null;
+    }
+    try {
+      await removeCodexSpawnHome({
+        agentId: agent.id,
+        runtime: agent.runtime,
+        runAsUid: target?.runAsUid ?? manifest?.run_as_uid,
+        env: manifest?.env,
+        target,
+      });
+    } catch (e) {
+      // removeCodexSpawnHome already swallows its own failures; this is the
+      // belt-and-braces guard that keeps ANY surprise (a bad manifest, a
+      // throwing mock) from blocking the close.
+      console.error(
+        `[crew] cleanupCodexSpawn: unexpected failure for agent '${agent.id}': ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 
