@@ -17,6 +17,9 @@
  * for one snapshot window but only a sustained `graceMs` absence deletes it.
  */
 
+import { realpathSync } from "fs";
+import { userInfo } from "os";
+import { join } from "path";
 import { listSessions, type ScreenSession } from "./screen.js";
 import type { CrewStore, Agent } from "./store.js";
 import type { TerminalBackend, TerminalSession } from "./terminal.js";
@@ -37,17 +40,66 @@ function manifestRunAsUid(spawnManifest: string | null | undefined): string | un
 
 /**
  * Whether this process's plain `screen -ls` can prove death for a row's
- * run_as_uid. An absent run_as_uid is the legacy same-UID path. A numeric
- * run_as_uid matching process.getuid() is also provably same-UID. Usernames
- * are not enough: service/local-sudo spawns stamp names like `_ephemeral`,
- * but their screen namespace is selected by sudo HOME/SCREENDIR, not by this
- * process's USER string. Treat those as unverifiable and fail open.
+ * run_as_uid. An absent run_as_uid is the legacy same-UID path.
+ *
+ * AGI-82: the old test compared run_as_uid to `String(process.getuid())` only,
+ * so a row stamped with a USERNAME — which is what every agiterra spawn writes
+ * ("run_as_uid":"_ephemeral") — could never match, even in a process running as
+ * that very user. `!verifiable` fails open, so the branch fired for essentially
+ * every row on the box and the reality-join filtered NOTHING: 23/23 rows of the
+ * shared store surfaced from agent_list, 14 of them with no screen and no live
+ * pid (measured 2026-09-10, /Users/_ephemeral/work/arrufada/evidence).
+ *
+ * The original caution was right about its cause and wrong about its remedy.
+ * `process.env.USER` genuinely can lie under sudo — but `os.userInfo()` does
+ * not: it is derived from getuid(), so it names the uid we are ACTUALLY running
+ * as. Matching either the numeric uid or that kernel-truth username is sound.
+ *
+ * The second half of the caution still binds: being the right user is not
+ * enough if we are probing the wrong screen namespace. `screen -ls` reads
+ * $SCREENDIR (else $HOME/.screen), and a sudo spawn can leave those pointing at
+ * another user's home. So we additionally require the namespace we would probe
+ * to live under OUR home. Anything we cannot place stays unverifiable and keeps
+ * failing open — crew-service's multi-UID lister owns those rows' liveness.
  */
 function screenNamespaceVerifiableHere(runAsUid: string | undefined): boolean {
   if (!runAsUid) return true;
   const getuid = process.getuid;
   if (typeof getuid !== "function") return false;
-  return runAsUid === String(getuid.call(process));
+  if (runAsUid === String(getuid.call(process))) return probesOwnScreenNamespace();
+
+  let self: ReturnType<typeof userInfo>;
+  try {
+    self = userInfo();
+  } catch {
+    // No passwd entry for this uid — cannot place ourselves; fail open.
+    return false;
+  }
+  if (runAsUid !== self.username) return false;
+  return probesOwnScreenNamespace();
+}
+
+/**
+ * True when the screen socket directory `screen -ls` will consult belongs to
+ * the uid we are running as. Guards the sudo case the AGI-27 comment warned
+ * about: right user, wrong SCREENDIR ⇒ absence still proves nothing.
+ */
+function probesOwnScreenNamespace(): boolean {
+  let home: string;
+  try {
+    home = userInfo().homedir;
+  } catch {
+    return false;
+  }
+  if (!home) return false;
+  const screenDir = process.env.SCREENDIR ?? join(home, ".screen");
+  const owned = join(home, ".screen");
+  if (screenDir === owned) return true;
+  try {
+    return realpathSync(screenDir) === realpathSync(owned);
+  } catch {
+    return false;
+  }
 }
 
 /**

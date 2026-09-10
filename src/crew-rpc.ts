@@ -6,7 +6,7 @@ import {
   derivePublicKeyB64,
   importPrivateKey,
 } from "@agiterra/wire-tools";
-import { CrewStore } from "./store.js";
+import { localMachineName } from "./store.js";
 
 export type CrewRpcWriter = {
   readonly dest: string;
@@ -28,8 +28,12 @@ function resolveDest(opts: CrewRpcWriterOptions): string {
   if (opts.dest) return opts.dest;
   if (process.env.CREW_SVC_DEST) return process.env.CREW_SVC_DEST;
   if (process.env.CREW_RPC_DEST) return process.env.CREW_RPC_DEST;
-  const store = new CrewStore(opts.dbPath);
-  return `crew-svc@${store.localMachineName()}`;
+  // AGI-82: this used to open a CrewStore purely to read a machine name, which
+  // made "who do I send RPC to?" depend on successfully opening a database —
+  // and, before the DEFAULT_DB fix, opening whichever private shard $HOME
+  // happened to point at. The name is a property of the machine, not of the
+  // roster; take it from the same helper the store uses.
+  return `crew-svc@${localMachineName()}`;
 }
 
 export async function createCrewRpcWriter(opts: CrewRpcWriterOptions = {}): Promise<CrewRpcWriter> {

@@ -7,7 +7,15 @@
 
 import { join } from "path";
 import { randomUUID } from "crypto";
-import { CrewStore, type Agent, type Tab, type Pane, type AgentTombstone, type Machine } from "./store.js";
+import {
+  resolveDefaultDb,
+  CrewStore,
+  type Agent,
+  type Tab,
+  type Pane,
+  type AgentTombstone,
+  type Machine,
+} from "./store.js";
 import * as screen from "./screen.js";
 import type { TerminalBackend } from "./terminal.js";
 import { getLaunchCommand, RuntimeNotProvisionedError, type LaunchResolveOpts } from "./runtimes.js";
@@ -25,8 +33,14 @@ export const AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 // CREW_DB overrides for the machine-shared database (one crews.db per
 // machine, e.g. /opt/agiterra/crew/crews.db group-fabrica — Tim 2026-07-02).
+//
+// AGI-82: this was a SECOND, independent copy of store.ts's DEFAULT_DB rule.
+// Two hand-maintained copies of "which crews.db am I?" is one too many — fixing
+// the fallback in store.ts alone would have left the orchestrator resolving to
+// a private shard. Both now go through the same resolver.
 // Default stays the per-user path for machines without the shared setup.
-const DEFAULT_DB = process.env.CREW_DB ?? join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
+// Resolved lazily: resolveDefaultDb() can throw, and a module-level const
+// would make a misconfigured CREW_DB an import-time crash for every consumer.
 const SCREEN_PREFIX = "wire-";
 const BRIDGE_TERM_TIMEOUT_MS = 10_000;
 
@@ -686,11 +700,11 @@ export class Orchestrator {
 
   constructor(
     terminal: TerminalBackend,
-    dbPath: string = DEFAULT_DB,
+    dbPath?: string,
     opts: { requireConfiguredRuntimes?: readonly string[]; runtimesUid?: string } = {},
   ) {
     this.terminal = terminal;
-    this.store = new CrewStore(dbPath);
+    this.store = new CrewStore(dbPath ?? resolveDefaultDb());
     this.reality = new RealityLayer(terminal);
     this.runtimePolicy = {
       requireConfigured: opts.requireConfiguredRuntimes,

@@ -6,11 +6,100 @@
  */
 
 import { Database } from "bun:sqlite";
-import { accessSync, constants, existsSync } from "fs";
+import { accessSync, constants, existsSync, realpathSync } from "fs";
 import { hostname } from "os";
 import { join } from "path";
 
-const DEFAULT_DB = process.env.CREW_DB ?? join(process.env.HOME ?? "/tmp", ".wire", "crews.db");
+/**
+ * The machine-shared crew store (AGI-27). One crews.db per machine, owned by
+ * the crew-service uid, group-readable by every persona uid.
+ */
+export const SHARED_DB = "/opt/agiterra/crew/crews.db";
+
+/**
+ * The local machine's registry name (lowercase OS hostname).
+ *
+ * Module-level so callers that only need the NAME — e.g. crew-rpc's dest
+ * resolution — do not have to open a database to get it (AGI-82).
+ */
+export function localMachineName(): string {
+  return hostname().toLowerCase();
+}
+
+/**
+ * Raised when this process's db path resolves to a PRIVATE per-uid shard while
+ * the machine-shared store exists. Named so callers can distinguish "roster is
+ * sharded" from any other open failure (AGI-82).
+ */
+export class PrivateCrewShardError extends Error {
+  readonly name = "PrivateCrewShardError";
+  constructor(readonly attempted: string, readonly shared: string) {
+    super(
+      `refusing to read a private crew shard: ${attempted} is not the machine-shared store ${shared}. ` +
+        `The crew roster has a single source of truth; set CREW_DB=${shared} (or symlink ~/.wire/crews.db -> ${shared}).`,
+    );
+  }
+}
+
+/** Same file on disk? Compares realpaths so a symlink counts as the shared store. */
+function sameFile(a: string, b: string): boolean {
+  if (a === b) return true;
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pick the crews.db path (AGI-82).
+ *
+ * Before this, the fallback was unconditionally `$HOME/.wire/crews.db`, so any
+ * process whose CREW_DB was unset — a launchd job that never sources a profile,
+ * an MCP server inheriting a bare env, a sudo spawn — silently opened a PRIVATE
+ * per-uid shard and reported a roster nobody else could see. AGI-27 made such a
+ * process READ-SAFE (it degrades to readonly) but not READ-CORRECT: reading the
+ * wrong file is still wrong.
+ *
+ * Order:
+ *   1. CREW_DB, when set — but only if it IS the shared store (or the shared
+ *      store does not exist on this box). An explicit CREW_DB pointing at a
+ *      private shard is the exact 2026-09-10 fondant bug and is refused.
+ *   2. `$HOME/.wire/crews.db` when it resolves (through symlinks) to the
+ *      shared store — the current tim/_ephemeral arrangement.
+ *   3. The shared store itself, when it exists. A private ~/.wire/crews.db can
+ *      never be reached by accident.
+ *   4. `$HOME/.wire/crews.db` on a box with no shared store — first-run
+ *      bootstrap and single-uid installs keep working unchanged.
+ *
+ * `CREW_DB_ALLOW_PRIVATE=1` opts out entirely (tests, fixtures, forensics on a
+ * captured shard). Nothing on the fleet sets it.
+ */
+export function resolveDefaultDb(
+  env: NodeJS.ProcessEnv = process.env,
+  sharedPath: string = SHARED_DB,
+): string {
+  const home = env.HOME ?? "/tmp";
+  const local = join(home, ".wire", "crews.db");
+  const allowPrivate = env.CREW_DB_ALLOW_PRIVATE === "1";
+  const sharedExists = existsSync(sharedPath);
+
+  if (allowPrivate) return env.CREW_DB ?? local;
+  if (env.CREW_DB) {
+    if (!sharedExists || sameFile(env.CREW_DB, sharedPath)) return env.CREW_DB;
+    throw new PrivateCrewShardError(env.CREW_DB, sharedPath);
+  }
+  if (!sharedExists) return local;
+  if (existsSync(local) && sameFile(local, sharedPath)) return local;
+  return sharedPath;
+}
+
+/**
+ * Lazy on purpose: {@link resolveDefaultDb} can THROW, and a module-level
+ * `const` would turn a misconfigured CREW_DB into an import-time crash in
+ * every consumer of this package. Resolving at construction keeps the error
+ * attributable to the caller that actually opened a store.
+ */
 
 /**
  * True when the db file exists but this uid cannot write it.
@@ -124,7 +213,12 @@ export class CrewStore {
   private db: Database;
   readonly readonly: boolean;
 
-  constructor(dbPath: string = DEFAULT_DB, opts: { readonly?: boolean } = {}) {
+  /** Absolute path this store opened. Useful in diagnostics and the census. */
+  readonly dbPath: string;
+
+  constructor(dbPath?: string, opts: { readonly?: boolean } = {}) {
+    dbPath = dbPath ?? resolveDefaultDb();
+    this.dbPath = dbPath;
     // Readonly when EITHER the caller is configured to route writes through
     // crew RPC (both dest vars, not just the newer one — a consumer configured
     // the old way is still a consumer) OR the file is simply not ours to write.
@@ -593,7 +687,7 @@ export class CrewStore {
 
   /** Return the local machine's registry name (lowercase OS hostname). */
   localMachineName(): string {
-    return hostname().toLowerCase();
+    return localMachineName();
   }
 
   createMachine(opts: {
