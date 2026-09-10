@@ -10,7 +10,7 @@ import { randomUUID } from "crypto";
 import { CrewStore, type Agent, type Tab, type Pane, type AgentTombstone, type Machine } from "./store.js";
 import * as screen from "./screen.js";
 import type { TerminalBackend } from "./terminal.js";
-import { getLaunchCommand } from "./runtimes.js";
+import { getLaunchCommand, RuntimeNotProvisionedError, type LaunchResolveOpts } from "./runtimes.js";
 import { reconcile, formatReport } from "./reconciler.js";
 import { RealityLayer } from "./reality.js";
 import type { HealOpts, HealResult } from "./reality.js";
@@ -672,10 +672,30 @@ export class Orchestrator {
    */
   readonly reality: RealityLayer;
 
-  constructor(terminal: TerminalBackend, dbPath: string = DEFAULT_DB) {
+  /**
+   * AGI-70 runtime-provisioning policy. Names in `requireConfiguredRuntimes`
+   * must be defined in the resolving home's ~/.wire/runtimes.json; resolving
+   * one from the built-in defaults throws RuntimeNotProvisionedError rather
+   * than launching the bare CLI. `runtimesUid` is a LABEL for those errors —
+   * it is never used to build a path, because the home actually consulted is
+   * this process's $HOME (see runtimes.ts header: the command is built here,
+   * under the SERVICE uid, and only then handed to `sudo -u <spawnUid>`).
+   * Empty/absent → legacy permissive behaviour.
+   */
+  readonly runtimePolicy: LaunchResolveOpts;
+
+  constructor(
+    terminal: TerminalBackend,
+    dbPath: string = DEFAULT_DB,
+    opts: { requireConfiguredRuntimes?: readonly string[]; runtimesUid?: string } = {},
+  ) {
     this.terminal = terminal;
     this.store = new CrewStore(dbPath);
     this.reality = new RealityLayer(terminal);
+    this.runtimePolicy = {
+      requireConfigured: opts.requireConfiguredRuntimes,
+      uid: opts.runtimesUid ?? process.env.USER,
+    };
   }
 
   // --- Agent lifecycle ---
@@ -829,7 +849,11 @@ export class Orchestrator {
     const templateVars = { ...opts.env, PROJECT_DIR: projectDir };
     // Kept separate from `command`: the asked-vs-got extractor must never see
     // the prompt (quoted free text that can contain literal "--model").
-    const baseCommand = getLaunchCommand(runtime, templateVars);
+    // AGI-70: refuse a must-be-configured runtime whose entry is missing from
+    // THIS process's ~/.wire/runtimes.json, rather than expanding the built-in
+    // bare command. Thrown before any screen is created, so a refused spawn
+    // leaves no half-born agent behind.
+    const baseCommand = getLaunchCommand(runtime, templateVars, this.runtimePolicy);
     let command = baseCommand;
     // Stamp the Claude Code session id at launch (`--session-id <uuid>`) and record
     // it on the row: nothing else ever did for spawned lanes — every lane row in
@@ -1168,7 +1192,7 @@ export class Orchestrator {
     // with no Playwright server and no pins; Brioche 597983). An explicit or
     // manifest channels list replaces the template's channel argument.
     if (!mergedEnv.TMPDIR) { const _t = `/tmp/agiterra-lane-${opts.id}`; mergedEnv.TMPDIR = _t; mergedEnv.TMP = _t; mergedEnv.TEMP = _t; }
-    let command = getLaunchCommand(runtime, { ...mergedEnv, PROJECT_DIR: projectDir });
+    let command = getLaunchCommand(runtime, { ...mergedEnv, PROJECT_DIR: projectDir }, this.runtimePolicy);
     if (opts.channels ?? manifest?.channels) {
       const flag = `--dangerously-load-development-channels ${shellEscape(channels)}`;
       const re = /--dangerously-load-development-channels\s+(?:'[^']*'|"[^"]*"|\S+)/;
