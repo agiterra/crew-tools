@@ -818,6 +818,13 @@ export async function startServer(): Promise<void> {
           );
           break;
         case "agent_list": {
+          // AGI-27: agent_list is a read, but its lazy-GC heal is a WRITE over
+          // arbitrary rows — the last direct-write surface in this server. The
+          // write half now goes to crew-service, which re-derives the caller
+          // from the signed frame and scopes the heal to rows that caller owns.
+          // Best-effort: a broker-less or unauthorized caller still gets its
+          // read (the local store is readonly, so heal() is a no-op there).
+          await tryCrewRpc("crew.agent_heal", {}, "agent_list heal");
           let agents = await orchestrator.listAgents();
           if (typeof a.attached === "boolean") {
             agents = agents.filter((ag) => (ag.pane !== null) === a.attached);
