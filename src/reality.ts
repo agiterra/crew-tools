@@ -79,6 +79,15 @@ export interface RealitySnapshot {
 }
 
 /** Outcome of a {@link RealityLayer.heal} pass over the agent table. */
+/**
+ * Scoping for {@link RealityLayer.heal}. Omitted ⇒ heal every row (the
+ * crew-service / operator path). Supplied ⇒ only rows the predicate accepts
+ * are written; the rest are reported in {@link HealResult.skipped}.
+ */
+export interface HealOpts {
+  canWrite?: (row: Agent) => boolean;
+}
+
 export interface HealResult {
   /** Local agent ids confirmed alive (screen present); pid refreshed. */
   alive: string[];
@@ -88,6 +97,12 @@ export interface HealResult {
   gcd: string[];
   /** Live `wire-` screens with no local agent row (orphans). */
   orphans: ScreenSession[];
+  /**
+   * Local agent ids the caller was NOT authorized to write (AGI-27). They are
+   * still classified and still returned in `live` — the heal simply declines
+   * to touch them, so a denial is visible/attributable rather than silent.
+   */
+  skipped: string[];
 }
 
 /** Per-row classification of the agent table against a snapshot (pure). */
@@ -286,15 +301,33 @@ export class RealityLayer {
     store: CrewStore,
     localMachine: string,
     snap?: RealitySnapshot,
+    opts?: HealOpts,
   ): Promise<{ live: Agent[]; result: HealResult }> {
     const s = snap ?? (await this.snapshot());
     const rows = store.listAgents();
     const { live, localAlive, localMissing, orphans } = this.classify(rows, localMachine, s);
     const now = this.now();
+    const skipped: string[] = [];
+
+    // AGI-27: a heal is a WRITE over arbitrary rows. Two gates decide whether
+    // this process may perform it at all:
+    //   - a readonly store (every non-crew-service consumer since the interim)
+    //     must degrade to a pure read instead of throwing SQLITE_READONLY,
+    //   - a per-row `canWrite` predicate scopes the heal to the rows the
+    //     calling identity actually owns (self / spawned descendants / ED).
+    const canWrite = (row: Agent): boolean => {
+      if (store.readonly) return false;
+      if (opts?.canWrite && !opts.canWrite(row)) {
+        skipped.push(row.id);
+        return false;
+      }
+      return true;
+    };
 
     const alive: string[] = [];
     for (const row of localAlive) {
       this.missingSince.delete(row.screen_name);
+      if (!canWrite(row)) continue;
       const session = s.screens.get(row.screen_name);
       if (session && session.pid !== row.screen_pid) {
         store.updateAgentPid(row.id, session.pid);
@@ -307,6 +340,7 @@ export class RealityLayer {
     const marked: string[] = [];
     const gcd: string[] = [];
     for (const row of localMissing) {
+      if (!canWrite(row)) continue;
       const first = this.missingSince.get(row.screen_name);
       if (first === undefined) {
         this.missingSince.set(row.screen_name, now);
@@ -323,6 +357,6 @@ export class RealityLayer {
       // else: still within grace — leave the row, keep the mark.
     }
 
-    return { live, result: { alive, marked, gcd, orphans } };
+    return { live, result: { alive, marked, gcd, orphans, skipped } };
   }
 }

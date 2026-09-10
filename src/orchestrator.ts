@@ -13,6 +13,7 @@ import type { TerminalBackend } from "./terminal.js";
 import { getLaunchCommand } from "./runtimes.js";
 import { reconcile, formatReport } from "./reconciler.js";
 import { RealityLayer } from "./reality.js";
+import type { HealOpts, HealResult } from "./reality.js";
 import { pickName, backgroundImagePath, loadTheme, updateTheme, listThemes } from "./themes.js";
 import { getClaudeCodeSessionId } from "./claude-session.js";
 import { assertClaudeCredentialLive } from "./credentials.js";
@@ -1882,8 +1883,29 @@ export class Orchestrator {
    * a grace). The snapshot is cached (≤TTL), so frequent polling is cheap.
    */
   async listAgents(): Promise<Agent[]> {
+    // AGI-27: the heal half is a WRITE over arbitrary rows. A consumer whose
+    // store is readonly (every process but crew-service since crews.db was
+    // tightened) must still be able to READ — heal() degrades to a pure
+    // reality-join there, and the write half is driven by crew-service via
+    // `crew.agent_heal`. Reads stay local; only the write moved.
     const { live } = await this.reality.heal(this.store, this.store.localMachineName());
     return live;
+  }
+
+  /**
+   * The WRITE half of the lazy-GC-on-read path, as an explicit, authz-scopable
+   * entry point (AGI-27 items 1-2). crew-service calls this on behalf of a
+   * verified caller, passing `canWrite` so the heal only touches rows that
+   * caller owns (self / spawned descendants), or every row for operator/ED.
+   */
+  async healAgents(opts?: HealOpts): Promise<HealResult> {
+    const { result } = await this.reality.heal(
+      this.store,
+      this.store.localMachineName(),
+      undefined,
+      opts,
+    );
+    return result;
   }
 
   // --- Pane I/O ---
