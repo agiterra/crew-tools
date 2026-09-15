@@ -38,7 +38,7 @@
  * this module deliberately does not have.
  */
 
-import { lstat, rm, readdir, readlink, mkdir, writeFile, open as fsOpen } from "fs/promises";
+import { lstat, rm, readdir, readlink, mkdir, writeFile, rename, open as fsOpen } from "fs/promises";
 import { createHash } from "crypto";
 import { basename, dirname, isAbsolute, join } from "path";
 import * as screen from "./screen.js";
@@ -57,6 +57,8 @@ const SAFE_UID = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/;
 
 /** Directory name that must be the parent of anything we delete. */
 const SPAWN_PARENT = "codex-spawn";
+/** Any character that could break out of single-quoted shell interpolation, plus control chars. */
+const SHELL_UNSAFE = /['"`$\\;&|<>(){}\n\r\t*?!#~\[\]]|[\x00-\x1f]/;
 
 /**
  * Runtimes whose launcher provisions a per-agent CODEX_HOME. `claude-code`
@@ -109,6 +111,11 @@ export function resolveCodexSpawnPaths(args: {
   // Both targets must be an absolute path named for THIS agent, directly
   // inside a `codex-spawn` directory. Anything else is a manifest we do not
   // trust with a recursive delete.
+  // ⛔ S1 (PR 91 review). These paths are interpolated into a `sudo -n -u <uid> env VAR='<path>'`
+  // command line on the remote path. The guards below check SHAPE; they say nothing about
+  // CONTENT, so a single quote in a manifest CODEX_HOME escapes the assignment and executes
+  // arbitrary commands as the ssh user. Reject anything that could leave the quotes.
+  if (SHELL_UNSAFE.test(codexHome) || SHELL_UNSAFE.test(stateDir) || SHELL_UNSAFE.test(threadPath)) return null;
   if (!isAbsolute(codexHome) || basename(codexHome) !== args.agentId) return null;
   if (basename(dirname(codexHome)) !== SPAWN_PARENT) return null;
   if (!isAbsolute(threadPath) || basename(dirname(threadPath)) !== SPAWN_PARENT) return null;
@@ -137,6 +144,14 @@ export const DISPOSABLE_BASENAMES = new Set([
 /** The only directories classification is allowed to descend into. */
 export const LOCK_DIRS = ["app-server-control", "mcp-oauth-locks", "thread-writer-locks"];
 
+/** Thrown when the spawn home exists but cannot be read — never confused with "already gone". */
+export class SpawnHomeUnreadable extends Error {
+  constructor(public readonly path: string, public readonly code: string) {
+    super(`spawn home unreadable at ${path}: ${code}`);
+    this.name = "SpawnHomeUnreadable";
+  }
+}
+
 export type SpawnEntry = {
   path: string;
   /** "disposable" only by structural identity or an exact .lock in a lock dir. */
@@ -154,8 +169,18 @@ export type SpawnEntry = {
  */
 export async function classifySpawnHome(codexHome: string, home: string): Promise<SpawnEntry[]> {
   const out: SpawnEntry[] = [];
+  // ⛔ C2 (PR 91 review). This swallowed EVERY readdir error and returned an empty list, so a
+  // cross-uid teardown that got EACCES wrote a receipt saying "complete, nothing here" —
+  // a permission failure recorded as a clean stop, inside the audit record built to be truthful.
+  // ENOENT genuinely means "already gone"; anything else means "I could not look".
   let names: string[];
-  try { names = await readdir(codexHome); } catch { return out; }
+  try {
+    names = await readdir(codexHome);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") return out;
+    throw new SpawnHomeUnreadable(codexHome, code ?? String(e));
+  }
   const authTarget = join(home, ".codex", "auth.json");
 
   for (const name of names.sort()) {
@@ -238,15 +263,22 @@ export function manifestDigest(entries: SpawnEntry[]): string {
  */
 export async function writeReceipt(stateDir: string, agentId: string, stamp: string, r: StopReceipt): Promise<string> {
   const dir = join(stateDir, ".stopped");
-  await mkdir(dir, { recursive: true });
+  await mkdir(dir, { recursive: true, mode: 0o750 });   // S2: spec §5 — never world-readable
   const path = join(dir, `${agentId}.${stamp}.json`);
-  const fh = await fsOpen(path, "w");
+  // ⛔ F2 (PR 91 review). This used to open the FINAL path with "w", which truncates AT OPEN —
+  // so a kill or ENOSPC during FINALIZE destroyed the INTENT record naming what was at risk,
+  // after removal had already run. The durable record was destroyed by the act of reporting on
+  // it. Write a temp, fsync it, then rename: a rename is atomic, so the reader sees either the
+  // whole previous receipt or the whole new one, never a truncated one.
+  const tmp = `${path}.tmp`;
+  const fh = await fsOpen(tmp, "w", 0o640);            // S2: receipts enumerate every path in the home
   try {
     await fh.writeFile(JSON.stringify(r, null, 1));
     await fh.sync();
   } finally {
     await fh.close();
   }
+  await rename(tmp, path);
   return path;
 }
 
@@ -280,8 +312,14 @@ export function buildRemoteTeardownScript(): string {
     '      all=1; any=0',
     '      for q in "$p"/* "$p"/.*; do',
     '        m=$(basename "$q"); [ "$m" = "." ] || [ "$m" = ".." ] && continue',
-    '        [ -e "$q" ] || continue; any=1',
-    '        case "$m" in *.lock) [ -f "$q" ] && echo "$q" >> "$D" || { all=0; echo "$q" >> "$K"; };; *) all=0; echo "$q" >> "$K";; esac',
+    // C1(a): a DANGLING symlink is `[ -e ]`-false. The root loop already pairs -e with -L;
+    // this inner loop dropped it, so a dangling .lock was skipped and never cleared `all`,
+    // and the shell then disposed a directory the classifier retains.
+    '        [ -e "$q" ] || [ -L "$q" ] || continue; any=1',
+    // C1(b): `[ -f ]` FOLLOWS a symlink; the TS side uses lstat and does not. A `*.lock`
+    // symlink pointing at a real file was disposed by the shell and retained by TS. Test the
+    // link itself first and refuse to dispose it.
+    '        case "$m" in *.lock) if [ -L "$q" ]; then all=0; echo "$q" >> "$K"; elif [ -f "$q" ]; then echo "$q" >> "$D"; else all=0; echo "$q" >> "$K"; fi;; *) all=0; echo "$q" >> "$K";; esac',
     '      done',
     '      [ "$any" = 1 ] && [ "$all" = 1 ] && d=1',
     '    done',
@@ -294,7 +332,13 @@ export function buildRemoteTeardownScript(): string {
     'sync; [ -s "$R" ] || { echo CREW_INTENT_FAILED; exit 9; }',
     'while IFS= read -r p; do echo "DISPOSE $p"; done < "$D"',
     'while IFS= read -r p; do echo "RETAIN $p"; done < "$K"',
-    'sort -r "$D" | while IFS= read -r p; do rm -rf -- "$p" 2>/dev/null; if [ -e "$p" ] || [ -L "$p" ]; then echo "REMAIN $p"; echo "$p" >> "$V"; else echo "REMOVED $p"; fi; done',
+    // Every removal takes ONE path from the disposal list, and the list never contains $H:
+    // the root loop only ever appends "$H"/<entry>. The `[ "$p" = "$H" ]` guard is the
+    // belt to that brace — and it is ASSERTED, not merely asserted-about: the test
+    // "T4: an explicit whole-home target on the disposal list is REFUSED by the guard"
+    // forces "$H" onto the list and requires the home to survive. Construction is a
+    // property of today's code; an edit can change it, and that test is what notices.
+    'sort -r "$D" | while IFS= read -r p; do [ "$p" = "$H" ] && continue; rm -rf -- "$p" 2>/dev/null; if [ -e "$p" ] || [ -L "$p" ]; then echo "REMAIN $p"; echo "$p" >> "$V"; else echo "REMOVED $p"; fi; done',
     // FINALIZE, valid JSON, after removal, reporting what ACTUALLY happened.
     'printf \'{"agent":"%s","state":"complete","manifest_scope":"root-metadata","disposable":%s,"retained":%s,"failed":%s}\' "$AG" "$(jarr "$D")" "$(jarr "$K")" "$(jarr "$V")" > "$R" 2>/dev/null || echo CREW_FINALIZE_FAILED',
     'sync',
@@ -319,6 +363,23 @@ export type CodexSpawnTeardownDeps = {
   sshRun?: (t: screen.RemoteTarget, command: string) => Promise<string>;
   /** Log sink. Defaults to console.error (crew's log channel). */
   log?: (msg: string) => void;
+  /**
+   * ⛔ SEAM FOR THE SPEC'S MUTANT CONTROLS (rows 15-18). Production never passes this.
+   * The spec's closing line is "rows 15-18 are what make the rest mean anything": a
+   * classifier that cannot be replaced cannot be mutated, and a suite that cannot run a
+   * KNOWN-BAD classifier has never shown its assertions are load-bearing. Every earlier
+   * revision of this spec passed every test imagined for it at the time.
+   */
+  classify?: (codexHome: string, home: string) => Promise<SpawnEntry[]>;
+  /**
+   * ⛔ SEAM FOR SPEC ROW 13 (finalize fails AFTER removal). Production never passes this.
+   * INTENT and FINALIZE write through the same function to the same directory, so the only
+   * thing that distinguishes them is WHEN they run — which a fixture cannot reach from the
+   * outside without racing the implementation. Row 13 is the one acceptance row that describes
+   * a state the code can only enter mid-call, and F3 shipped unassigned precisely because
+   * nothing could reach it.
+   */
+  writeReceipt?: (stateDir: string, agentId: string, stamp: string, r: StopReceipt) => Promise<string>;
 };
 
 /**
@@ -378,7 +439,19 @@ async function teardownLocal(
   result: CodexSpawnTeardownResult, deps: CodexSpawnTeardownDeps,
 ): Promise<void> {
   const log = deps.log ?? ((m: string) => console.error(m));
-  const entries = await classifySpawnHome(paths.codexHome, paths.home);
+  const write = deps.writeReceipt ?? writeReceipt;
+  let entries: SpawnEntry[];
+  try {
+    entries = await (deps.classify ?? classifySpawnHome)(paths.codexHome, paths.home);
+  } catch (e) {
+    if (e instanceof SpawnHomeUnreadable) {
+      log(`[crew] codex-spawn: spawn home UNREADABLE for '${agentId}' (${e.code}) at ${e.path} — ` +
+          `NOTHING REMOVED and no receipt written. This is not "already gone"; it is "I could not look".`);
+      result.skipped = "home-unreadable";
+      return;
+    }
+    throw e;
+  }
   const disposable = entries.filter((e) => e.disposition === "disposable");
   const retained = entries.filter((e) => e.disposition === "retained");
 
@@ -390,7 +463,7 @@ async function teardownLocal(
     disposable: disposable.map((e) => e.path), retained: retained.map((e) => e.path),
   };
   try {
-    await writeReceipt(stateDir, agentId, stamp, receipt);
+    await write(stateDir, agentId, stamp, receipt);
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
     log(`[crew] codex-spawn: INTENT receipt undurable for '${agentId}' (${error}) — NOTHING REMOVED.`);
@@ -415,10 +488,22 @@ async function teardownLocal(
     manifest_sha256: manifestDigest(entries),
   };
   try {
-    await writeReceipt(stateDir, agentId, stamp, final);
+    await write(stateDir, agentId, stamp, final);
   } catch (e) {
+    // ⛔ F3 (PR 91 review). The spec requires a receipt in state "finalize-failed" carrying
+    // INTENT's sets plus what is still observable. It was declared, typed, and never assigned.
+    // Try once more at a sibling path so the honest partial report survives even when the
+    // primary receipt cannot be rewritten; if THAT fails too, say so — never silently.
     log(`[crew] codex-spawn: FINALIZE receipt failed for '${agentId}' — removal ALREADY RAN; ` +
         `removed=${result.removed.length} retained=${retained.length}. Not reported as success.`);
+    const partial: StopReceipt = { ...final, state: "finalize-failed" };
+    try {
+      await write(stateDir, agentId, `${stamp}.finalize-failed`, partial);
+    } catch {
+      log(`[crew] codex-spawn: could not write the finalize-failed receipt either for '${agentId}' — ` +
+          `storage will not accept a failure record. removed=${result.removed.length}; ` +
+          `the in-progress INTENT receipt is the only durable record and it is INTACT.`);
+    }
     result.failed.push({ path: `${stateDir}/.stopped/${agentId}.${stamp}.json`, error: "finalize-failed" });
   }
   log(`[crew] codex-spawn: retained ${retained.length} entr(ies) incl. conversation state; ` +
@@ -468,78 +553,9 @@ async function teardownRemote(
   for (const p of pick("REMAIN")) result.failed.push({ path: p, error: "still present after remote rm" });
 }
 
-async function removeLocal(targets: string[], result: CodexSpawnTeardownResult): Promise<void> {
-  for (const path of targets) {
-    const existed = await exists(path);
-    try {
-      await rm(path, { recursive: true, force: true });
-    } catch (e) {
-      result.failed.push({ path, error: e instanceof Error ? e.message : String(e) });
-      continue;
-    }
-    if (await exists(path)) {
-      result.failed.push({ path, error: "still present after rm" });
-    } else if (existed) {
-      result.removed.push(path);
-    } else {
-      result.absent.push(path);
-    }
-  }
-}
-
-/**
- * Cross-uid / cross-machine removal. Runs the whole rm-and-verify under
- * `sudo -n -u <uid>` — the same grant the spawn itself rides (screen.ts's
- * remoteScreen) — because the service user typically cannot even stat inside
- * /Users/<uid>, and a permission-denied `[ -e ]` would otherwise read as
- * "successfully gone".
- */
-async function removeRemote(
-  target: screen.RemoteTarget,
-  targets: string[],
-  result: CodexSpawnTeardownResult,
-  deps: CodexSpawnTeardownDeps,
-): Promise<void> {
-  const run = deps.sshRun ?? screen.sshRun;
-  const [codexHome, threadPath] = targets as [string, string];
-  const script =
-    'for p in "$P1" "$P2"; do [ -e "$p" ] && echo "PRE $p"; done; ' +
-    'rm -rf -- "$P1" "$P2"; ' +
-    'for p in "$P1" "$P2"; do [ -e "$p" ] && echo "REMAIN $p"; done; ' +
-    "echo CREW_TEARDOWN_DONE";
-  const command =
-    `sudo -n -u ${target.runAsUid} env P1='${codexHome}' P2='${threadPath}' ` +
-    `/bin/sh -c '${script}'`;
-
-  let out: string;
-  try {
-    out = await run(target, command);
-  } catch (e) {
-    const error = e instanceof Error ? e.message : String(e);
-    for (const path of targets) result.failed.push({ path, error });
-    return;
-  }
-  if (out.includes("CREW_FINALIZE_FAILED")) {
-    result.failed.push({ path: receipt, error: "finalize-failed" });
-  }
-  if (!out.includes("CREW_TEARDOWN_DONE")) {
-    for (const path of targets) {
-      result.failed.push({ path, error: `remote teardown did not complete: ${out.trim() || "(no output)"}` });
-    }
-    return;
-  }
-  const pre = new Set(
-    out.split("\n").filter((l) => l.startsWith("PRE ")).map((l) => l.slice(4).trim()),
-  );
-  const remain = new Set(
-    out.split("\n").filter((l) => l.startsWith("REMAIN ")).map((l) => l.slice(7).trim()),
-  );
-  for (const path of targets) {
-    if (remain.has(path)) result.failed.push({ path, error: "still present after remote rm" });
-    else if (pre.has(path)) result.removed.push(path);
-    else result.absent.push(path);
-  }
-}
+// F5 (PR 91 review): the dead removeLocal/removeRemote were deleted. removeRemote referenced
+// an out-of-scope `receipt` identifier that nothing typechecks, so it would have thrown
+// ReferenceError the moment anyone re-wired it. Dead code that cannot run is still a loaded gun.
 
 /** lstat, not stat: a dangling auth.json symlink still exists for removal. */
 async function exists(path: string): Promise<boolean> {
