@@ -820,7 +820,7 @@ describe("N1 — remote path failure contracts", () => {
     await chmod(f.codexHome, 0o755);
     expect(r.out).toContain("CREW_HOME_UNREADABLE");
     expect(r.out).not.toContain("CREW_TEARDOWN_DONE");
-    expect(r.err).toContain("I could not look");
+    expect(r.out).toContain("I could not look");        // ⛔ N16: stdout, the stream production reads
     // nothing removed, and no receipt claiming completeness
     expect(await alive(join(f.codexHome, "thread_history_1.sqlite"))).toBe(true);
     expect(await alive(join(f.stateDir, ".stopped", "agentx.remote.json"))).toBe(false);
@@ -845,7 +845,7 @@ describe("N1 — remote path failure contracts", () => {
                           'rcpt complete "$REMOVEDLIST" "/nonexistent-dir-for-test/x"');
     const r = runSh(f, script);
     expect(r.out).toContain("CREW_FINALIZE_FAILED");
-    expect(r.err).toContain("Not reported as success");
+    expect(r.out).toContain("Not reported as success");
 
     // ⛔ F2 remote, the whole point: the durable INTENT is STILL INTACT and parses.
     const intent = JSON.parse(await readFile(join(f.stateDir, ".stopped", "agentx.remote.json"), "utf8"));
@@ -866,8 +866,8 @@ describe("N1 — remote path failure contracts", () => {
                             'rcpt finalize-failed "$REMOVEDLIST" "/nonexistent-dir-for-test/y"');
     const r = runSh(f, script);
     expect(r.out).toContain("CREW_FINALIZE_RECORD_FAILED");
-    expect(r.err).toContain("storage will not accept a failure record");
-    expect(r.err).toContain("INTENT is the only durable record");
+    expect(r.out).toContain("storage will not accept a failure record");
+    expect(r.out).toContain("INTENT is the only durable record");
     const intent = JSON.parse(await readFile(join(f.stateDir, ".stopped", "agentx.remote.json"), "utf8"));
     expect(intent.state).toBe("in-progress");           // intact, per F2
   });
@@ -878,5 +878,70 @@ describe("N1 — remote path failure contracts", () => {
     expect(script).toContain('mv -f "$3.tmp" "$3"');
     // the old in-place form must not reappear
     expect(script).not.toContain('> "$R" 2>/dev/null');
+  });
+});
+
+// ── N14 (re-review): the RETURNED CONTRACT, not just the receipt ──────────────────────────
+// "absent populated" was true of the receipt and false of what the caller gets back, because
+// the script gained `$B` and its READER gained nothing. A field that is right in the audit
+// record and empty in the result is two different answers to one question. These rows drive
+// removeCodexSpawnHome through a STDOUT-ONLY sshRun stand-in — the shape screen.sshRun actually
+// has — so they fail if the reader ever stops parsing what the script emits.
+describe("N14 — the remote RESULT contract, via a stdout-only sshRun", () => {
+  const stdoutOnly = (f: Fx) => async (_t: unknown, command: string): Promise<string> => {
+    const m = command.match(/CODEX_HOME='([^']*)'/);
+    const p = Bun.spawnSync(["/bin/sh", "-c", buildRemoteTeardownScript()], {
+      env: { ...process.env, AGENT_ID: "agentx", CODEX_HOME: m?.[1] ?? f.codexHome,
+             AUTH_TARGET: join(f.home, ".codex", "auth.json"),
+             RECEIPT: join(f.stateDir, ".stopped", "agentx.remote.json") },
+    });
+    return new TextDecoder().decode(p.stdout);   // ⛔ stdout ONLY, exactly like screen.sshRun
+  };
+  const remote = (f: Fx, codexHome: string, log: (m: string) => void = () => {}) =>
+    removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: f.home, runAsUid: "someuid",
+        env: { STATE_DIR: f.stateDir, CODEX_HOME: codexHome },
+        target: { runAsUid: "someuid", host: "localhost" } as never },
+      { log, sshRun: stdoutOnly(f) as never },
+    );
+
+  test("N14: an ABSENT home reaches result.absent, not just the receipt", async () => {
+    // ⛔ The absent home must still have the SHAPE resolveCodexSpawnPaths accepts —
+    // <…>/codex-spawn/<agentId> — or the S1 guard refuses it as an unrecognised manifest and
+    // sshRun is never called. My first version named it "never-existed" and tested the guard
+    // instead of the contract, which is a different (and already covered) row.
+    const bare = await mkdtemp(join(tmpdir(), "spawnabsent-"));
+    const stateDir = join(bare, ".wire", "codex-spawn");
+    await mkdir(stateDir, { recursive: true });
+    await mkdir(join(bare, ".codex"), { recursive: true });
+    await writeFile(join(bare, ".codex", "auth.json"), "CREDENTIAL-MUST-SURVIVE");
+    const gone = join(stateDir, "agentx");          // correct shape, does not exist
+    const g: Fx = { home: bare, codexHome: gone, stateDir };
+    const res = await remote(g, gone);
+    expect(res.skipped).toBeUndefined();            // the guard did NOT refuse it
+    expect(res.absent).toContain(gone);
+    expect(res.removed).toEqual([]);
+    expect(res.failed).toEqual([]);
+  });
+
+  test("N14/C2: an UNREADABLE home sets skipped on the RESULT, not a generic failure", async () => {
+    if (process.getuid?.() === 0) return;
+    const f = await fixture();
+    await chmod(f.codexHome, 0o000);
+    const logs: string[] = [];
+    const res = await remote(f, f.codexHome, (m) => logs.push(m));
+    await chmod(f.codexHome, 0o755);
+    expect(res.skipped).toBe("home-unreadable");
+    expect(res.failed).toEqual([]);                       // NOT a generic "did not complete"
+    expect(logs.join("\n")).toContain("I could not look");
+  });
+
+  test("N14: a healthy remote run still reports removed, and absent stays empty", async () => {
+    const f = await fixture();
+    const res = await remote(f, f.codexHome);
+    expect(res.skipped).toBeUndefined();
+    expect(res.removed.length).toBeGreaterThan(0);
+    expect(res.absent).toEqual([]);
+    expect(await alive(join(f.codexHome, "thread_history_1.sqlite"))).toBe(true);
   });
 });

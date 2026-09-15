@@ -1699,7 +1699,9 @@ export class Orchestrator {
     // divergence-between-two-declarations shape as review finding C1, at the service
     // boundary. A package-level test cannot prove this boundary and must not claim to.
     // ⇒ Tracked as a ROLLOUT BLOCKER with companion wiring prepared (not deployed):
-    //   patches/crew-service-f4-teardown-wiring/ . Until that lands, agent_stop/agent_close
+    //   the companion patch lives OUTSIDE this repo (N17: `patches/…` does not resolve here) —
+    //   it is in the Fondant vault at patches/crew-service-f4-teardown-wiring/, mirrored into
+    //   the ENG-4161 incident directory. Until it lands, agent_stop/agent_close
     //   still report success regardless of skipped/failed, and this comment is the warning.
     try {
       return await removeCodexSpawnHome({

@@ -307,6 +307,11 @@ export async function writeReceipt(stateDir: string, agentId: string, stamp: str
     const dh = await fsOpen(dir, "r");
     try { await dh.sync(); } finally { await dh.close(); }
   } catch { /* directory fsync unsupported here; content is still fsynced */ }
+  // ⚠️ N20 (re-review): this is the LOCAL path only. The generated remote script cannot call
+  // fsync(2) on a directory from /bin/sh, so it uses `sync` — a whole-filesystem flush, which
+  // is broader but not a targeted guarantee about this directory entry. The two paths are
+  // therefore NOT equivalent on durability, and that asymmetry is stated rather than implied.
+  // Not "fixed" by weakening the local path to match; the remote is as strong as sh allows.
   return path;
 }
 
@@ -330,7 +335,10 @@ export function buildRemoteTeardownScript(): string {
     // Locally this is SpawnHomeUnreadable; here it was silently "nothing to do, complete".
     // ENOENT really is "already gone"; anything else is "I could not look".
     'if [ ! -d "$H" ]; then echo "$H" >> "$B"; CREW_ABSENT=1; else CREW_ABSENT=0;',
-    '  ls -A "$H" >/dev/null 2>&1 || { echo CREW_HOME_UNREADABLE; echo "NOTHING REMOVED for $AG at $H — this is not \'already gone\', it is \'I could not look\'." >&2; exit 8; }',
+    // ⛔ N16: these explanations were on STDERR, and screen.sshRun returns STDOUT ONLY — so
+    // production dropped every one of them. Explaining a refusal down a channel nobody reads is
+    // the same as not explaining it. All diagnostics go to stdout.
+    '  ls -A "$H" >/dev/null 2>&1 || { echo CREW_HOME_UNREADABLE; echo "CREW_NOTE NOTHING REMOVED for $AG at $H — this is not \'already gone\', it is \'I could not look\'."; exit 8; }',
     'fi',
     // JSON array from a newline list — quoting handled once, in awk.
     'jarr() { awk \'BEGIN{printf "["} {gsub(/\\\\/,"\\\\\\\\"); gsub(/"/,"\\\\\\""); printf "%s\\"%s\\"",(NR>1?",":""),$0} END{printf "]"}\' "$1"; }',
@@ -371,6 +379,10 @@ export function buildRemoteTeardownScript(): string {
     'rcpt in-progress "$EMPTY" "$R" || { echo CREW_INTENT_FAILED; exit 9; }',
     'while IFS= read -r p; do echo "DISPOSE $p"; done < "$D"',
     'while IFS= read -r p; do echo "RETAIN $p"; done < "$K"',
+    // ⛔ N14: `absent` reached the RECEIPT and never the RETURNED CONTRACT, because the script
+    // gained $B and its reader gained nothing. A field that is right in the audit record and
+    // empty in the caller's result is two different answers to one question.
+    'while IFS= read -r p; do echo "ABSENT $p"; done < "$B"',
     // Every removal takes ONE path from the disposal list, and the list never contains $H:
     // the root loop only ever appends "$H"/<entry>. The `[ "$p" = "$H" ]` guard is the
     // belt to that brace — and it is ASSERTED, not merely asserted-about: the test
@@ -388,10 +400,10 @@ export function buildRemoteTeardownScript(): string {
     'if ! rcpt complete "$REMOVEDLIST" "$R"; then',
     '  echo CREW_FINALIZE_FAILED',
     '  if rcpt finalize-failed "$REMOVEDLIST" "$R.finalize-failed"; then',
-    '    echo "FINALIZE receipt failed for $AG — removal ALREADY RAN; honest partial report written to $R.finalize-failed. Not reported as success." >&2',
+    '    echo "CREW_NOTE FINALIZE receipt failed for $AG — removal ALREADY RAN; honest partial report written to $R.finalize-failed. Not reported as success."',
     '  else',
     '    echo CREW_FINALIZE_RECORD_FAILED',
-    '    echo "Could not write the finalize-failed receipt either for $AG — storage will not accept a failure record. The in-progress INTENT is the only durable record and it is INTACT." >&2',
+    '    echo "CREW_NOTE Could not write the finalize-failed receipt either for $AG — storage will not accept a failure record. The in-progress INTENT is the only durable record and it is INTACT."',
     '  fi',
     'fi',
     'sync',
@@ -622,8 +634,21 @@ async function teardownRemote(
     result.skipped = "intent-undurable";
     return;
   }
+  // ⛔ N14/C2 on the REMOTE reader. The script distinguishes "I could not look" from ENOENT;
+  // until now only the script knew. Same fail-closed semantics as the local path.
+  if (out.includes("CREW_HOME_UNREADABLE")) {
+    (deps.log ?? ((m: string) => console.error(m)))(
+      `[crew] codex-spawn: spawn home UNREADABLE for '${agentId}' at ${paths.codexHome} — ` +
+        `NOTHING REMOVED and no receipt written. This is not "already gone"; it is "I could not look".`,
+    );
+    result.skipped = "home-unreadable";
+    return;
+  }
   if (out.includes("CREW_FINALIZE_FAILED")) {
     result.failed.push({ path: receipt, error: "finalize-failed" });
+  }
+  if (out.includes("CREW_FINALIZE_RECORD_FAILED")) {
+    result.failed.push({ path: `${receipt}.finalize-failed`, error: "finalize-failure-record-unwritable" });
   }
   if (!out.includes("CREW_TEARDOWN_DONE")) {
     result.failed.push({ path: paths.codexHome, error: `remote teardown did not complete: ${out.trim() || "(no output)"}` });
@@ -631,6 +656,7 @@ async function teardownRemote(
   }
   const pick = (tag: string) =>
     out.split("\n").filter((l) => l.startsWith(tag + " ")).map((l) => l.slice(tag.length + 1).trim());
+  result.absent.push(...pick("ABSENT"));
   result.removed.push(...pick("REMOVED"));
   for (const p of pick("REMAIN")) result.failed.push({ path: p, error: "still present after remote rm" });
 }

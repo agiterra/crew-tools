@@ -5,3 +5,10 @@ node_modules/
 .DS_Store
 bun.lockb
 .env
+
+# ⛔ N19: review artifacts are EVIDENCE, not library content. They are preserved 0640
+# root:agiterra in the incident directory; shipping them in the package would put a review of
+# the package inside the package.
+BRIEF.md
+REVIEW-pr91-*.md
+row7-teardown.ts
