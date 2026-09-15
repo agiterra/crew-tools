@@ -5,12 +5,13 @@
  * Zeppolina, per the GO. Every fixture is built and torn down under a temp dir.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, writeFile, symlink, readdir, readFile, stat, chmod } from "fs/promises";
+import { mkdtemp, mkdir, writeFile, symlink, readdir, readFile, stat, lstat, chmod } from "fs/promises";
 import { tmpdir } from "os";
-import { join } from "path";
+import { basename, dirname, join } from "path";
 import {
   classifySpawnHome, manifestDigest, buildRemoteTeardownScript,
-  removeCodexSpawnHome, DISPOSABLE_BASENAMES, LOCK_DIRS,
+  removeCodexSpawnHome, writeReceipt, DISPOSABLE_BASENAMES, LOCK_DIRS,
+  type SpawnEntry, type StopReceipt,
 } from "./codex-spawn.js";
 
 /** A spawn home carrying one of everything the spec cares about. */
@@ -28,6 +29,14 @@ async function fixture(): Promise<{ home: string; codexHome: string; stateDir: s
     await mkdir(join(codexHome, d), { recursive: true });
     await writeFile(join(codexHome, d, "a.lock"), "lock");
   }
+  // ⛔ C1 (PR 91 review). The parity fixture held only plain `a.lock` files, so the two places
+  // where /bin/sh and lstat disagree about "exists" and "is a file" were never exercised:
+  //   (a) a DANGLING symlink is `[ -e ]`-false, so the shell skipped it and disposed the dir;
+  //   (b) `[ -f ]` FOLLOWS a link, so a symlinked .lock was disposed by shell and kept by TS.
+  // Both made the shell rm -rf a lock directory the classifier retains.
+  await writeFile(join(codexHome, "realfile-for-lock-link"), "MUST-SURVIVE");
+  await symlink(join(codexHome, "realfile-for-lock-link"), join(codexHome, "app-server-control", "sneaky.lock"));
+  await symlink(join(codexHome, "does-not-exist"), join(codexHome, "mcp-oauth-locks", "dangling.lock"));
   // conversation state + sidecars
   for (const f of ["thread_history_1.sqlite", "thread_history_1.sqlite-wal", "thread_history_1.sqlite-shm",
                    "memories_1.sqlite", "state_5.sqlite", "goals_1.sqlite"]) {
@@ -51,7 +60,10 @@ const run = (f: { home: string; codexHome: string; stateDir: string }) =>
     { log: () => {} },
   );
 
-const alive = async (p: string) => { try { await stat(p); return true; } catch { return false; } };
+// ⛔ lstat, NOT stat. stat FOLLOWS symlinks, so a dangling link reads as absent and this helper
+// would report a retained entry as removed. That is the same stat/lstat confusion as C1(b) —
+// it was in the test harness as well as the shell, which is part of why C1 was invisible here.
+const alive = async (p: string) => { try { await lstat(p); return true; } catch { return false; } };
 
 describe("classification", () => {
   test("1+11: conversation state, sidecars and unknown entries are retained", async () => {
@@ -65,11 +77,23 @@ describe("classification", () => {
     expect(await alive(join(f.stateDir, "agentx.thread.json"))).toBe(true);
   });
 
-  test("2: disposable scaffolding is removed", async () => {
+  test("2: disposable scaffolding is removed, and a lock dir holding non-locks is NOT", async () => {
     const f = await fixture();
     await run(f);
     for (const b of DISPOSABLE_BASENAMES) expect(await alive(join(f.codexHome, b))).toBe(false);
-    for (const d of LOCK_DIRS) expect(await alive(join(f.codexHome, d))).toBe(false);
+    // A lock dir whose entries are ALL plain .lock files goes.
+    expect(await alive(join(f.codexHome, "thread-writer-locks"))).toBe(false);
+    // ⛔ C1 regression rows. These two hold a symlinked and a dangling .lock respectively, so the
+    // DIRECTORY is retained while its plain a.lock is still removed. Before the fix the generated
+    // shell disposed both directories outright — rm -rf on content the classifier retains.
+    for (const d of ["app-server-control", "mcp-oauth-locks"]) {
+      expect(await alive(join(f.codexHome, d))).toBe(true);
+      expect(await alive(join(f.codexHome, d, "a.lock"))).toBe(false);
+    }
+    expect(await alive(join(f.codexHome, "app-server-control", "sneaky.lock"))).toBe(true);
+    expect(await alive(join(f.codexHome, "mcp-oauth-locks", "dangling.lock"))).toBe(true);
+    // the symlink target must be untouched
+    expect(await readFile(join(f.codexHome, "realfile-for-lock-link"), "utf8")).toBe("MUST-SURVIVE");
   });
 
   test("3: auth.json is unlinked and the CREDENTIAL ITSELF is untouched", async () => {
@@ -164,8 +188,14 @@ describe("remote parity", () => {
 
     const script = buildRemoteTeardownScript();
     const proc = Bun.spawnSync(["/bin/sh", "-c", script], {
+      // ⛔ F1 (PR 91 review). This inherited AGENT_ID from the author's shell. The generated
+      // script runs `set -u` then `AG="$AGENT_ID"`, so with AGENT_ID unset the shell exits
+      // before the first loop iteration and every assertion below rides on a persona variable.
+      // It was green here and red in CI, and it is WHY C1 went undetected: a test green for an
+      // environmental reason is never under pressure. Supply it explicitly.
       env: {
         ...process.env,
+        AGENT_ID: "agentx",
         CODEX_HOME: f.codexHome,
         AUTH_TARGET: join(f.home, ".codex", "auth.json"),
         RECEIPT: join(f.stateDir, ".stopped", "agentx.remote.json"),
@@ -191,5 +221,315 @@ describe("remote parity", () => {
     expect(rec.disposable.length).toBeGreaterThan(0);
     expect(rec.retained.some((p: string) => p.endsWith("thread_history_1.sqlite"))).toBe(true);
     expect(rec.failed).toEqual([]);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+// SPEC ROWS 15-18 — MUTANT CONTROLS                                    (PR 91 review, T1)
+//
+// The spec's closing line: "Rows 15-18 are what make the rest mean anything: each earlier
+// revision of this spec passed every test I had imagined for it at the time." That is the
+// literal history of this file — rev1's allowlist would have deleted the 19.5 MB
+// thread_history and kept a 32 KB goals file, and it passed review; rev2 named cache/ and
+// tmp/ as disposable DIRECTORIES, the same bug one level down, and it passed review too.
+//
+// A test suite that has never been run against a KNOWN-BAD classifier has not been shown to
+// be load-bearing. So: one auditor, both implementations, four mutants, and a positive
+// control proving the auditor can return clean.
+//
+// ⚠️ ROW 7 (stop -> resume e2e) is named by spec row 15 and is NOT audited here: it is not
+// in this suite at all (review finding T2, follow-up). The whole-home control below covers
+// rows 1, 4, 5, 6, 9 and 10. Row 7 is stated as uncovered rather than quietly dropped.
+// ════════════════════════════════════════════════════════════════════════════════════════
+
+type Fx = { home: string; codexHome: string; stateDir: string };
+type Classifier = (codexHome: string, home: string) => Promise<SpawnEntry[]>;
+
+/** A fixture with the mode-sensitive entry row 5 measures already armed. */
+async function armed(): Promise<Fx> {
+  const f = await fixture();
+  await chmod(join(f.codexHome, "state_5.sqlite"), 0o600);
+  return f;
+}
+
+/**
+ * ONE auditor, run against BOTH implementations and every mutant, returning the spec rows
+ * that FAILED. Shared on purpose: a per-implementation auditor lets a mutant fail
+ * "differently" on each side, which is precisely the divergence class C1 turned out to be.
+ */
+async function failedRows(f: Fx): Promise<number[]> {
+  const at = (...p: string[]) => join(f.codexHome, ...p);
+  const same = async (p: string, want: string) => {
+    try { return (await readFile(p, "utf8")) === want; } catch { return false; }
+  };
+  const bad: number[] = [];
+
+  if (!(await alive(at("thread_history_1.sqlite")))) bad.push(1);
+  // 2 is audited so a mutant that removes NOTHING cannot read as a clean pass.
+  if (await alive(at("config.toml"))) bad.push(2);
+  if (!(await same(join(f.home, ".codex", "auth.json"), "CREDENTIAL-MUST-SURVIVE"))) bad.push(3);
+  // 4: a sqlite is retained WITH its -wal and -shm. All three, or the row fails.
+  const trio = ["thread_history_1.sqlite", "thread_history_1.sqlite-wal", "thread_history_1.sqlite-shm"];
+  if (!(await Promise.all(trio.map((n) => alive(at(n))))).every(Boolean)) bad.push(4);
+  let mode = -1;
+  try { mode = (await stat(at("state_5.sqlite"))).mode & 0o777; } catch { /* gone */ }
+  if (mode !== 0o600) bad.push(5);
+  if (!(await same(at("workspaces", "repo", ".git", "HEAD"), "ref: refs/heads/main\n"))) bad.push(6);
+  if (!(await same(at("cache", "a", "deadbeef.json"), "USER-WROTE-THIS"))) bad.push(9);
+  if (!(await same(at("tmp", "arg0", "codex-arg0-example", "userfile.txt"), "USER-WROTE-THIS"))) bad.push(10);
+  if (!(await alive(at("something-new-from-a-future-release")))) bad.push(11);
+  return bad.sort((a, b) => a - b);
+}
+
+const runWith = (f: Fx, classify?: Classifier) =>
+  removeCodexSpawnHome(
+    { agentId: "agentx", runtime: "codex", selfHome: f.home, env: { STATE_DIR: f.stateDir } },
+    { log: () => {}, classify },
+  );
+
+function runShell(f: Fx, script: string): string {
+  const proc = Bun.spawnSync(["/bin/sh", "-c", script], {
+    env: {
+      ...process.env,
+      AGENT_ID: "agentx",
+      CODEX_HOME: f.codexHome,
+      AUTH_TARGET: join(f.home, ".codex", "auth.json"),
+      RECEIPT: join(f.stateDir, ".stopped", "agentx.remote.json"),
+    },
+  });
+  return new TextDecoder().decode(proc.stdout);
+}
+
+/**
+ * Mutate the REAL generated program. ⛔ A string replace that matches nothing produces a
+ * perfectly valid script that passes every assertion — a mutant control that silently
+ * failed to apply is worse than no control, because it reports as evidence. So each
+ * mutation proves it changed the text before it is allowed to run.
+ */
+function mutate(find: string, replace: string): string {
+  const src = buildRemoteTeardownScript();
+  const out = src.replace(find, replace);
+  if (out === src) throw new Error(`MUTATION DID NOT APPLY — anchor gone: ${find.slice(0, 70)}`);
+  return out;
+}
+
+// ---- the four mutants, TS side -----------------------------------------------------------
+
+/** Commit bf3fdb0 itself: the whole home is one disposable entry. This IS the incident. */
+const mutantWholeHome: Classifier = async (codexHome) => [
+  { path: codexHome, disposition: "disposable", reason: "MUTANT: whole-home removal",
+    kind: "dir", size: 0, mode: 0o700 },
+];
+
+/** Revision 1 of the spec: an ALLOWLIST of what to keep. It named goals_1.sqlite (32 KB)
+ *  and would have deleted thread_history_1.sqlite (19.5 MB). */
+const REV1_KEEP = new Set(["goals_1.sqlite", "sessions", "skills", "plugins", "workspaces"]);
+const mutantRev1Allowlist: Classifier = async (codexHome, home) =>
+  (await classifySpawnHome(codexHome, home)).map((e) =>
+    dirname(e.path) === codexHome && !REV1_KEEP.has(basename(e.path))
+      ? { ...e, disposition: "disposable" as const, reason: "MUTANT: rev-1 allowlist" }
+      : e);
+
+/** Revision 2: cache/ and tmp/ named as disposable DIRECTORIES — the same bug, one level down. */
+const mutantCacheTmpDirs: Classifier = async (codexHome, home) =>
+  (await classifySpawnHome(codexHome, home)).map((e) =>
+    dirname(e.path) === codexHome && ["cache", "tmp"].includes(basename(e.path))
+      ? { ...e, disposition: "disposable" as const, reason: "MUTANT: cache/tmp disposable dirs" }
+      : e);
+
+/** The pre-structural heuristics: a hex basename "looks generated", codex-arg0* "looks like
+ *  scaffolding". Both require DESCENDING, which the real classifier never does — so the
+ *  mutant has to add the descent in order to express them at all. */
+const mutantHexHeuristics: Classifier = async (codexHome, home) => {
+  const out = await classifySpawnHome(codexHome, home);
+  const walk = async (dir: string): Promise<void> => {
+    let names: string[] = [];
+    try { names = await readdir(dir); } catch { return; }
+    for (const n of names) {
+      const p = join(dir, n);
+      const st = await lstat(p);
+      const base = { path: p, size: st.size, mode: st.mode & 0o7777 };
+      if (st.isDirectory()) {
+        if (/^codex-arg0/.test(n)) {
+          out.push({ ...base, kind: "dir", disposition: "disposable", reason: "MUTANT: codex-arg0 heuristic" });
+        } else await walk(p);
+      } else if (/^[0-9a-f]{8,}\./.test(n)) {
+        out.push({ ...base, kind: "file", disposition: "disposable", reason: "MUTANT: hex-basename heuristic" });
+      }
+    }
+  };
+  await walk(join(codexHome, "cache"));
+  await walk(join(codexHome, "tmp"));
+  return out;
+};
+
+describe("spec rows 15-18 — mutant controls", () => {
+  // ⛔ POSITIVE CONTROLS FIRST. Without these two rows, every mutant assertion below is
+  // equally satisfied by an auditor that fails everything unconditionally.
+  test("control: the REAL TS classifier passes every audited row", async () => {
+    const f = await armed();
+    await runWith(f);
+    expect(await failedRows(f)).toEqual([]);
+  });
+
+  test("control: the REAL shell program passes every audited row", async () => {
+    const f = await armed();
+    expect(runShell(f, buildRemoteTeardownScript())).toContain("CREW_TEARDOWN_DONE");
+    expect(await failedRows(f)).toEqual([]);
+  });
+
+  test("15 TS: whole-home mutant fails rows 1, 4, 5, 6, 9, 10", async () => {
+    const f = await armed();
+    await runWith(f, mutantWholeHome);
+    expect(await failedRows(f)).toEqual(expect.arrayContaining([1, 4, 5, 6, 9, 10]));
+    expect(await alive(f.codexHome)).toBe(false);
+  });
+
+  test("15 shell: whole-home mutant fails rows 1, 4, 5, 6, 9, 10", async () => {
+    const f = await armed();
+    // Reinstates bf3fdb0's removal AND drops the `$H` guard, in one edit.
+    runShell(f, mutate(
+      'sort -r "$D" | while IFS= read -r p; do [ "$p" = "$H" ] && continue;',
+      'rm -rf -- "$H"\nsort -r "$D" | while IFS= read -r p; do',
+    ));
+    expect(await failedRows(f)).toEqual(expect.arrayContaining([1, 4, 5, 6, 9, 10]));
+  });
+
+  test("16 TS: rev-1 allowlist mutant fails row 1 on thread_history_1.sqlite specifically", async () => {
+    const f = await armed();
+    await runWith(f, mutantRev1Allowlist);
+    expect(await failedRows(f)).toContain(1);
+    expect(await alive(join(f.codexHome, "thread_history_1.sqlite"))).toBe(false);
+    // The exact inversion that made rev1 look reasonable: the small file lives, the big one dies.
+    expect(await alive(join(f.codexHome, "goals_1.sqlite"))).toBe(true);
+  });
+
+  test("16 shell: rev-1 allowlist mutant fails row 1 on thread_history_1.sqlite specifically", async () => {
+    const f = await armed();
+    runShell(f, mutate(
+      '  elif [ -f "$p" ]; then for b in $BASES; do [ "$n" = "$b" ] && d=1; done',
+      '  elif [ -f "$p" ]; then d=1; for b in goals_1.sqlite; do [ "$n" = "$b" ] && d=0; done',
+    ));
+    expect(await failedRows(f)).toContain(1);
+    expect(await alive(join(f.codexHome, "thread_history_1.sqlite"))).toBe(false);
+    expect(await alive(join(f.codexHome, "goals_1.sqlite"))).toBe(true);
+  });
+
+  test("17 TS: cache/ and tmp/ as disposable directories fails rows 9 and 10", async () => {
+    const f = await armed();
+    await runWith(f, mutantCacheTmpDirs);
+    expect(await failedRows(f)).toEqual(expect.arrayContaining([9, 10]));
+  });
+
+  test("17 shell: cache/ and tmp/ as disposable directories fails rows 9 and 10", async () => {
+    const f = await armed();
+    runShell(f, mutate(
+      '  elif [ -d "$p" ]; then',
+      '  elif [ -d "$p" ]; then\n    [ "$n" = "cache" ] && d=1\n    [ "$n" = "tmp" ] && d=1',
+    ));
+    expect(await failedRows(f)).toEqual(expect.arrayContaining([9, 10]));
+  });
+
+  test("18 TS: hex-basename / codex-arg0 heuristics fail rows 9 and 10", async () => {
+    const f = await armed();
+    await runWith(f, mutantHexHeuristics);
+    expect(await failedRows(f)).toEqual(expect.arrayContaining([9, 10]));
+  });
+
+  test("18 shell: hex-basename / codex-arg0 heuristics fail rows 9 and 10", async () => {
+    const f = await armed();
+    runShell(f, mutate(
+      'mkdir -p "$(dirname "$R")"',
+      'find "$H/cache" "$H/tmp" \\( -type d -name "codex-arg0*" -o -type f -name "[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*" \\) >> "$D" 2>/dev/null\n'
+        + 'mkdir -p "$(dirname "$R")"',
+    ));
+    expect(await failedRows(f)).toEqual(expect.arrayContaining([9, 10]));
+  });
+
+  // ⛔ T4 (PR 91 review). The generator's comment claims a whole-home target is "unreachable
+  // by construction rather than by assertion". Construction can be changed by an edit; this
+  // row is what notices. It forces `$H` onto the disposal list and requires the guard to
+  // REFUSE it — a guard nobody has seen refuse is indistinguishable from one that cannot.
+  test("T4: an explicit whole-home target on the disposal list is REFUSED by the guard", async () => {
+    const f = await armed();
+    const out = runShell(f, mutate(
+      'while IFS= read -r p; do echo "DISPOSE $p"; done < "$D"',
+      'echo "$H" >> "$D"\nwhile IFS= read -r p; do echo "DISPOSE $p"; done < "$D"',
+    ));
+    expect(out).toContain("CREW_TEARDOWN_DONE");
+    expect(await alive(f.codexHome)).toBe(true);
+    expect(await failedRows(f)).toEqual([]);
+  });
+});
+
+// ── spec row 13 — FINALIZE FAILS AFTER REMOVAL ────────────────────────────────────────────
+// The receipt is the whole audit story, and this is the branch where it is hardest to tell the
+// truth: removal has ALREADY RUN, so "nothing was removed" and "everything was retained" are
+// both lies, and "complete" is the worst lie of the three. F3 shipped with `state:
+// "finalize-failed"` declared, typed — and never assigned to anything.
+describe("spec row 13 — finalize-failed", () => {
+  /** Succeeds for the first `okFor` calls, then throws. Records every receipt it accepted. */
+  function flakyWriter(okFor: number) {
+    const accepted: Array<{ stamp: string; r: StopReceipt }> = [];
+    let n = 0;
+    const fn = async (stateDir: string, agentId: string, stamp: string, r: StopReceipt) => {
+      if (++n > okFor) throw new Error("ENOSPC: simulated storage failure");
+      accepted.push({ stamp, r });
+      return writeReceipt(stateDir, agentId, stamp, r);
+    };
+    return { fn, accepted, calls: () => n };
+  }
+
+  test("13: finalize fails -> a finalize-failed receipt carries the ACTUAL sets, never 'complete'", async () => {
+    const f = await armed();
+    const w = flakyWriter(1); // INTENT succeeds; the finalize write throws; the retry succeeds.
+    const logs: string[] = [];
+    const res = await removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: f.home, env: { STATE_DIR: f.stateDir } },
+      { log: (m) => logs.push(m), writeReceipt: async (sd, a, st, r) => {
+          if (st.endsWith(".finalize-failed")) return writeReceipt(sd, a, st, r);
+          return w.fn(sd, a, st, r);
+        } },
+    );
+
+    // Removal DID run — this is the state the row exists to describe.
+    expect(res.removed.length).toBeGreaterThan(0);
+
+    const names = await readdir(join(f.stateDir, ".stopped"));
+    const ff = names.find((n) => n.includes("finalize-failed"));
+    expect(ff).toBeDefined();
+    const rec = JSON.parse(await readFile(join(f.stateDir, ".stopped", ff!), "utf8"));
+
+    expect(rec.state).toBe("finalize-failed");           // never "complete"
+    expect(rec.removed).toEqual(res.removed);            // the ACTUAL removed set
+    expect(rec.retained.length).toBeGreaterThan(0);
+    expect(rec.retained.some((p: string) => p.endsWith("thread_history_1.sqlite"))).toBe(true);
+    expect(rec.manifest_scope).toBe("root-metadata");
+    // and the caller is told, rather than handed a success.
+    expect(res.failed.some((x) => x.error === "finalize-failed")).toBe(true);
+    expect(logs.join("\n")).toContain("Not reported as success");
+    // ⛔ the row's negative half: it must NOT claim everything survived.
+    expect(logs.join("\n")).not.toContain("retained 0 entr");
+  });
+
+  test("13b: when the failure receipt ALSO cannot be written, that limitation is stated", async () => {
+    const f = await armed();
+    const w = flakyWriter(1); // INTENT succeeds; finalize AND its retry both throw.
+    const logs: string[] = [];
+    const res = await removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: f.home, env: { STATE_DIR: f.stateDir } },
+      { log: (m) => logs.push(m), writeReceipt: w.fn },
+    );
+    expect(w.calls()).toBe(3);                            // INTENT, finalize, finalize-failed retry
+    expect(res.removed.length).toBeGreaterThan(0);
+    const all = logs.join("\n");
+    expect(all).toContain("storage will not accept a failure record");
+    expect(all).toContain("the in-progress INTENT receipt is the only durable record");
+    // The INTENT really is intact and really does name what was at risk.
+    const names = await readdir(join(f.stateDir, ".stopped"));
+    expect(names.some((n) => n.includes("finalize-failed"))).toBe(false);
+    const intent = JSON.parse(await readFile(join(f.stateDir, ".stopped", names[0]), "utf8"));
+    expect(intent.state).toBe("in-progress");
+    expect(intent.retained.some((p: string) => p.endsWith("thread_history_1.sqlite"))).toBe(true);
   });
 });

@@ -1605,8 +1605,13 @@ describe("codex-spawn teardown (AGI-74)", () => {
     expect(teardown).toContain("sudo -n -u _ephemeral");
     expect(teardown).toContain("CODEX_HOME='/Users/_ephemeral/.wire/codex-spawn/ephem'");
     // NO-GLOB-TO-RM, the intent of the old not.toContain("*"): the script globs to
-    // ENUMERATE, but every removal takes ONE explicit path. Asserting that directly is
-    // stronger than asserting the command string contains no asterisk anywhere.
+    // ENUMERATE, but every removal takes ONE explicit path.
+    // ⛔ NOT "stronger" — that claim was wrong and the review (T4) was right to call it.
+    // This is a SHAPE assertion and it is blind to the only thing that matters: what "$p"
+    // is BOUND TO. `rm -rf -- "$p"` is equally true when $p is the whole home. The gap is
+    // closed at RUNTIME, not here — codex-spawn-preserve.test.ts, "T4: an explicit
+    // whole-home target on the disposal list is REFUSED by the guard". Keep both: this row
+    // catches a glob reappearing in the text, that row catches a bad binding.
     for (const line of teardown!.split("\n").filter((l) => l.includes("rm -rf"))) {
       expect(line).toContain('rm -rf -- "$p"');
     }
