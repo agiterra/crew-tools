@@ -679,8 +679,20 @@ describe("spec row 14 — accept path, and the thread pointer", () => {
 // this repo. Override with GEN_CODEX_HOME. If it cannot be found this test FAILS rather than
 // skipping — a skipped row for an unavailable instrument reads as coverage it never had.
 describe("spec row 7 — stop then re-provision (Phase A: persistence, not continuation)", () => {
-  const GEN = process.env.GEN_CODEX_HOME
+  // ⛔ CI FOUND MY DESIGN ERROR. This was a hardcoded absolute path OUTSIDE this repository,
+  // and the row FAILED rather than skipped when it was missing — deliberately, so an
+  // unavailable instrument could not read as coverage. The consequence I did not think through:
+  // CI can then NEVER be green, and a gate that cannot go green is one nobody reads. That is
+  // the same failure I had already written into backup-hygiene-check.sh's header.
+  // ⇒ SPLIT THE TWO CLAIMS instead of trading one off against the other:
+  //   · OUR CONTRACT — re-provisioning must not clobber retained state — is tested ALWAYS,
+  //     with a vendored provisioner performing the four operations the spec quotes.
+  //   · THE REAL GENERATOR still performing exactly those operations is a DIFFERENT claim about
+  //     an external artifact, and it runs only where that artifact exists.
+  // Neither row is weakened and neither is platform-excluded; they were two claims in one row.
+  const REAL_GEN = process.env.GEN_CODEX_HOME
     ?? "/Users/tim/Projects/Agiterra/codex-wire/scripts/gen-codex-home.sh";
+  const VENDORED = join(import.meta.dir, "..", "test", "e2e", "vendored-provisioner.sh");
 
   const sh = (cmd: string[], cwd?: string, env?: Record<string, string>) => {
     const p = Bun.spawnSync(cmd, { cwd, env: { ...process.env, ...(env ?? {}) } });
@@ -749,10 +761,15 @@ describe("spec row 7 — stop then re-provision (Phase A: persistence, not conti
     expect(res.failed).toEqual([]);
 
     // ── the REAL generator, re-provisioning the same home ──
-    const genStat = await lstat(GEN).catch(() => null);
-    expect(genStat, `real generator not found at ${GEN}. Set GEN_CODEX_HOME. ` +
-      `Row 7 cannot be witnessed without it, and a skipped row would read as coverage.`).not.toBeNull();
-    const gen = sh(["bash", GEN], undefined, {
+    // The CONTRACT row uses the real generator when it is present and the vendored one
+    // otherwise, and RECORDS WHICH — so a fallback can never be silent.
+    const realPresent = (await lstat(REAL_GEN).catch(() => null)) !== null;
+    const usedGen = realPresent ? REAL_GEN : VENDORED;
+    if (!realPresent) {
+      console.warn(`[row7] REAL generator absent at ${REAL_GEN} — contract verified with the ` +
+        `VENDORED provisioner. The real-generator claim is NOT covered in this run.`);
+    }
+    const gen = sh(["bash", usedGen], undefined, {
       HOME: f.home,
       AGENT_ID: "agentx",
       // fixture-only dummy; the generator writes it into config.toml, which is disposable.

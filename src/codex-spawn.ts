@@ -465,7 +465,13 @@ export function buildRemoteTeardownScript(): string {
     // ⛔ N16: these explanations were on STDERR, and screen.sshRun returns STDOUT ONLY — so
     // production dropped every one of them. Explaining a refusal down a channel nobody reads is
     // the same as not explaining it. All diagnostics go to stdout.
-    '  ls -A "$H" >/dev/null 2>&1 || { echo CREW_HOME_UNREADABLE; echo "CREW_CODE EACCES"; echo "CREW_NOTE NOTHING REMOVED for $AG at $H — this is not \'already gone\', it is \'I could not look\'."; exit 8; }',
+    // ⛔ PORTABILITY DEFECT, found by CI on Linux after N15 wired the suite in. `ls -A` tests
+    // whether the directory can be LISTED, which needs only `r`. Resolving a name INSIDE it
+    // needs `x`. On macOS `ls` happens to fail for a 0400 directory, so every local run and
+    // every review pass saw a refusal that Linux does not produce — the parity rows proved the
+    // two implementations agree ON ONE PLATFORM. The local path needs both bits implicitly
+    // (readdir needs r, per-entry lstat needs x), so the remote must test both explicitly.
+    '  { [ -r "$H" ] && [ -x "$H" ] && ls -A "$H" >/dev/null 2>&1; } || { echo CREW_HOME_UNREADABLE; echo "CREW_CODE EACCES"; echo "CREW_NOTE NOTHING REMOVED for $AG at $H — this is not \'already gone\', it is \'I could not look\'."; exit 8; }',
     'fi',
     // JSON array from a newline list — quoting handled once, in awk.
     'jarr() { awk \'BEGIN{printf "["} {gsub(/\\\\/,"\\\\\\\\"); gsub(/"/,"\\\\\\""); printf "%s\\"%s\\"",(NR>1?",":""),$0} END{printf "]"}\' "$1"; }',
@@ -482,7 +488,9 @@ export function buildRemoteTeardownScript(): string {
     // ⛔ N33 on the remote side. An unreadable lock dir globbed to nothing, so `any` stayed 0
     // and `d` was never set — retained for the same incidental reason as the local seed. Make
     // the refusal explicit, matching the root-level check and the local path.
-    '      ls -A "$p" >/dev/null 2>&1 || { echo CREW_HOME_UNREADABLE; echo "CREW_CODE EACCES"; echo "CREW_NOTE LOCK DIR UNREADABLE: $p for $AG — refusing; this is not \'no locks here\'."; exit 8; }',
+    // Same both-bits test one level down: a lock dir we can list but not traverse is still
+    // "I could not look", and the local path throws for it via the per-entry lstat.
+    '      { [ -r "$p" ] && [ -x "$p" ] && ls -A "$p" >/dev/null 2>&1; } || { echo CREW_HOME_UNREADABLE; echo "CREW_CODE EACCES"; echo "CREW_NOTE LOCK DIR UNREADABLE: $p for $AG — refusing; this is not \'no locks here\'."; exit 8; }',
     '      all=1; any=0',
     '      for q in "$p"/* "$p"/.*; do',
     '        m=$(basename "$q"); [ "$m" = "." ] || [ "$m" = ".." ] && continue',
