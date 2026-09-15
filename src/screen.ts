@@ -128,14 +128,22 @@ function remoteScreen(t: RemoteTarget): string {
  *  `sshHost: "local"` executes through a local `/bin/zsh -lc` — identical shell
  *  semantics to the ssh path (login shell), minus the network hop. */
 export async function sshRun(t: RemoteTarget, remoteCommand: string): Promise<string> {
-  if (t.sshHost === LOCAL_SUDO_HOST) {
-    const r = await $`/bin/zsh -lc ${remoteCommand}`.quiet().nothrow();
-    return r.stdout.toString();
-  }
-  const r = await $`ssh -o BatchMode=yes -o ConnectTimeout=15 ${t.sshHost} ${remoteCommand}`
-    .quiet()
-    .nothrow();
-  return r.stdout.toString();
+  return (await sshRunStatus(t, remoteCommand)).stdout;
+}
+
+/** What `sshRun` throws away. A command that FAILED and one that succeeded with no
+ *  output both return "" from sshRun, so a caller deciding presence/absence on stdout
+ *  alone cannot tell "nothing there" from "could not look". */
+export type SshRunResult = { stdout: string; stderr: string; exitCode: number };
+
+/** `sshRun`, retaining exit status and stderr. `sshRun` delegates here, so existing
+ *  callers are unaffected; use this one wherever empty output would otherwise be read
+ *  as a fact about the subject. */
+export async function sshRunStatus(t: RemoteTarget, remoteCommand: string): Promise<SshRunResult> {
+  const r = t.sshHost === LOCAL_SUDO_HOST
+    ? await $`/bin/zsh -lc ${remoteCommand}`.quiet().nothrow()
+    : await $`ssh -o BatchMode=yes -o ConnectTimeout=15 ${t.sshHost} ${remoteCommand}`.quiet().nothrow();
+  return { stdout: r.stdout.toString(), stderr: r.stderr.toString(), exitCode: r.exitCode };
 }
 
 /** Create a detached screen session on a remote host, owned by `runAsUid`. */
@@ -282,6 +290,37 @@ export async function getRemoteSessionPid(name: string, t: RemoteTarget): Promis
     if (match && match[2] === name) return parseInt(match[1]);
   }
   return null;
+}
+
+/** A remote-pid lookup that can report ITS OWN failure.
+ *
+ *  `screen -ls` exits non-zero when it finds no sessions, which is a legitimate
+ *  "absent" — so exit status alone is not the discriminator. What IS a probe failure:
+ *  `sudo -n` refusing for want of a NOPASSWD grant, a broken login shell, or a
+ *  SCREENDIR that cannot be opened. Those print to stderr and produce no session list.
+ *
+ *  ⇒ `{ ok: false }` means UNKNOWN — the caller must not report absence. */
+export async function getRemoteSessionPidChecked(
+  name: string,
+  t: RemoteTarget,
+): Promise<{ ok: true; pid: number | null } | { ok: false; reason: string }> {
+  const r = await sshRunStatus(t, `${remoteScreen(t)} -ls`);
+  const looksLikeScreenOutput = /No Sockets found|Sockets? in |^\t\d+\./m.test(r.stdout);
+  if (!looksLikeScreenOutput) {
+    const err = r.stderr.trim().split("\n")[0] ?? "";
+    // Categorise, and do NOT echo an arbitrary stderr line back to a caller that may log it.
+    const reason = /sudo|password|not permitted|not allowed/i.test(err)
+      ? `sudo refused for uid '${t.runAsUid}'`
+      : /screendir|permission denied|cannot open/i.test(err)
+        ? `SCREENDIR unreadable for uid '${t.runAsUid}'`
+        : `no parseable screen output, exit ${r.exitCode}`;
+    return { ok: false, reason };
+  }
+  for (const line of r.stdout.split("\n")) {
+    const match = line.match(/^\t(\d+)\.(\S+)\t/);
+    if (match && match[2] === name) return { ok: true, pid: parseInt(match[1]) };
+  }
+  return { ok: true, pid: null };
 }
 
 /**

@@ -24,7 +24,7 @@ import { pickName, backgroundImagePath, loadTheme, updateTheme, listThemes } fro
 import { getClaudeCodeSessionId } from "./claude-session.js";
 import { assertClaudeCredentialLive } from "./credentials.js";
 import { buildConfigDirSetup } from "./config-dir.js";
-import { removeCodexSpawnHome, type CodexSpawnTeardownResult } from "./codex-spawn.js";
+import { removeCodexSpawnHome, SAFE_UID, type CodexSpawnTeardownResult } from "./codex-spawn.js";
 
 /** The agent/lane id contract, enforced by launchAgent. Mirrored by wallet-browser-register.sh and lane-reap.sh. */
 export const AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -61,6 +61,43 @@ function sanitizeEnv(env: Record<string, string>): Record<string, string> {
     out[k] = v;
   }
   return out;
+}
+
+/**
+ * Merge `run_as_uid` into an existing spawn manifest, or REFUSE.
+ *
+ * ⛔ A malformed or non-object manifest is NOT recovered by substituting `{}`. Doing that
+ * would write the substitute back and permanently destroy whatever the column held —
+ * turning a read problem into data loss on the one path that can restore a deleted agent
+ * row. We refuse instead, leaving the row byte-for-byte unchanged, and the operator can
+ * inspect the column directly.
+ *
+ * The thrown message carries ONLY the agent id and an error CATEGORY. The manifest holds
+ * `env`, so neither the raw value nor any part of it is ever logged or thrown.
+ */
+function mergeRunAsUid(raw: string | null, runAsUid: string, agentId: string): string {
+  if (!raw) return JSON.stringify({ run_as_uid: runAsUid });
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `registerAgent: agent '${agentId}' has an unparseable spawn_manifest (JSON syntax error). ` +
+      `Refusing to register rather than overwrite it — the row is unchanged. ` +
+      `Inspect agents.spawn_manifest for this id.`,
+    );
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const kind = parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed;
+    throw new Error(
+      `registerAgent: agent '${agentId}' has a non-object spawn_manifest (parsed as ${kind}). ` +
+      `Refusing to register rather than overwrite it — the row is unchanged. ` +
+      `Inspect agents.spawn_manifest for this id.`,
+    );
+  }
+  // Spread FIRST so run_as_uid wins, and every other field the launcher wrote —
+  // env, project_dir, channels, ttl_idle_minutes, aux_surface — survives untouched.
+  return JSON.stringify({ ...(parsed as Record<string, unknown>), run_as_uid: runAsUid });
 }
 
 /** Shape of the persisted spawn manifest (agents.spawn_manifest JSON). */
@@ -1337,16 +1374,41 @@ export class Orchestrator {
       }
     }
 
+    // F7: VALIDATE BEFORE CONSTRUCTING. The value reaches a shell — remoteScreen()
+    // builds a `sudo -n -u <uid> …` STRING that sshRun hands to `/bin/zsh -lc`, so this
+    // regex is the only thing between it and a shell parser. Ordering was previously
+    // inert (the literal has no getters and nothing read it before the guard), but the
+    // next edit to move a line will not arrive with that analysis attached.
+    // SAFE_UID is imported from codex-spawn rather than re-spelled: two validators of
+    // one concept that disagree in both directions is how a value becomes valid at one
+    // boundary and invalid at the next. It is also length-bounded, which the old local
+    // pattern was not.
+    if (opts.runAsUid !== undefined && !SAFE_UID.test(opts.runAsUid)) {
+      throw new Error("registerAgent: invalid owning UID");
+    }
     // A central service's screen namespace is not the registering persona's.
     const registerTarget = opts.runAsUid
       ? { sshHost: screen.LOCAL_SUDO_HOST, runAsUid: opts.runAsUid }
       : undefined;
-    if (opts.runAsUid && !/^[a-z_][a-z0-9_-]*$/i.test(opts.runAsUid)) {
-      throw new Error("registerAgent: invalid owning UID");
+    // F4: the cross-uid probe must not report its own failure as the subject's absence.
+    // getRemoteSessionPidChecked surfaces the exit status sshRun discards, so a sudo
+    // refusal / broken login shell / unreadable SCREENDIR is reported as UNOBSERVABLE
+    // rather than as "not running". A log line cannot substitute for this: the status
+    // is information the probe threw away, not information it failed to print.
+    let alive: boolean;
+    if (registerTarget) {
+      const probe = await screen.getRemoteSessionPidChecked(screenName, registerTarget);
+      if (!probe.ok) {
+        throw new Error(
+          `registerAgent: could not observe screen namespace for uid '${opts.runAsUid}' ` +
+          `(${probe.reason}) — liveness of '${screenName}' is UNKNOWN, not disproved. ` +
+          `This is a fact about the probe, not the session.`,
+        );
+      }
+      alive = probe.pid === screenPid && screen.pidLooksAlive(screenPid);
+    } else {
+      alive = await screen.isAlive(screenName);
     }
-    const alive = registerTarget
-      ? (await screen.getRemoteSessionPid(screenName, registerTarget)) === screenPid && screen.pidLooksAlive(screenPid)
-      : await screen.isAlive(screenName);
     if (!alive) throw new Error(`screen session '${screenName}' is not running with pid ${screenPid}${opts.runAsUid ? ` as ${opts.runAsUid}` : ""}`);
 
     // Find the pane this agent is sitting in (by terminal session ID).
@@ -1401,13 +1463,37 @@ export class Orchestrator {
           `own screen session, not yours.`,
         );
       }
+      // ⛔ F1: PREPARE EVERYTHING THAT CAN FAIL **BEFORE** THE FIRST WRITE.
+      // Previously the pid and runtime updates were committed and then the manifest
+      // parse threw, leaving the row in a state no successful path produces: new pid,
+      // new runtime, possibly a nulled cc_session_id, stale run_as_uid. The caller saw
+      // a failure and would retry, but the row had already moved. registerAgent is the
+      // only operation that can restore a deleted agent row, so it must not be the one
+      // that half-writes.
+      const nextManifest = opts.runAsUid !== undefined
+        ? mergeRunAsUid(existingByScreen.spawn_manifest, opts.runAsUid, existingByScreen.id)
+        : undefined;
+
+      // ---- from here nothing throws; the row moves or it does not ----
       this.store.updateAgentPid(existingByScreen.id, screenPid);
       if (opts.runtime) this.store.updateAgentRuntime(existingByScreen.id, opts.runtime);
-      if (opts.runAsUid) {
-        const manifest = existingByScreen.spawn_manifest ? JSON.parse(existingByScreen.spawn_manifest) : {};
-        this.store.updateAgentManifest(existingByScreen.id, JSON.stringify({ ...manifest, run_as_uid: opts.runAsUid }));
+      if (nextManifest !== undefined) this.store.updateAgentManifest(existingByScreen.id, nextManifest);
+      // F8: a supplied cc_session_id that is dropped must leave a record. The id itself
+      // is NEVER logged — only the agent id and the runtime that caused the drop.
+      if (ccSessionId) {
+        const effectiveRuntime = opts.runtime ?? existingByScreen.runtime;
+        if (effectiveRuntime === "claude-code") {
+          this.store.updateAgentCcSession(screenName, ccSessionId);
+        } else {
+          console.error(
+            `[crew] registerAgent: discarded a supplied cc_session_id for '${existingByScreen.id}' — ` +
+            `row runtime is '${effectiveRuntime}'` +
+            (opts.runtime === undefined ? " (INHERITED from the row; no runtime was passed)" : " (passed by the caller)") +
+            `. A Claude session id is not meaningful on a non-claude-code row. If this row's ` +
+            `runtime is wrong, pass the correct runtime — otherwise this id can never be refreshed.`,
+          );
+        }
       }
-      if (ccSessionId && (opts.runtime ?? existingByScreen.runtime) === "claude-code") this.store.updateAgentCcSession(screenName, ccSessionId);
       if (!existingByScreen.pane && callerPane) {
         this.store.updateAgentPane(existingByScreen.id, callerPane);
       }

@@ -292,3 +292,84 @@ describe("cross-UID rows (manifest run_as_uid) — never verified, never reaped 
     expect(live).toEqual([]); // same-UID → snapshot-verified → missing → hidden
   });
 });
+
+describe("F5a · healer disposition for rows carrying a foreign run_as_uid", () => {
+  // ⛔ WHY THIS EXISTS, AND WHAT IT IS NOT.
+  //
+  // registerAgent now writes `run_as_uid` into spawn_manifest for cross-uid rows, and
+  // this healer READS that field (`manifestRunAsUid` → `screenNamespaceVerifiableHere`).
+  // So a registration-side change alters which rows this reaper will touch — a coupling
+  // through a DB column that no source diff between the two files can show.
+  //
+  // ⚠️ THIS INTRODUCES NO REAPING POLICY. The behaviour asserted below is what the
+  // deployed hot patch already does and what merged main already does for rows whose
+  // manifest carries the field by any other route (launch/resume stamp it too). What
+  // CHANGES versus merged main is only that SELF-REGISTERED rows now also carry it.
+  // These tests pin the existing disposition so it cannot drift unnoticed.
+  //
+  // The rationale lives in reality.ts: a session under another uid is INVISIBLE to this
+  // process's same-uid `screen -ls`, so "missing from the snapshot" proves nothing, and
+  // reaping on it would false-delete a live agent. Fondant's own CLAUDE.md records the
+  // 2026-07-20 incident where three personas were deleted in one second and stayed
+  // invisible for eight weeks.
+
+  test("a row with a FOREIGN run_as_uid is passed through, never marked or GC'd", async () => {
+    store.createAgent({
+      id: "ephemeral-lane",
+      display_name: "Ephemeral",
+      runtime: "claude-code",
+      screen_name: "wire-ephemeral-lane",
+      spawn_manifest: JSON.stringify({ run_as_uid: "_ephemeral", env: {}, project_dir: "/x", display_name: "E", runtime: "claude-code" }),
+    });
+    let clock = 1000;
+    const reality = makeReality({ screens: () => [], now: () => clock, graceMs: 60_000 });
+
+    let r = await reality.heal(store, localMachine);
+    expect(r.result.marked).not.toContain("ephemeral-lane");
+
+    clock += 10_000_000; // far past any grace window
+    r = await reality.heal(store, localMachine);
+    expect(r.result.gcd).not.toContain("ephemeral-lane");
+    // ⇒ Still here. Its liveness is crew-service's multi-UID lister's to decide;
+    //   this healer cannot see that namespace and therefore declines to judge.
+    expect(store.getAgent("ephemeral-lane")).not.toBeNull();
+  });
+
+  test("CONTROL: the same row WITHOUT run_as_uid is marked and GC'd as normal", async () => {
+    // Without this, the test above passes for any reason at all — including a healer
+    // that has simply stopped reaping.
+    store.createAgent({
+      id: "local-lane",
+      display_name: "Local",
+      runtime: "claude-code",
+      screen_name: "wire-local-lane",
+      spawn_manifest: JSON.stringify({ env: {}, project_dir: "/x", display_name: "L", runtime: "claude-code" }),
+    });
+    let clock = 1000;
+    const reality = makeReality({ screens: () => [], now: () => clock, graceMs: 60_000 });
+
+    let r = await reality.heal(store, localMachine);
+    expect(r.result.marked).toContain("local-lane");
+
+    clock += 61_000;
+    r = await reality.heal(store, localMachine);
+    expect(r.result.gcd).toContain("local-lane");
+    expect(store.getAgent("local-lane")).toBeNull();
+  });
+
+  test("a malformed manifest does not make the healer treat the row as cross-uid", async () => {
+    // manifestRunAsUid must degrade to undefined, not throw and not fail open — the
+    // row is then judged locally, exactly as one with no manifest at all.
+    store.createAgent({
+      id: "broken-lane",
+      display_name: "Broken",
+      runtime: "claude-code",
+      screen_name: "wire-broken-lane",
+      spawn_manifest: "{not json",
+    });
+    let clock = 1000;
+    const reality = makeReality({ screens: () => [], now: () => clock, graceMs: 60_000 });
+    const r = await reality.heal(store, localMachine);
+    expect(r.result.marked).toContain("broken-lane");
+  });
+});

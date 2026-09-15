@@ -53,7 +53,14 @@ import * as screen from "./screen.js";
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 /** Same guard for a uid, which on macOS may lead with `_` (`_ephemeral`). */
-const SAFE_UID = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/;
+/**
+ * The ONE uid validator. Exported so `registerAgent` validates identically — two
+ * validators of one concept that disagree in both directions is how a value becomes
+ * valid at one boundary and invalid at the next. Bounded at 64; admits no shell
+ * metacharacter, quote, space or `/`; the leading class forbids `-`, which blocks
+ * option injection into `sudo`.
+ */
+export const SAFE_UID = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/;
 
 /** Directory name that must be the parent of anything we delete. */
 const SPAWN_PARENT = "codex-spawn";
