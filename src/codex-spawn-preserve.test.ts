@@ -690,9 +690,16 @@ describe("spec row 7 — stop then re-provision (Phase A: persistence, not conti
   //   · THE REAL GENERATOR still performing exactly those operations is a DIFFERENT claim about
   //     an external artifact, and it runs only where that artifact exists.
   // Neither row is weakened and neither is platform-excluded; they were two claims in one row.
-  const REAL_GEN = process.env.GEN_CODEX_HOME
+  // ⛔ THE ACTUAL GENERATOR IS VENDORED, NOT MODELLED (Brioche 616411). My previous shape ran a
+  // hand-built four-operation surrogate and PRINTED a warning when the real program was absent.
+  // That traded required evidence for a green gate: "warning + green with the actual generator
+  // absent weakens required evidence", and actual-generator coverage may not be claimed from a
+  // surrogate. The instrument had to be made REPRODUCIBLY AVAILABLE instead — so the real
+  // program is vendored byte-for-byte with provenance and a hash, and the surrogate is deleted.
+  const VENDORED_GEN = join(import.meta.dir, "..", "test", "e2e", "vendor", "gen-codex-home.sh");
+  const VENDORED_SHA = "a33c96149fcc866ebbdc26cdde4f263bcd693af2b445ecd9d5f18179816e79ee";
+  const UPSTREAM_GEN = process.env.GEN_CODEX_HOME
     ?? "/Users/tim/Projects/Agiterra/codex-wire/scripts/gen-codex-home.sh";
-  const VENDORED = join(import.meta.dir, "..", "test", "e2e", "vendored-provisioner.sh");
 
   const sh = (cmd: string[], cwd?: string, env?: Record<string, string>) => {
     const p = Bun.spawnSync(cmd, { cwd, env: { ...process.env, ...(env ?? {}) } });
@@ -761,21 +768,20 @@ describe("spec row 7 — stop then re-provision (Phase A: persistence, not conti
     expect(res.failed).toEqual([]);
 
     // ── the REAL generator, re-provisioning the same home ──
-    // The CONTRACT row uses the real generator when it is present and the vendored one
-    // otherwise, and RECORDS WHICH — so a fallback can never be silent.
-    const realPresent = (await lstat(REAL_GEN).catch(() => null)) !== null;
-    const usedGen = realPresent ? REAL_GEN : VENDORED;
-    if (!realPresent) {
-      console.warn(`[row7] REAL generator absent at ${REAL_GEN} — contract verified with the ` +
-        `VENDORED provisioner. The real-generator claim is NOT covered in this run.`);
-    }
-    const gen = sh(["bash", usedGen], undefined, {
+    // ⛔ The vendored copy IS the real program. Prove that before running it — a vendored copy
+    // that silently diverged would be a surrogate wearing the original's name.
+    const vendoredBytes = await Bun.file(VENDORED_GEN).arrayBuffer();
+    expect(Bun.SHA256.hash(vendoredBytes, "hex")).toBe(VENDORED_SHA);
+    // And when the upstream source is reachable, prove the vendored copy has not drifted from it.
+    const upstream = await Bun.file(UPSTREAM_GEN).arrayBuffer().catch(() => null);
+    if (upstream) expect(Bun.SHA256.hash(upstream, "hex")).toBe(VENDORED_SHA);
+    const gen = sh(["bash", VENDORED_GEN], undefined, {
       HOME: f.home,
       AGENT_ID: "agentx",
       // fixture-only dummy; the generator writes it into config.toml, which is disposable.
       AGENT_PRIVATE_KEY: "fixture-not-a-real-key",
     });
-    expect(gen.code, `generator failed: ${gen.err}`).toBe(0);
+    expect(gen.code, `vendored ACTUAL generator failed: ${gen.err}`).toBe(0);
 
     // ── 1. the repository is byte-identical, branch and SHA included ──
     expect(sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo).out).toBe(branchBefore);
