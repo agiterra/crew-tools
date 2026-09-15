@@ -634,3 +634,147 @@ describe("spec row 14 — accept path, and the thread pointer", () => {
     expect(await alive(join(f.codexHome, "config.toml"))).toBe(true);
   });
 });
+
+// ── SPEC ROW 7 — stop → resume, PHASE A (fixture-only) ────────────────────────────────────
+// Brioche 616204, GO for Phase A. Row 7 reads: "stop → resume end-to-end: branch, commit SHAs
+// and thread id all survive and the lane resumes."
+//
+// This exercises the CANDIDATE teardown (this working copy — NOT the deployed containment
+// build, which disables teardown entirely and would therefore test nothing) followed by the
+// REAL generator, against a fixture home containing a REAL git repository.
+//
+// ⚠️ WHAT THIS DOES AND DOES NOT WITNESS. It witnesses PERSISTENCE: that stop followed by
+// re-provision leaves branch, commit SHAs, the thread pointer and every retained byte exactly
+// as they were. It does NOT witness CONVERSATION CONTINUATION — that a live codex lane
+// actually resumes its thread. No fixture can show that; it needs a real lane (Phase B, not
+// approved as drafted). Row 7 is therefore PARTIALLY covered, and the gap is named here rather
+// than implied by a green tick.
+//
+// ⚠️ MACHINE-SPECIFIC DEPENDENCY, deliberately not hidden: the real generator lives outside
+// this repo. Override with GEN_CODEX_HOME. If it cannot be found this test FAILS rather than
+// skipping — a skipped row for an unavailable instrument reads as coverage it never had.
+describe("spec row 7 — stop then re-provision (Phase A: persistence, not continuation)", () => {
+  const GEN = process.env.GEN_CODEX_HOME
+    ?? "/Users/tim/Projects/Agiterra/codex-wire/scripts/gen-codex-home.sh";
+
+  const sh = (cmd: string[], cwd?: string, env?: Record<string, string>) => {
+    const p = Bun.spawnSync(cmd, { cwd, env: { ...process.env, ...(env ?? {}) } });
+    return { code: p.exitCode, out: new TextDecoder().decode(p.stdout).trim(),
+             err: new TextDecoder().decode(p.stderr).trim() };
+  };
+
+  /** sha256 of every file under a tree, keyed by path relative to it. Symlinks by target. */
+  async function treeDigest(root: string): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    const walk = async (dir: string, rel: string) => {
+      let names: string[] = [];
+      try { names = await readdir(dir); } catch { return; }
+      for (const n of names.sort()) {
+        const p = join(dir, n), r = rel ? `${rel}/${n}` : n;
+        const st = await lstat(p);
+        if (st.isSymbolicLink()) { out.set(r, `link:${await import("fs/promises").then(m => m.readlink(p))}`); }
+        else if (st.isDirectory()) { out.set(r, "dir"); await walk(p, r); }
+        else if (st.isFile()) {
+          out.set(r, Bun.SHA256.hash(await Bun.file(p).arrayBuffer(), "hex") as unknown as string);
+        }
+      }
+    };
+    await walk(root, "");
+    return out;
+  }
+
+  test("7a: branch, commit SHAs, thread id and every retained byte survive stop + re-provision", async () => {
+    const f = await fixture();
+
+    // A REAL repository, not a .git-shaped fixture — row 7 is about real commit SHAs.
+    const repo = join(f.codexHome, "workspaces", "realrepo");
+    await mkdir(repo, { recursive: true });
+    expect(sh(["git", "init", "-q", "-b", "feat/row7"], repo).code).toBe(0);
+    sh(["git", "config", "user.email", "row7@fixture.invalid"], repo);
+    sh(["git", "config", "user.name", "Row Seven"], repo);
+    await writeFile(join(repo, "work.txt"), "UNPUBLISHED WORK\n");
+    sh(["git", "add", "-A"], repo);
+    expect(sh(["git", "commit", "-qm", "the work an agent would lose"], repo).code).toBe(0);
+
+    const branchBefore = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo).out;
+    const shaBefore = sh(["git", "rev-parse", "HEAD"], repo).out;
+    expect(branchBefore).toBe("feat/row7");
+    expect(shaBefore).toMatch(/^[0-9a-f]{40}$/);
+
+    const threadBefore = await readFile(join(f.stateDir, "agentx.thread.json"), "utf8");
+    const threadIdBefore = JSON.parse(threadBefore).threadId;
+
+    // Digest everything the classifier says it will RETAIN, before anything runs.
+    const entries = await classifySpawnHome(f.codexHome, f.home);
+    const retainedPaths = entries.filter((e) => e.disposition === "retained").map((e) => e.path);
+    // ⛔ A RETAINED DIRECTORY DOES NOT MEAN A RETAINED SUBTREE. The three lock dirs are the one
+    // place classification descends, so `app-server-control/` can be retained (it holds a
+    // symlinked .lock) while the plain `a.lock` inside it is disposed. My first version swept
+    // those children in by prefix and reported the correct removal as a mutation — the test was
+    // wrong, not the code. Exclude what the classifier explicitly disposed.
+    const disposedRel = new Set(
+      entries.filter((e) => e.disposition === "disposable")
+             .map((e) => e.path.slice(f.codexHome.length + 1)),
+    );
+    const before = await treeDigest(f.codexHome);
+
+    // ── the CANDIDATE teardown ──
+    const res = await runWith(f);
+    expect(res.skipped).toBeUndefined();
+    expect(res.failed).toEqual([]);
+
+    // ── the REAL generator, re-provisioning the same home ──
+    const genStat = await lstat(GEN).catch(() => null);
+    expect(genStat, `real generator not found at ${GEN}. Set GEN_CODEX_HOME. ` +
+      `Row 7 cannot be witnessed without it, and a skipped row would read as coverage.`).not.toBeNull();
+    const gen = sh(["bash", GEN], undefined, {
+      HOME: f.home,
+      AGENT_ID: "agentx",
+      // fixture-only dummy; the generator writes it into config.toml, which is disposable.
+      AGENT_PRIVATE_KEY: "fixture-not-a-real-key",
+    });
+    expect(gen.code, `generator failed: ${gen.err}`).toBe(0);
+
+    // ── 1. the repository is byte-identical, branch and SHA included ──
+    expect(sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo).out).toBe(branchBefore);
+    expect(sh(["git", "rev-parse", "HEAD"], repo).out).toBe(shaBefore);
+    expect(sh(["git", "status", "--porcelain"], repo).out).toBe("");
+    expect(await readFile(join(repo, "work.txt"), "utf8")).toBe("UNPUBLISHED WORK\n");
+
+    // ── 2. the thread pointer is byte-identical; the thread id survives ──
+    const threadAfter = await readFile(join(f.stateDir, "agentx.thread.json"), "utf8");
+    expect(threadAfter).toBe(threadBefore);
+    expect(JSON.parse(threadAfter).threadId).toBe(threadIdBefore);
+
+    // ── 3. EVERY retained entry is byte-identical. Not a sample — the whole set. ──
+    const after = await treeDigest(f.codexHome);
+    const changed: string[] = [];
+    for (const p of retainedPaths) {
+      const rel = p.slice(f.codexHome.length + 1);
+      for (const [k, v] of before) {
+        if (disposedRel.has(k)) continue;
+        if (k === rel || k.startsWith(`${rel}/`)) {
+          if (after.get(k) !== v) changed.push(`${k}: ${v} -> ${after.get(k)}`);
+        }
+      }
+    }
+    expect(changed).toEqual([]);
+
+    // ── 4. and the scaffolding really was re-provisioned, or "nothing changed" is trivial ──
+    expect(await alive(join(f.codexHome, "config.toml"))).toBe(true);
+    expect(await alive(join(f.codexHome, "auth.json"))).toBe(true);
+    expect(await readFile(join(f.home, ".codex", "auth.json"), "utf8")).toBe("CREDENTIAL-MUST-SURVIVE");
+  });
+
+  // ⛔ The control for 7a. If the teardown removed the repository, 7a's identity assertions
+  // would have nothing to compare and could pass vacuously on an empty set. This proves the
+  // retained set is non-empty and contains the things row 7 names.
+  test("7b: the retained set actually CONTAINS the conversation state and the repo", async () => {
+    const f = await fixture();
+    const entries = await classifySpawnHome(f.codexHome, f.home);
+    const retained = entries.filter((e) => e.disposition === "retained").map((e) => e.path);
+    expect(retained.some((p) => p.endsWith("thread_history_1.sqlite"))).toBe(true);
+    expect(retained.some((p) => p.endsWith("/workspaces"))).toBe(true);
+    expect(retained.length).toBeGreaterThan(3);
+  });
+});
