@@ -936,7 +936,7 @@ describe("N14 — the remote RESULT contract, via a stdout-only sshRun", () => {
     const logs: string[] = [];
     const res = await remote(f, f.codexHome, (m) => logs.push(m));
     await chmod(f.codexHome, 0o755);
-    expect(res.skipped).toBe("home-unreadable");
+    expect(res.skipped).toMatch(/^home-unreadable:/);   // N29: class + code
     expect(res.failed).toEqual([]);                       // NOT a generic "did not complete"
     expect(logs.join("\n")).toContain("I could not look");
   });
@@ -991,7 +991,7 @@ describe("N21/N22 — remote classification parity, and markers a filename canno
       { agentId: "agentx", runtime: "codex", selfHome: alt,
         env: { STATE_DIR: altState, CODEX_HOME: notDir } },
       { log: () => {} });
-    expect(localRes.skipped).toBe("home-unreadable");   // NOT "unsafe-path": shape is valid
+    expect(localRes.skipped).toBe("home-unreadable:ENOTDIR");   // N29 carries the code; NOT "unsafe-path"
     expect(localRes.removed).toEqual([]);
   });
 
@@ -1048,6 +1048,16 @@ describe("CODEX_HOME shape parity — absent / symlink / dangling / not-a-dir / 
         const p = join(sd, "agentx"); await symlink(real, p); return p; } },
     { name: "not a directory (ENOTDIR)", refuse: true,
       build: async (sd) => { const p = join(sd, "agentx"); await writeFile(p, "not a dir"); return p; } },
+    // ⛔ N27 — THE CASE THE AXIS MISSED, and the one that produced the FAIL at e057eba. The
+    // home IS a directory and readdir SUCCEEDS (listing names needs only `r`); it is resolving
+    // a name INSIDE it that needs `x`. So every shape guard passed and every per-entry lstat
+    // returned EACCES, and the classifier's `catch { continue; }` turned that into an empty
+    // listing — indistinguishable from an empty home, with a state:"complete" receipt and
+    // "retained 0 entr(ies) incl. conversation state" logged over a live sqlite file.
+    { name: "readable but NOT searchable (0400)", refuse: true,
+      build: async (sd) => { const p = join(sd, "agentx"); await mkdir(p, { recursive: true });
+        await writeFile(join(p, "thread_history_1.sqlite"), "CONVERSATION-MUST-SURVIVE");
+        await chmod(p, 0o400); return p; } },
     { name: "unreadable (EACCES)", refuse: true,
       build: async (sd) => { const p = join(sd, "agentx"); await mkdir(p, { recursive: true });
         await writeFile(join(p, "thread_history_1.sqlite"), "db"); await chmod(p, 0o000); return p; } },
@@ -1055,7 +1065,8 @@ describe("CODEX_HOME shape parity — absent / symlink / dangling / not-a-dir / 
 
   for (const c of cases) {
     test(`${c.name} -> both implementations ${c.refuse ? "REFUSE" : "treat as already-gone"}`, async () => {
-      if (c.name.includes("EACCES") && process.getuid?.() === 0) return;   // root ignores the mode
+      // root ignores permission bits, so the two permission cases cannot be exercised as root
+      if ((c.name.includes("EACCES") || c.name.includes("0400")) && process.getuid?.() === 0) return;
       const home = await mkdtemp(join(tmpdir(), "shape-"));
       const sd = join(home, ".wire", "codex-spawn");
       await mkdir(sd, { recursive: true });
@@ -1072,7 +1083,7 @@ describe("CODEX_HOME shape parity — absent / symlink / dangling / not-a-dir / 
         { agentId: "agentx", runtime: "codex", selfHome: home,
           env: { STATE_DIR: sd, CODEX_HOME: ch } },
         { log: () => {} });
-      const localRefused = localRes.skipped === "home-unreadable";
+      const localRefused = (localRes.skipped ?? "").startsWith("home-unreadable");
 
       // ── REMOTE ──
       const p = Bun.spawnSync(["/bin/sh", "-c", buildRemoteTeardownScript()], {
@@ -1083,7 +1094,7 @@ describe("CODEX_HOME shape parity — absent / symlink / dangling / not-a-dir / 
       const lines = new TextDecoder().decode(p.stdout).split("\n").map((l) => l.trim());
       const remoteRefused = lines.includes("CREW_HOME_UNREADABLE");
 
-      if (c.name.includes("EACCES")) await chmod(ch, 0o755);
+      if (c.name.includes("EACCES") || c.name.includes("0400")) await chmod(ch, 0o755);
 
       // ⛔ THE POINT OF THE TABLE: they must agree, and agree on the RIGHT answer.
       expect({ impl: "local", refused: localRefused }).toEqual({ impl: "local", refused: c.refuse });
@@ -1092,6 +1103,14 @@ describe("CODEX_HOME shape parity — absent / symlink / dangling / not-a-dir / 
       if (c.refuse) {
         expect(lines).not.toContain("CREW_TEARDOWN_DONE");
         expect(localRes.removed).toEqual([]);          // a refusal is TOTAL on the result too
+        // ⛔ N28. This block's comment claimed "a refusal is total — no receipt can claim
+        // success", and that assertion was applied ONLY to the remote lines. There was no
+        // local-receipt assertion anywhere in the table, so a change in teardownLocal — which
+        // is exactly where the withdrawn 4348a46 defect lived — could not turn these rows red.
+        // A receipt is the artifact an operator reads; its ABSENCE is the claim under test.
+        let stopped: string[] = [];
+        try { stopped = await readdir(join(sd, ".stopped")); } catch { /* never created: fine */ }
+        expect({ case: c.name, receipts: stopped }).toEqual({ case: c.name, receipts: [] });
       } else {
         expect(lines).toContain("CREW_TEARDOWN_DONE");
         expect(localRes.skipped).toBeUndefined();      // and an accept really accepts

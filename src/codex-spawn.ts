@@ -228,7 +228,25 @@ export async function classifySpawnHome(codexHome: string, home: string): Promis
   for (const name of names.sort()) {
     const path = join(codexHome, name);
     let st;
-    try { st = await lstat(path); } catch { continue; }
+    try {
+      st = await lstat(path);
+    } catch (e) {
+      // ⛔ N27 (review, the FAIL at e057eba). `catch { continue; }` swallowed EVERY per-entry
+      // failure. On a home that is READABLE BUT NOT SEARCHABLE (0400) the shape guards above all
+      // pass — it IS a directory — and readdir succeeds, because listing names needs only `r`.
+      // Resolving a name INSIDE the directory needs `x`, so every per-entry lstat returned
+      // EACCES, every entry was skipped, and `out` came back EMPTY — indistinguishable from an
+      // empty home. The result: a state:"complete" receipt and the log line "retained 0
+      // entr(ies) incl. conversation state" while thread_history_1.sqlite sat inside, unread.
+      // THE AXIS ABOVE ENUMERATES WHAT THE HOME *IS*. IT NEVER ASKED WHETHER ITS ENTRIES CAN BE
+      // READ. That is the same receipt shape and the same sentence that forced the 4348a46
+      // withdrawal, reached through a different door.
+      // ENOENT alone is benign here: an entry that vanished between readdir and lstat is a race
+      // whose loser we are content to ignore. Anything else means we could not look.
+      const code = (e as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT") continue;
+      throw new SpawnHomeUnreadable(codexHome, `entry:${name}:${code ?? String(e)}`);
+    }
     const kind: SpawnEntry["kind"] =
       st.isSymbolicLink() ? "symlink" : st.isSocket() ? "socket"
       : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other";
@@ -370,13 +388,13 @@ export function buildRemoteTeardownScript(): string {
     // A SYMLINK is refused before the `-d` test, because `-d` FOLLOWS links: without this, a
     // symlink-to-a-directory would be accepted here and refused locally — the same divergence
     // one case over. Dangling links are caught here too, having survived the `-e`/`-L` test.
-    'elif [ -L "$H" ]; then echo CREW_HOME_UNREADABLE; echo "CREW_NOTE SYMLINK AT CODEX_HOME: $H for $AG — refusing; a spawn home is a real directory."; exit 8;',
-    'elif [ ! -d "$H" ]; then echo CREW_HOME_UNREADABLE; echo "CREW_NOTE NOT A DIRECTORY: $H for $AG — refusing; this is not \'already gone\'."; exit 8;',
+    'elif [ -L "$H" ]; then echo CREW_HOME_UNREADABLE; echo "CREW_CODE ESYMLINK"; echo "CREW_NOTE SYMLINK AT CODEX_HOME: $H for $AG — refusing; a spawn home is a real directory."; exit 8;',
+    'elif [ ! -d "$H" ]; then echo CREW_HOME_UNREADABLE; echo "CREW_CODE ENOTDIR"; echo "CREW_NOTE NOT A DIRECTORY: $H for $AG — refusing; this is not \'already gone\'."; exit 8;',
     'else CREW_ABSENT=0;',
     // ⛔ N16: these explanations were on STDERR, and screen.sshRun returns STDOUT ONLY — so
     // production dropped every one of them. Explaining a refusal down a channel nobody reads is
     // the same as not explaining it. All diagnostics go to stdout.
-    '  ls -A "$H" >/dev/null 2>&1 || { echo CREW_HOME_UNREADABLE; echo "CREW_NOTE NOTHING REMOVED for $AG at $H — this is not \'already gone\', it is \'I could not look\'."; exit 8; }',
+    '  ls -A "$H" >/dev/null 2>&1 || { echo CREW_HOME_UNREADABLE; echo "CREW_CODE EACCES"; echo "CREW_NOTE NOTHING REMOVED for $AG at $H — this is not \'already gone\', it is \'I could not look\'."; exit 8; }',
     'fi',
     // JSON array from a newline list — quoting handled once, in awk.
     'jarr() { awk \'BEGIN{printf "["} {gsub(/\\\\/,"\\\\\\\\"); gsub(/"/,"\\\\\\""); printf "%s\\"%s\\"",(NR>1?",":""),$0} END{printf "]"}\' "$1"; }',
@@ -557,7 +575,11 @@ async function teardownLocal(
     if (e instanceof SpawnHomeUnreadable) {
       log(`[crew] codex-spawn: spawn home UNREADABLE for '${agentId}' (${e.code}) at ${e.path} — ` +
           `NOTHING REMOVED and no receipt written. This is not "already gone"; it is "I could not look".`);
-      result.skipped = "home-unreadable";
+      // ⛔ N29 (review). ESYMLINK / ENOTDIR / EACCES / ELOOP / entry:* all collapsed to one
+      // string, so a deliberately-symlinked lane was indistinguishable from a broken one on
+      // every stop, forever — and the symlink refusal is a JUDGEMENT I asked to be allowed to
+      // keep. Carrying the code is the condition that makes that judgement inspectable.
+      result.skipped = `home-unreadable:${e.code}`;
       return;
     }
     throw e;
@@ -697,7 +719,11 @@ async function teardownRemote(
       `[crew] codex-spawn: spawn home UNREADABLE for '${agentId}' at ${paths.codexHome} — ` +
         `NOTHING REMOVED and no receipt written. This is not "already gone"; it is "I could not look".`,
     );
-    result.skipped = "home-unreadable";
+    // ⛔ N29 on the remote side. The CODE travels on its OWN line so the bare marker stays
+    // exact-line matchable — appending it to the marker would have silently broken N22's fix.
+    const code = out.split("\n").map((l) => l.trim())
+      .find((l) => l.startsWith("CREW_CODE "))?.slice("CREW_CODE ".length) ?? "UNKNOWN";
+    result.skipped = `home-unreadable:${code}`;
     return;
   }
   if (markers.has("CREW_FINALIZE_FAILED")) {
