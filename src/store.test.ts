@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import { CrewStore } from "./store";
-import { chmodSync, mkdtempSync, rmSync } from "fs";
+import { chmodSync, mkdtempSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 

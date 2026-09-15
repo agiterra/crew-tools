@@ -533,3 +533,104 @@ describe("spec row 13 — finalize-failed", () => {
     expect(intent.retained.some((p: string) => p.endsWith("thread_history_1.sqlite"))).toBe(true);
   });
 });
+
+// ── T3 (row 14, ACCEPT PATH) and M2 (the thread pointer) ──────────────────────────────────
+describe("spec row 14 — accept path, and the thread pointer", () => {
+  /** A home containing NOTHING but disposable entries. */
+  async function onlyDisposable(): Promise<Fx> {
+    const home = await mkdtemp(join(tmpdir(), "spawnacc-"));
+    const stateDir = join(home, ".wire", "codex-spawn");
+    const codexHome = join(stateDir, "agentx");
+    await mkdir(codexHome, { recursive: true });
+    await mkdir(join(home, ".codex"), { recursive: true });
+    await writeFile(join(home, ".codex", "auth.json"), "CREDENTIAL-MUST-SURVIVE");
+    await symlink(join(home, ".codex", "auth.json"), join(codexHome, "auth.json"));
+    for (const b of DISPOSABLE_BASENAMES) await writeFile(join(codexHome, b), "regenerable");
+    for (const d of LOCK_DIRS) {
+      await mkdir(join(codexHome, d), { recursive: true });
+      await writeFile(join(codexHome, d, "a.lock"), "lock");
+    }
+    await writeFile(join(stateDir, "agentx.thread.json"), '{"threadId":"t-1"}');
+    return { home, codexHome, stateDir };
+  }
+
+  // ⛔ The previous suite labelled a full-fixture test "8+14" and never ran the accept path at
+  // all. A gate suite that only ever shows the gate REFUSING has not shown it can say yes —
+  // and a classifier that says no to everything passes every retention row in this file.
+  test("14: a lane with only disposable entries stops cleanly and the receipt says so", async () => {
+    const f = await onlyDisposable();
+    const res = await runWith(f);
+
+    expect(res.skipped).toBeUndefined();
+    expect(res.failed).toEqual([]);
+    expect(res.removed.length).toBeGreaterThan(0);
+    // Everything classified went; nothing is left but the emptied home itself.
+    expect(await readdir(f.codexHome)).toEqual([]);
+    // and the credential is still untouched.
+    expect(await readFile(join(f.home, ".codex", "auth.json"), "utf8")).toBe("CREDENTIAL-MUST-SURVIVE");
+
+    const names = await readdir(join(f.stateDir, ".stopped"));
+    const rec = JSON.parse(await readFile(join(f.stateDir, ".stopped", names[0]), "utf8"));
+    expect(rec.state).toBe("complete");
+    expect(rec.retained).toEqual([]);
+    expect(rec.removed.length).toBe(res.removed.length);
+  });
+
+  // ⛔ M2. Deleting the thread pointer is half of ENG-4161: the spawn home can be rebuilt,
+  // but `<id>.thread.json` is what `codex resume` reads to find the conversation. It was
+  // retained by OMISSION — no code path referenced it, so nothing would have noticed an edit
+  // that added it to the disposal set. Asserted now on BOTH implementations.
+  test("M2 local: the thread pointer survives and is reported, not merely unmentioned", async () => {
+    const f = await fixture();
+    const res = await runWith(f);
+    const thread = join(f.stateDir, "agentx.thread.json");
+    expect(await alive(thread)).toBe(true);
+    expect(await readFile(thread, "utf8")).toBe('{"threadId":"t-1"}');
+    expect(res.removed).not.toContain(thread);
+    expect(res.absent).not.toContain(thread);   // present, so it must NOT be reported absent
+  });
+
+  test("M2 remote: the generated program never disposes the thread pointer", async () => {
+    const f = await fixture();
+    const out = runShell(f, buildRemoteTeardownScript());
+    expect(out).toContain("CREW_TEARDOWN_DONE");
+    const thread = join(f.stateDir, "agentx.thread.json");
+    expect(await alive(thread)).toBe(true);
+    expect(out).not.toContain(`DISPOSE ${thread}`);
+  });
+
+  // ⛔ C3. `absent` was dead — every live path returned []. A caller must be able to tell
+  // "there was nothing to do" from "I did nothing", which is exactly the C2 distinction.
+  test("C3: a never-started agent reports its missing paths as ABSENT, not as a clean removal", async () => {
+    const home = await mkdtemp(join(tmpdir(), "spawnabs-"));
+    const stateDir = join(home, ".wire", "codex-spawn");
+    await mkdir(stateDir, { recursive: true });
+    const res = await removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: home, env: { STATE_DIR: stateDir } },
+      { log: () => {} },
+    );
+    expect(res.removed).toEqual([]);
+    expect(res.failed).toEqual([]);
+    expect(res.absent.length).toBe(2);           // the home and the thread pointer
+    expect(res.absent.some((p) => p.endsWith("agentx"))).toBe(true);
+    expect(res.absent.some((p) => p.endsWith("agentx.thread.json"))).toBe(true);
+  });
+
+  // The refusal guard added for M2: if a future edit ever routes the thread pointer into the
+  // disposal set, nothing is removed at all. A guard nobody has seen refuse is indistinguishable
+  // from one that cannot.
+  test("M2 guard: the thread pointer in the disposal set aborts the whole teardown", async () => {
+    const f = await fixture();
+    const thread = join(f.stateDir, "agentx.thread.json");
+    const res = await runWith(f, async (codexHome, home) => [
+      ...(await classifySpawnHome(codexHome, home)),
+      { path: thread, disposition: "disposable" as const, reason: "MUTANT: thread pointer",
+        kind: "file" as const, size: 0, mode: 0o640 },
+    ]);
+    expect(res.skipped).toBe("thread-pointer-in-disposal-set");
+    expect(res.removed).toEqual([]);
+    expect(await alive(thread)).toBe(true);
+    // and nothing else was touched either — refusal is total, not partial.
+    expect(await alive(join(f.codexHome, "config.toml"))).toBe(true);
+  });
+});

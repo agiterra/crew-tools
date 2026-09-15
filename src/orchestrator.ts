@@ -5,7 +5,6 @@
  * into the operations that MCP adapters expose as tools.
  */
 
-import { join } from "path";
 import { randomUUID } from "crypto";
 import {
   resolveDefaultDb,
@@ -13,12 +12,11 @@ import {
   type Agent,
   type Tab,
   type Pane,
-  type AgentTombstone,
   type Machine,
 } from "./store.js";
 import * as screen from "./screen.js";
 import type { TerminalBackend } from "./terminal.js";
-import { getLaunchCommand, RuntimeNotProvisionedError, type LaunchResolveOpts } from "./runtimes.js";
+import { getLaunchCommand, type LaunchResolveOpts } from "./runtimes.js";
 import { reconcile, formatReport } from "./reconciler.js";
 import { RealityLayer } from "./reality.js";
 import type { HealOpts, HealResult } from "./reality.js";
@@ -1686,9 +1684,17 @@ export class Orchestrator {
       // removeCodexSpawnHome already swallows its own failures; this is the
       // belt-and-braces guard that keeps ANY surprise (a bad manifest, a
       // throwing mock) from blocking the close.
+      const error = e instanceof Error ? e.message : String(e);
       console.error(
-        `[crew] cleanupCodexSpawn: unexpected failure for agent '${agent.id}': ${e instanceof Error ? e.message : String(e)}`,
+        `[crew] cleanupCodexSpawn: unexpected failure for agent '${agent.id}': ${error}`,
       );
+      // ⛔ FOUND BY THE TYPECHECK ADDED FOR M4, in the F4 fix itself (TS2366: function lacks
+      // ending return statement). Falling out of this catch returns `undefined`, which the
+      // call sites treat exactly like "no teardown ran" — so an unexpected crash would be
+      // reported to the RPC as a clean no-op. That is F4's own defect one level up, and it
+      // is precisely the class M4 says goes unnoticed in a repo nothing typechecks.
+      return { removed: [], absent: [], failed: [{ path: "<cleanupCodexSpawn>", error }],
+               skipped: "unexpected-error" };
     }
   }
 

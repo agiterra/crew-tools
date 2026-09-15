@@ -38,7 +38,7 @@
  * this module deliberately does not have.
  */
 
-import { lstat, rm, readdir, readlink, mkdir, writeFile, rename, open as fsOpen } from "fs/promises";
+import { lstat, rm, readdir, readlink, mkdir, rename, open as fsOpen } from "fs/promises";
 import { createHash } from "crypto";
 import { basename, dirname, isAbsolute, join } from "path";
 import * as screen from "./screen.js";
@@ -251,7 +251,7 @@ export type StopReceipt = {
 
 export function manifestDigest(entries: SpawnEntry[]): string {
   const h = createHash("sha256");
-  for (const e of entries.filter((x) => x.disposition === "retained").sort((a, b) => a.path < b.path ? -1 : 1)) {
+  for (const e of entries.filter((x) => x.disposition === "retained").sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) {
     h.update(`${e.path}\0${e.kind}\0${e.size}\0${e.mode}\n`);
   }
   return h.digest("hex");
@@ -452,8 +452,26 @@ async function teardownLocal(
     }
     throw e;
   }
+  // ⛔ C3 (PR 91 review). `absent` was populated only by removeLocal/removeRemote, both
+  // deleted by F5, so every live path returned [] and a caller could not tell "there was
+  // nothing to do" from "I did nothing". Those are the two outcomes C2 is about. Record it.
+  if (!(await exists(paths.codexHome))) result.absent.push(paths.codexHome);
+  // ⛔ M2 (PR 91 review). paths.threadPath is deliberately NOT in the disposal set: the
+  // thread pointer is what `codex resume` reads, and deleting it is half of the incident.
+  // It held by OMISSION — nothing constructed it and nothing would notice a future edit
+  // adding it. Recording it here makes the retention explicit and gives the tests a handle.
+  if (!(await exists(paths.threadPath))) result.absent.push(paths.threadPath);
+
   const disposable = entries.filter((e) => e.disposition === "disposable");
   const retained = entries.filter((e) => e.disposition === "retained");
+  // The thread pointer must never reach the disposal loop. Cheap, and it is the exact edit
+  // a future refactor would make innocently.
+  if (disposable.some((e) => e.path === paths.threadPath)) {
+    log(`[crew] codex-spawn: REFUSING to dispose the thread pointer ${paths.threadPath} — ` +
+        `it is what resume reads. Nothing removed.`);
+    result.skipped = "thread-pointer-in-disposal-set";
+    return;
+  }
 
   // ⛔ INTENT IS A PRECONDITION. If it cannot be made durable, NOTHING is removed —
   // enforceable precisely because nothing has been destroyed yet.

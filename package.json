@@ -14,12 +14,17 @@
     "src/"
   ],
   "devDependencies": {
-    "bun-types": "latest"
+    "bun-types": "^1.4.2",
+    "typescript": "^7.0.2"
   },
   "license": "MIT",
   "author": "Tim Garthwaite <https://github.com/mividtim>",
   "dependencies": {
     "@agiterra/wire-tools": "agiterra/wire-tools#v2.17.1",
     "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "scripts": {
+    "test": "bun test ./src/",
+    "typecheck": "bash scripts/typecheck.sh"
   }
 }
