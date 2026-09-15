@@ -10,7 +10,7 @@ import { tmpdir } from "os";
 import { basename, dirname, join } from "path";
 import {
   classifySpawnHome, manifestDigest, buildRemoteTeardownScript,
-  removeCodexSpawnHome, writeReceipt, DISPOSABLE_BASENAMES, LOCK_DIRS,
+  removeCodexSpawnHome, writeReceipt, SpawnHomeUnreadable, DISPOSABLE_BASENAMES, LOCK_DIRS,
   type SpawnEntry, type StopReceipt,
 } from "./codex-spawn.js";
 
@@ -943,5 +943,72 @@ describe("N14 — the remote RESULT contract, via a stdout-only sshRun", () => {
     expect(res.removed.length).toBeGreaterThan(0);
     expect(res.absent).toEqual([]);
     expect(await alive(join(f.codexHome, "thread_history_1.sqlite"))).toBe(true);
+  });
+});
+
+// ── N21 / N22 (delta review at 5276c3cf) ──────────────────────────────────────────────────
+describe("N21/N22 — remote classification parity, and markers a filename cannot forge", () => {
+  const runSh2 = (codexHome: string, stateDir: string, home: string) => {
+    const p = Bun.spawnSync(["/bin/sh", "-c", buildRemoteTeardownScript()], {
+      env: { ...process.env, AGENT_ID: "agentx", CODEX_HOME: codexHome,
+             AUTH_TARGET: join(home, ".codex", "auth.json"),
+             RECEIPT: join(stateDir, ".stopped", "agentx.remote.json") },
+    });
+    return new TextDecoder().decode(p.stdout);
+  };
+
+  // ⛔ N21: `[ ! -d "$H" ]` conflated "does not exist" with "is not a directory". A CODEX_HOME
+  // that is a regular FILE came out of the remote path as a clean `complete` with a receipt,
+  // while the local path refused it. Neither of us had tested ENOTDIR — only EACCES.
+  test("N21: a CODEX_HOME that is a FILE is refused on BOTH paths, identically", async () => {
+    const f = await fixture();
+    const notDir = join(f.stateDir, "agentx-file");
+    await writeFile(notDir, "I am not a directory");
+
+    // remote
+    const out = runSh2(notDir, f.stateDir, f.home);
+    expect(out.split("\n").map((l) => l.trim())).toContain("CREW_HOME_UNREADABLE");
+    expect(out).toContain("NOT A DIRECTORY");
+    expect(out.split("\n").map((l) => l.trim())).not.toContain("CREW_TEARDOWN_DONE");
+
+    // local, same input, same classification — this is the parity the finding was about
+    let localSkipped: string | undefined;
+    try { await classifySpawnHome(notDir, f.home); }
+    catch (e) { if (e instanceof SpawnHomeUnreadable) localSkipped = "home-unreadable"; }
+    expect(localSkipped).toBe("home-unreadable");
+  });
+
+  test("N21: a genuinely ABSENT home still completes and reports absent (ENOENT ≠ ENOTDIR)", async () => {
+    const f = await fixture();
+    const gone = join(f.stateDir, "agentx-gone");
+    const out = runSh2(gone, f.stateDir, f.home);
+    expect(out.split("\n").map((l) => l.trim())).toContain("CREW_TEARDOWN_DONE");
+    expect(out).toContain(`ABSENT ${gone}`);
+    expect(out.split("\n").map((l) => l.trim())).not.toContain("CREW_HOME_UNREADABLE");
+  });
+
+  // ⛔ N22: the marker checks were unanchored `out.includes()` over a stream carrying root-entry
+  // FILENAMES. A retained file named `notes-CREW_INTENT_FAILED.txt` made the reader announce
+  // "NOTHING REMOVED, the spawn home is intact" and return early — while removal had ALREADY
+  // RUN. False in the reassuring direction, which is the direction this change exists to
+  // distrust. A filename must never be able to forge a control marker.
+  test("N22: a FILENAME containing a marker word cannot forge that marker", async () => {
+    const f = await fixture();
+    const forged = join(f.codexHome, "notes-CREW_INTENT_FAILED.txt");
+    await writeFile(forged, "a retained user file whose NAME is a control word");
+
+    const stdoutOnly = async (): Promise<string> => runSh2(f.codexHome, f.stateDir, f.home);
+    const res = await removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: f.home, runAsUid: "someuid",
+        env: { STATE_DIR: f.stateDir, CODEX_HOME: f.codexHome },
+        target: { runAsUid: "someuid", host: "localhost" } as never },
+      { log: () => {}, sshRun: stdoutOnly as never },
+    );
+
+    // the word IS in the stream, via the filename — and must change nothing
+    expect(runSh2(f.codexHome, f.stateDir, f.home)).toContain("CREW_INTENT_FAILED");
+    expect(res.skipped).toBeUndefined();                       // NOT "intent-undurable"
+    expect(res.removed.length).toBeGreaterThan(0);             // removal really ran, and is reported
+    expect(await alive(forged)).toBe(true);                    // and the forging file is retained
   });
 });

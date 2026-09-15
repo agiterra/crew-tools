@@ -334,7 +334,16 @@ export function buildRemoteTeardownScript(): string {
     // cannot READ yields nothing — indistinguishable from a home that is genuinely empty.
     // Locally this is SpawnHomeUnreadable; here it was silently "nothing to do, complete".
     // ENOENT really is "already gone"; anything else is "I could not look".
-    'if [ ! -d "$H" ]; then echo "$H" >> "$B"; CREW_ABSENT=1; else CREW_ABSENT=0;',
+    // ⛔ N21 (delta review). `[ ! -d "$H" ]` conflated TWO different states: "does not exist"
+    // and "exists but is not a directory". A CODEX_HOME that is a regular file came out of the
+    // remote path as a clean `complete` with absent=1 AND A RECEIPT WRITTEN, while the local
+    // path refused it (readdir -> ENOTDIR -> SpawnHomeUnreadable -> skipped, no receipt). Two
+    // implementations agreeing only on the cases anyone tested is finding C1's shape, and this
+    // is its third appearance in this PR. ENOENT is "already gone"; ENOTDIR is "that is not a
+    // spawn home", which is a refusal, not a completion.
+    'if [ ! -e "$H" ] && [ ! -L "$H" ]; then echo "$H" >> "$B"; CREW_ABSENT=1;',
+    'elif [ ! -d "$H" ]; then echo CREW_HOME_UNREADABLE; echo "CREW_NOTE NOT A DIRECTORY: $H for $AG — refusing; this is not \'already gone\'."; exit 8;',
+    'else CREW_ABSENT=0;',
     // ⛔ N16: these explanations were on STDERR, and screen.sshRun returns STDOUT ONLY — so
     // production dropped every one of them. Explaining a refusal down a channel nobody reads is
     // the same as not explaining it. All diagnostics go to stdout.
@@ -623,7 +632,9 @@ async function teardownRemote(
     result.failed.push({ path: paths.codexHome, error });
     return;
   }
-  if (out.includes("CREW_INTENT_FAILED")) {
+  // Declared before the FIRST marker test: every check below is exact-line membership.
+  const markers = new Set(out.split("\n").map((l) => l.trim()));
+  if (markers.has("CREW_INTENT_FAILED")) {
     // FAIL CLOSED AND SAY SO. The FV proved the safety worked and was SILENT: an
     // operator saw a successful stop with no hint that cleanup never ran. A guard
     // nobody can observe is indistinguishable from one that did not fire.
@@ -636,7 +647,15 @@ async function teardownRemote(
   }
   // ⛔ N14/C2 on the REMOTE reader. The script distinguishes "I could not look" from ENOENT;
   // until now only the script knew. Same fail-closed semantics as the local path.
-  if (out.includes("CREW_HOME_UNREADABLE")) {
+  // ⛔ N22 (delta review). These were unanchored `out.includes(...)` over a stream that carries
+  // ROOT-ENTRY FILENAMES on its RETAIN/DISPOSE lines. A retained user file named
+  // `notes-CREW_INTENT_FAILED.txt` made the reader announce "NOTHING REMOVED, the spawn home is
+  // intact", set skipped:"intent-undurable" and return early — while config.toml and the auth
+  // symlink had in fact been removed. Reproduced. That is false in the REASSURING direction,
+  // which is the direction this whole change exists to distrust: a filename must never be able
+  // to forge a control marker. Every marker is emitted by `echo <WORD>` as a line of its own,
+  // so exact line membership is the correct test and a filename cannot satisfy it.
+  if (markers.has("CREW_HOME_UNREADABLE")) {
     (deps.log ?? ((m: string) => console.error(m)))(
       `[crew] codex-spawn: spawn home UNREADABLE for '${agentId}' at ${paths.codexHome} — ` +
         `NOTHING REMOVED and no receipt written. This is not "already gone"; it is "I could not look".`,
@@ -644,13 +663,13 @@ async function teardownRemote(
     result.skipped = "home-unreadable";
     return;
   }
-  if (out.includes("CREW_FINALIZE_FAILED")) {
+  if (markers.has("CREW_FINALIZE_FAILED")) {
     result.failed.push({ path: receipt, error: "finalize-failed" });
   }
-  if (out.includes("CREW_FINALIZE_RECORD_FAILED")) {
+  if (markers.has("CREW_FINALIZE_RECORD_FAILED")) {
     result.failed.push({ path: `${receipt}.finalize-failed`, error: "finalize-failure-record-unwritable" });
   }
-  if (!out.includes("CREW_TEARDOWN_DONE")) {
+  if (!markers.has("CREW_TEARDOWN_DONE")) {
     result.failed.push({ path: paths.codexHome, error: `remote teardown did not complete: ${out.trim() || "(no output)"}` });
     return;
   }
