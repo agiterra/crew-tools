@@ -162,9 +162,43 @@ export const DISPOSABLE_BASENAMES = new Set([
 export const LOCK_DIRS = ["app-server-control", "mcp-oauth-locks", "thread-writer-locks"];
 
 /** Thrown when the spawn home exists but cannot be read — never confused with "already gone". */
+/**
+ * ⛔ N31/N32 (delta review at 6bb1c60). `skipped` carried FREE TEXT — it was built as
+ * `home-unreadable:entry:<filename>:<code>`, and a filename is attacker-shaped data:
+ *   a `:` in a name   -> positional parsing breaks (6 fields, [1]==="entry"); `:` is legal
+ *                        in a POSIX filename on macOS, so this is reachable, not theoretical
+ *   a NEWLINE in a name -> `skipped` spans lines and breaks ANY line-oriented log or event
+ *                        record. Reproduced.
+ *   the String(e) fallback could inject arbitrary text the same way.
+ * And N32: the same condition produced DIFFERENT strings on the two paths — local
+ * `home-unreadable:entry:config.toml:EACCES` vs remote `home-unreadable:EACCES`, because the
+ * remote has no per-entry classifier and can never emit an `entry:*` code. The field I added
+ * to make conditions DISTINGUISHABLE reported two values for one condition, defeating its own
+ * purpose (N29).
+ * ⇒ `code` is now a CLOSED VOCABULARY. The offending entry name is still reported — in the LOG
+ *   line, which is free text by nature and read by humans — never in a parsed string.
+ */
+export const UNREADABLE_CODES = ["EACCES", "ENOTDIR", "ESYMLINK", "ELOOP", "EPERM", "EIO", "UNKNOWN"] as const;
+export type UnreadableCode = (typeof UNREADABLE_CODES)[number];
+
+/** Anything outside the closed set becomes UNKNOWN. No caller ever sees free text. */
+export function normalizeUnreadableCode(raw: string | undefined): UnreadableCode {
+  return (UNREADABLE_CODES as readonly string[]).includes(raw ?? "")
+    ? (raw as UnreadableCode)
+    : "UNKNOWN";
+}
+
 export class SpawnHomeUnreadable extends Error {
-  constructor(public readonly path: string, public readonly code: string) {
-    super(`spawn home unreadable at ${path}: ${code}`);
+  readonly code: UnreadableCode;
+  constructor(
+    public readonly path: string,
+    rawCode: string | undefined,
+    /** The entry that could not be read, when the failure was per-entry. Log-only. */
+    public readonly entry?: string,
+  ) {
+    const code = normalizeUnreadableCode(rawCode);
+    super(`spawn home unreadable at ${path}: ${code}${entry ? ` (entry: ${entry})` : ""}`);
+    this.code = code;
     this.name = "SpawnHomeUnreadable";
   }
 }
@@ -210,7 +244,7 @@ export async function classifySpawnHome(codexHome: string, home: string): Promis
   } catch (e) {
     const code = (e as NodeJS.ErrnoException)?.code;
     if (code === "ENOENT") return out;                       // truly absent
-    throw new SpawnHomeUnreadable(codexHome, code ?? String(e));
+    throw new SpawnHomeUnreadable(codexHome, code);
   }
   if (st.isSymbolicLink()) throw new SpawnHomeUnreadable(codexHome, "ESYMLINK");
   if (!st.isDirectory()) throw new SpawnHomeUnreadable(codexHome, "ENOTDIR");
@@ -221,7 +255,7 @@ export async function classifySpawnHome(codexHome: string, home: string): Promis
   } catch (e) {
     const code = (e as NodeJS.ErrnoException)?.code;
     if (code === "ENOENT") return out;                       // raced away between lstat and readdir
-    throw new SpawnHomeUnreadable(codexHome, code ?? String(e));
+    throw new SpawnHomeUnreadable(codexHome, code);
   }
   const authTarget = join(home, ".codex", "auth.json");
 
@@ -245,7 +279,7 @@ export async function classifySpawnHome(codexHome: string, home: string): Promis
       // whose loser we are content to ignore. Anything else means we could not look.
       const code = (e as NodeJS.ErrnoException)?.code;
       if (code === "ENOENT") continue;
-      throw new SpawnHomeUnreadable(codexHome, `entry:${name}:${code ?? String(e)}`);
+      throw new SpawnHomeUnreadable(codexHome, code, name);
     }
     const kind: SpawnEntry["kind"] =
       st.isSymbolicLink() ? "symlink" : st.isSocket() ? "socket"
@@ -573,8 +607,9 @@ async function teardownLocal(
     entries = await (deps.classify ?? classifySpawnHome)(paths.codexHome, paths.home);
   } catch (e) {
     if (e instanceof SpawnHomeUnreadable) {
-      log(`[crew] codex-spawn: spawn home UNREADABLE for '${agentId}' (${e.code}) at ${e.path} — ` +
-          `NOTHING REMOVED and no receipt written. This is not "already gone"; it is "I could not look".`);
+      log(`[crew] codex-spawn: spawn home UNREADABLE for '${agentId}' (${e.code}` +
+          `${e.entry ? `, entry: ${e.entry}` : ""}) at ${e.path} — NOTHING REMOVED and no receipt ` +
+          `written. This is not "already gone"; it is "I could not look".`);
       // ⛔ N29 (review). ESYMLINK / ENOTDIR / EACCES / ELOOP / entry:* all collapsed to one
       // string, so a deliberately-symlinked lane was indistinguishable from a broken one on
       // every stop, forever — and the symlink refusal is a JUDGEMENT I asked to be allowed to
@@ -721,9 +756,11 @@ async function teardownRemote(
     );
     // ⛔ N29 on the remote side. The CODE travels on its OWN line so the bare marker stays
     // exact-line matchable — appending it to the marker would have silently broken N22's fix.
-    const code = out.split("\n").map((l) => l.trim())
-      .find((l) => l.startsWith("CREW_CODE "))?.slice("CREW_CODE ".length) ?? "UNKNOWN";
-    result.skipped = `home-unreadable:${code}`;
+    // N31/N32: normalise here too — the remote stream is data, so an unexpected CREW_CODE must
+    // not become free text in `skipped` any more than a filename may.
+    const raw = out.split("\n").map((l) => l.trim())
+      .find((l) => l.startsWith("CREW_CODE "))?.slice("CREW_CODE ".length);
+    result.skipped = `home-unreadable:${normalizeUnreadableCode(raw)}`;
     return;
   }
   if (markers.has("CREW_FINALIZE_FAILED")) {

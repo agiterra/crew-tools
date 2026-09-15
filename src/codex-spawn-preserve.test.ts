@@ -10,7 +10,7 @@ import { tmpdir } from "os";
 import { basename, dirname, join } from "path";
 import {
   classifySpawnHome, manifestDigest, buildRemoteTeardownScript,
-  removeCodexSpawnHome, writeReceipt, DISPOSABLE_BASENAMES, LOCK_DIRS,
+  removeCodexSpawnHome, writeReceipt, UNREADABLE_CODES, DISPOSABLE_BASENAMES, LOCK_DIRS,
   type SpawnEntry, type StopReceipt,
 } from "./codex-spawn.js";
 
@@ -306,6 +306,13 @@ function runShell(f: Fx, script: string): string {
  * failed to apply is worse than no control, because it reports as evidence. So each
  * mutation proves it changed the text before it is allowed to run.
  */
+/** Same contract as mutate(), for mutating an ALREADY-mutated script. */
+function mutate2(src: string, find: string, replace: string): string {
+  const out = src.replace(find, replace);
+  if (out === src) throw new Error(`MUTATION DID NOT APPLY — anchor gone: ${find.slice(0, 70)}`);
+  return out;
+}
+
 function mutate(find: string, replace: string): string {
   const src = buildRemoteTeardownScript();
   const out = src.replace(find, replace);
@@ -862,8 +869,11 @@ describe("N1 — remote path failure contracts", () => {
     const f = await fixture();
     let script = mutate('rcpt complete "$REMOVEDLIST" "$R"',
                         'rcpt complete "$REMOVEDLIST" "/nonexistent-dir-for-test/x"');
-    script = script.replace('rcpt finalize-failed "$REMOVEDLIST" "$R.finalize-failed"',
-                            'rcpt finalize-failed "$REMOVEDLIST" "/nonexistent-dir-for-test/y"');
+    // ⛔ NIT (review at df40ad3): this was a bare `.replace`, so a no-op would NOT throw — the
+    // exact hole mutate() exists to close, in a row testing a guard whose failure reads as
+    // success. Second mutation now goes through mutate2() and proves it applied.
+    script = mutate2(script, 'rcpt finalize-failed "$REMOVEDLIST" "$R.finalize-failed"',
+                             'rcpt finalize-failed "$REMOVEDLIST" "/nonexistent-dir-for-test/y"');
     const r = runSh(f, script);
     expect(r.out).toContain("CREW_FINALIZE_RECORD_FAILED");
     expect(r.out).toContain("storage will not accept a failure record");
@@ -1099,7 +1109,9 @@ describe("CODEX_HOME shape parity — absent / symlink / dangling / not-a-dir / 
       // ⛔ THE POINT OF THE TABLE: they must agree, and agree on the RIGHT answer.
       expect({ impl: "local", refused: localRefused }).toEqual({ impl: "local", refused: c.refuse });
       expect({ impl: "remote", refused: remoteRefused }).toEqual({ impl: "remote", refused: c.refuse });
-      // and a refusal is total — no completion marker, so no receipt claims success
+      // and a refusal is total. ⚠️ SCOPE: these two lines assert the REMOTE stream only. The
+      // local receipt-absence claim is asserted separately below (N28) — the original wording
+      // here claimed both while checking one.
       if (c.refuse) {
         expect(lines).not.toContain("CREW_TEARDOWN_DONE");
         expect(localRes.removed).toEqual([]);          // a refusal is TOTAL on the result too
@@ -1152,7 +1164,10 @@ describe("N25/N26 — finalize markers at the READER level, and absent-contract 
     const res = await remoteWith(f, script);
     expect(res.failed.some((x) => x.error === "finalize-failed")).toBe(true);
     expect(res.skipped).toBeUndefined();
-    // ⛔ the anti-vacuity half: prove the marker was LIVE in the stream this run
+    // ⛔ the anti-vacuity half. ⚠️ HONEST ABOUT WHAT THIS IS: a SECOND, SEPARATE run of the same
+    // mutated script against a synthetic CODEX_HOME — not the run asserted above. It proves the
+    // mutation emits the marker at all, not that this particular invocation did. The earlier
+    // comment claimed "this run" and was the fourth name-vs-body overclaim I have shipped.
     expect(await rawSsh(f, script)(null, "CODEX_HOME='x'")).toContain("CREW_FINALIZE_FAILED");
   });
 
@@ -1160,8 +1175,11 @@ describe("N25/N26 — finalize markers at the READER level, and absent-contract 
     const f = await fixture();
     let script = mutate('rcpt complete "$REMOVEDLIST" "$R"',
                         'rcpt complete "$REMOVEDLIST" "/nonexistent-dir-for-test/x"');
-    script = script.replace('rcpt finalize-failed "$REMOVEDLIST" "$R.finalize-failed"',
-                            'rcpt finalize-failed "$REMOVEDLIST" "/nonexistent-dir-for-test/y"');
+    // ⛔ NIT (review at df40ad3): this was a bare `.replace`, so a no-op would NOT throw — the
+    // exact hole mutate() exists to close, in a row testing a guard whose failure reads as
+    // success. Second mutation now goes through mutate2() and proves it applied.
+    script = mutate2(script, 'rcpt finalize-failed "$REMOVEDLIST" "$R.finalize-failed"',
+                             'rcpt finalize-failed "$REMOVEDLIST" "/nonexistent-dir-for-test/y"');
     const res = await remoteWith(f, script);
     expect(res.failed.some((x) => x.error === "finalize-failure-record-unwritable")).toBe(true);
     expect(res.skipped).toBeUndefined();
@@ -1189,5 +1207,72 @@ describe("N25/N26 — finalize markers at the READER level, and absent-contract 
 
     expect(rel(remote.absent, b.stateDir)).toEqual(rel(local.absent, a.stateDir));
     expect(rel(local.absent, a.stateDir)).toEqual(["agentx", "agentx.thread.json"]);
+  });
+});
+
+// ── N31/N32 (delta review at 6bb1c60) — `skipped` is a CLOSED VOCABULARY ──────────────────
+describe("N31/N32 — skipped carries no free text, and both paths agree", () => {
+  test("N31: a filename with ':' and a NEWLINE cannot reach skipped", async () => {
+    if (process.getuid?.() === 0) return;
+    const home = await mkdtemp(join(tmpdir(), "n31-"));
+    const sd = join(home, ".wire", "codex-spawn");
+    const ch = join(sd, "agentx");
+    await mkdir(ch, { recursive: true });
+    await mkdir(join(home, ".codex"), { recursive: true });
+    await writeFile(join(home, ".codex", "auth.json"), "CREDENTIAL-MUST-SURVIVE");
+    await writeFile(join(ch, "we:ird\nname.txt"), "attacker-shaped filename");
+    await chmod(ch, 0o400);
+    const res = await removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: home, env: { STATE_DIR: sd } },
+      { log: () => {} });
+    await chmod(ch, 0o755);
+
+    const sk = res.skipped ?? "";
+    expect(sk).toBe("home-unreadable:EACCES");
+    expect(sk.includes("\n")).toBe(false);            // no line-oriented-log vector
+    expect(sk.split(":").length).toBe(2);             // class + code, exactly two fields
+    const code = sk.split(":")[1]!;
+    expect(UNREADABLE_CODES as readonly string[]).toContain(code);
+  });
+
+  // ⛔ N32: the field added to make conditions DISTINGUISHABLE reported two values for one
+  // condition, because the remote has no per-entry classifier and can never emit entry:*.
+  test("N32: the SAME condition yields the SAME skipped string on both paths", async () => {
+    if (process.getuid?.() === 0) return;
+    const build = async () => {
+      const home = await mkdtemp(join(tmpdir(), "n32-"));
+      const sd = join(home, ".wire", "codex-spawn");
+      const ch = join(sd, "agentx");
+      await mkdir(ch, { recursive: true });
+      await mkdir(join(home, ".codex"), { recursive: true });
+      await writeFile(join(home, ".codex", "auth.json"), "CREDENTIAL-MUST-SURVIVE");
+      await writeFile(join(ch, "thread_history_1.sqlite"), "CONVERSATION-MUST-SURVIVE");
+      await chmod(ch, 0o400);
+      return { home, codexHome: ch, stateDir: sd } as Fx;
+    };
+
+    const a = await build();
+    const local = await removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: a.home, env: { STATE_DIR: a.stateDir } },
+      { log: () => {} });
+    await chmod(a.codexHome, 0o755);
+
+    const b = await build();
+    const remote = await removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: b.home, runAsUid: "someuid",
+        env: { STATE_DIR: b.stateDir, CODEX_HOME: b.codexHome },
+        target: { runAsUid: "someuid", host: "localhost" } as never },
+      { log: () => {}, sshRun: (async () => {
+          const p = Bun.spawnSync(["/bin/sh", "-c", buildRemoteTeardownScript()], {
+            env: { ...process.env, AGENT_ID: "agentx", CODEX_HOME: b.codexHome,
+                   THREAD_PATH: join(b.stateDir, "agentx.thread.json"),
+                   AUTH_TARGET: join(b.home, ".codex", "auth.json"),
+                   RECEIPT: join(b.stateDir, ".stopped", "agentx.remote.json") } });
+          return new TextDecoder().decode(p.stdout);
+        }) as never });
+    await chmod(b.codexHome, 0o755);
+
+    expect({ impl: "local", skipped: local.skipped }).toEqual({ impl: "local", skipped: "home-unreadable:EACCES" });
+    expect({ impl: "remote", skipped: remote.skipped }).toEqual({ impl: "remote", skipped: "home-unreadable:EACCES" });
   });
 });
