@@ -342,3 +342,76 @@ describe("migration", () => {
     }
   });
 });
+
+// --- Coupled registration patch: runtime + manifest updates ---
+//
+// These two methods were hot-patched into the DEPLOYED tree and existed in no
+// commit. They are reconciled onto merged main here, and they carry the only
+// coverage they have ever had. `updateAgentManifest` is what the orchestrator's
+// runAsUid path calls, so a regression here breaks cross-uid registration
+// silently — the caller does not check a return value.
+
+describe("agent runtime/manifest updates (coupled registration patch)", () => {
+  function seed(runtime = "claude-code", ccSession: string | undefined = "sess-1") {
+    return store.createAgent({
+      id: "fondant",
+      display_name: "Fondant",
+      runtime,
+      screen_name: "fondant",
+      screen_pid: 4242,
+      cc_session_id: ccSession,
+    });
+  }
+
+  test("updateAgentRuntime changes the runtime", () => {
+    seed();
+    store.updateAgentRuntime("fondant", "codex");
+    expect(store.getAgent("fondant")!.runtime).toBe("codex");
+  });
+
+  test("updateAgentRuntime PRESERVES cc_session_id when the runtime stays claude-code", () => {
+    seed("claude-code", "sess-keep");
+    store.updateAgentRuntime("fondant", "claude-code");
+    expect(store.getAgent("fondant")!.cc_session_id).toBe("sess-keep");
+  });
+
+  test("updateAgentRuntime CLEARS cc_session_id when switching away from claude-code", () => {
+    // The CASE WHEN in the UPDATE exists for exactly this: a Claude session id
+    // is meaningless once the row describes a codex runtime, and a stale one
+    // would make a dead session look resumable.
+    seed("claude-code", "sess-stale");
+    store.updateAgentRuntime("fondant", "codex");
+    expect(store.getAgent("fondant")!.cc_session_id).toBeNull();
+  });
+
+  test("updateAgentRuntime bumps last_seen", async () => {
+    const before = seed().last_seen;
+    await Bun.sleep(2);
+    store.updateAgentRuntime("fondant", "codex");
+    expect(store.getAgent("fondant")!.last_seen).toBeGreaterThan(before);
+  });
+
+  test("updateAgentManifest round-trips the manifest, run_as_uid included", () => {
+    seed();
+    store.updateAgentManifest("fondant", JSON.stringify({ run_as_uid: "fondant", cwd: "/opt" }));
+    const parsed = JSON.parse(store.getAgent("fondant")!.spawn_manifest!);
+    expect(parsed.run_as_uid).toBe("fondant");
+    expect(parsed.cwd).toBe("/opt");
+  });
+
+  test("updateAgentManifest bumps last_seen", async () => {
+    const before = seed().last_seen;
+    await Bun.sleep(2);
+    store.updateAgentManifest("fondant", JSON.stringify({ run_as_uid: "fondant" }));
+    expect(store.getAgent("fondant")!.last_seen).toBeGreaterThan(before);
+  });
+
+  test("both updates on an unknown id affect no row and do not throw", () => {
+    seed();
+    store.updateAgentRuntime("no-such-agent", "codex");
+    store.updateAgentManifest("no-such-agent", "{}");
+    const row = store.getAgent("fondant")!;
+    expect(row.runtime).toBe("claude-code");
+    expect(row.spawn_manifest).toBeNull();
+  });
+});

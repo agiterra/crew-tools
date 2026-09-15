@@ -1317,6 +1317,8 @@ export class Orchestrator {
     runtime?: string;
     callerSessionId?: string;
     ccSessionId?: string;
+    /** Owning UID resolved by the service from its observed screen namespace. */
+    runAsUid?: string;
   }): Promise<Agent> {
     const runtime = opts.runtime ?? "claude-code";
     const ccSessionId = opts.ccSessionId ?? getClaudeCodeSessionId() ?? undefined;
@@ -1335,9 +1337,17 @@ export class Orchestrator {
       }
     }
 
-    // Verify screen session is alive
-    const alive = await screen.isAlive(screenName);
-    if (!alive) throw new Error(`screen session '${screenName}' is not running`);
+    // A central service's screen namespace is not the registering persona's.
+    const registerTarget = opts.runAsUid
+      ? { sshHost: screen.LOCAL_SUDO_HOST, runAsUid: opts.runAsUid }
+      : undefined;
+    if (opts.runAsUid && !/^[a-z_][a-z0-9_-]*$/i.test(opts.runAsUid)) {
+      throw new Error("registerAgent: invalid owning UID");
+    }
+    const alive = registerTarget
+      ? (await screen.getRemoteSessionPid(screenName, registerTarget)) === screenPid && screen.pidLooksAlive(screenPid)
+      : await screen.isAlive(screenName);
+    if (!alive) throw new Error(`screen session '${screenName}' is not running with pid ${screenPid}${opts.runAsUid ? ` as ${opts.runAsUid}` : ""}`);
 
     // Find the pane this agent is sitting in (by terminal session ID).
     // If the session isn't registered as a pane, auto-register it.
@@ -1351,7 +1361,7 @@ export class Orchestrator {
     // Danish ends up with pane='lisbon' (Brioche's pane). Skip auto-link
     // for detached screens — the caller can agent_attach explicitly later.
     let callerPane: string | null = null;
-    const attached = await screen.isAttached(screenName);
+    const attached = !registerTarget && await screen.isAttached(screenName);
     if (callerContext.terminalSessionId && attached) {
       // Pane auto-link is COSMETIC; the identity row below is load-bearing.
       // autoRegisterPane enumerates iTerm via AppleScript, which fails from
@@ -1392,7 +1402,12 @@ export class Orchestrator {
         );
       }
       this.store.updateAgentPid(existingByScreen.id, screenPid);
-      if (ccSessionId) this.store.updateAgentCcSession(screenName, ccSessionId);
+      if (opts.runtime) this.store.updateAgentRuntime(existingByScreen.id, opts.runtime);
+      if (opts.runAsUid) {
+        const manifest = existingByScreen.spawn_manifest ? JSON.parse(existingByScreen.spawn_manifest) : {};
+        this.store.updateAgentManifest(existingByScreen.id, JSON.stringify({ ...manifest, run_as_uid: opts.runAsUid }));
+      }
+      if (ccSessionId && (opts.runtime ?? existingByScreen.runtime) === "claude-code") this.store.updateAgentCcSession(screenName, ccSessionId);
       if (!existingByScreen.pane && callerPane) {
         this.store.updateAgentPane(existingByScreen.id, callerPane);
       }
@@ -1407,6 +1422,7 @@ export class Orchestrator {
       screen_pid: screenPid,
       cc_session_id: ccSessionId ?? undefined,
       pane: callerPane ?? undefined,
+      spawn_manifest: opts.runAsUid ? JSON.stringify({ run_as_uid: opts.runAsUid }) : undefined,
     });
   }
 

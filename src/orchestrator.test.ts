@@ -32,6 +32,14 @@ const screenState = {
   // saw nothing (the argv-unreadable path).
   argvResult: null as string | null,
   sshRunCalls: [] as Array<{ target: unknown; command: string }>,
+  // Cross-uid registration (coupled registration patch): the runAsUid path
+  // resolves liveness through getRemoteSessionPid + pidLooksAlive instead of
+  // the local isAlive, so both must be scriptable to cover it.
+  remoteSessionPidResult: null as number | null,
+  // null = DELEGATE to the real pidLooksAlive. An unconditional override here would
+  // replace it PROCESS-WIDE (mock.module), breaking screen.test.ts's ESRCH test —
+  // which is exactly what mock-isolation.test.ts caught. Opt in per test, never by default.
+  pidLooksAliveResult: null as boolean | null,
   sshRunResult: "",
 };
 
@@ -54,6 +62,11 @@ globalThis.fetch = (async (input: unknown) => {
   return { ok: true, status: 200, json: async () => body } as unknown as Response;
 }) as unknown as typeof fetch;
 import * as __realScreen from "./screen";
+// ⛔ Captured EAGERLY, before mock.module runs. A late `__realScreen.pidLooksAlive(pid)`
+// inside the mock resolves through the LIVE namespace — which mock.module has by then
+// replaced with this very mock — so the wrapper calls itself. Infinite recursion, and it
+// presents as the paired run HANGING, not as a failed assertion.
+const realPidLooksAlive = __realScreen.pidLooksAlive;
 // ⛔ CROSS-FILE MOCK CONTAMINATION (CI, Bun 1.4.2; hypothesis from Brioche's source read,
 // reproduced locally). `mock.module` replaces the module PROCESS-WIDE for every later import.
 // This mock enumerated the handful of functions this file needs and omitted the rest — so once
@@ -131,7 +144,8 @@ mock.module("./screen", () => ({
     screenState.sshRunCalls.push({ target, command });
     return screenState.sshRunResult;
   },
-  getRemoteSessionPid: async () => null,
+  getRemoteSessionPid: async () => screenState.remoteSessionPidResult,
+  pidLooksAlive: (pid: number) => screenState.pidLooksAliveResult ?? realPidLooksAlive(pid),
   pollRemoteSessionPid: async () => null,
   // Post-spawn verify chain (v2.26.0). Tests inject channelProbe/argvReader
   // explicitly; these defaults make un-injected background chains resolve
@@ -1657,5 +1671,80 @@ describe("codex-spawn teardown (AGI-74)", () => {
     const failure = logs.find((l) => l.includes("codex-spawn teardown FAILED"));
     expect(failure).toContain("/Users/_ephemeral/.wire/codex-spawn/ephem2");
     expect(orch.store.getAgent("ephem2")).toBeNull();
+  });
+});
+
+describe("registerAgent cross-uid path (coupled registration patch)", () => {
+  // A central service does not share the registering persona's screen namespace,
+  // so registerAgent resolves liveness through the REMOTE pid probe when the
+  // caller supplies runAsUid. This path was hot-patched into the deployed tree
+  // and existed in no commit; these are the only tests it has ever had.
+  const caller = JSON.stringify({
+    terminal_session_id: "iterm-session-9",
+    screen_name: "wire-fondant",
+    screen_pid: 31337,
+    sty: "31337.wire-fondant",
+  });
+
+  test("rejects a runAsUid that is not a valid unix username, and writes no row", async () => {
+    await expect(
+      orch.registerAgent({
+        id: "fondant", displayName: "Fondant", runAsUid: "bad uid; rm -rf /", callerSessionId: caller,
+      }),
+    ).rejects.toThrow(/invalid owning UID/);
+    expect(orch.store.getAgent("fondant")).toBeNull();
+  });
+
+  test("uses the REMOTE pid probe, not the local isAlive, when runAsUid is given", async () => {
+    // The local probe is made to say ALIVE. If the cross-uid path were not taken
+    // this would register successfully — so the throw is what proves the branch.
+    screenState.isAliveResult = true;
+    screenState.remoteSessionPidResult = null;
+    try {
+      await expect(
+        orch.registerAgent({
+          id: "fondant", displayName: "Fondant", runAsUid: "fondant", callerSessionId: caller,
+        }),
+      ).rejects.toThrow(/is not running with pid 31337 as fondant/);
+    } finally {
+      screenState.isAliveResult = false;
+      screenState.remoteSessionPidResult = null;
+    }
+  });
+
+  test("registers and records run_as_uid in the manifest when the remote pid matches", async () => {
+    // The manifest write is the COUPLING: this orchestrator path calls the
+    // store's updateAgentManifest/createAgent. If the store half is reverted
+    // while this half survives, the call is to a method that no longer exists.
+    screenState.isAliveResult = false;
+    screenState.remoteSessionPidResult = 31337;
+    screenState.pidLooksAliveResult = true;
+    try {
+      const agent = await orch.registerAgent({
+        id: "fondant", displayName: "Fondant", runAsUid: "fondant", callerSessionId: caller,
+      });
+      expect(agent.screen_name).toBe("wire-fondant");
+      expect(agent.screen_pid).toBe(31337);
+      expect(JSON.parse(orch.store.getAgent("fondant")!.spawn_manifest!).run_as_uid).toBe("fondant");
+      // A cross-uid registration must not claim an attached pane.
+      expect(agent.pane).toBeNull();
+    } finally {
+      screenState.remoteSessionPidResult = null;
+      screenState.pidLooksAliveResult = null;
+    }
+  });
+
+  test("without runAsUid the local isAlive path still governs (no regression)", async () => {
+    screenState.isAliveResult = true;
+    screenState.remoteSessionPidResult = null; // remote probe would refuse if consulted
+    try {
+      const agent = await orch.registerAgent({
+        id: "fondant", displayName: "Fondant", callerSessionId: caller,
+      });
+      expect(agent.screen_pid).toBe(31337);
+      expect(orch.store.getAgent("fondant")!.spawn_manifest).toBeNull();
+    } finally {
+      screenState.isAliveResult = false;
+    }
   });
 });
