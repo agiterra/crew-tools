@@ -142,6 +142,20 @@ describe("receipt", () => {
   });
 });
 
+describe("fail-closed is audible", () => {
+  test("remote INTENT failure is LOGGED, not merely skipped", async () => {
+    const f = await fixture();
+    const logs: string[] = [];
+    const r = await removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: f.home,
+        env: { STATE_DIR: f.stateDir }, target: { runAsUid: "_ephemeral" } as any },
+      { log: (m) => logs.push(m), sshRun: async () => "CREW_INTENT_FAILED\n" },
+    );
+    expect(r.skipped).toBe("intent-undurable");
+    expect(logs.some((l) => l.includes("NOTHING REMOVED"))).toBe(true);
+  });
+});
+
 describe("remote parity", () => {
   test("the generated /bin/sh program yields the SAME disposition as the TS classifier", async () => {
     const f = await fixture();

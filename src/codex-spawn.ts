@@ -445,6 +445,13 @@ async function teardownRemote(
     return;
   }
   if (out.includes("CREW_INTENT_FAILED")) {
+    // FAIL CLOSED AND SAY SO. The FV proved the safety worked and was SILENT: an
+    // operator saw a successful stop with no hint that cleanup never ran. A guard
+    // nobody can observe is indistinguishable from one that did not fire.
+    (deps.log ?? ((m: string) => console.error(m)))(
+      `[crew] codex-spawn: INTENT receipt undurable for '${agentId}' at ${receipt} — ` +
+        `NOTHING REMOVED. The spawn home is intact, including scaffolding; fix the receipt path.`,
+    );
     result.skipped = "intent-undurable";
     return;
   }
