@@ -1012,3 +1012,62 @@ describe("N21/N22 — remote classification parity, and markers a filename canno
     expect(await alive(forged)).toBe(true);                    // and the forging file is retained
   });
 });
+
+// ── CODEX_HOME SHAPE PARITY — the whole axis, both implementations ────────────────────────
+// One table, five cases, driven through BOTH classifiers. Written this way because this class
+// has cost exactly one defect per case we failed to enumerate: EACCES (C2), ENOTDIR (N21), and
+// a dangling symlink (found at 4348a46, in the code written to fix N21). Discovering them one
+// at a time is the pattern; the table is the fix for the pattern.
+describe("CODEX_HOME shape parity — absent / symlink / dangling / not-a-dir / unreadable", () => {
+  type Case = { name: string; build: (sd: string) => Promise<string>; refuse: boolean };
+  const cases: Case[] = [
+    { name: "truly absent (ENOENT)", refuse: false,
+      build: async (sd) => join(sd, "agentx") },
+    { name: "DANGLING symlink", refuse: true,
+      build: async (sd) => { const p = join(sd, "agentx");
+        await symlink(join(sd, "no-such-target"), p); return p; } },
+    { name: "symlink to a real directory", refuse: true,
+      build: async (sd) => { const real = join(sd, "real-dir"); await mkdir(real, { recursive: true });
+        const p = join(sd, "agentx"); await symlink(real, p); return p; } },
+    { name: "not a directory (ENOTDIR)", refuse: true,
+      build: async (sd) => { const p = join(sd, "agentx"); await writeFile(p, "not a dir"); return p; } },
+    { name: "unreadable (EACCES)", refuse: true,
+      build: async (sd) => { const p = join(sd, "agentx"); await mkdir(p, { recursive: true });
+        await writeFile(join(p, "thread_history_1.sqlite"), "db"); await chmod(p, 0o000); return p; } },
+  ];
+
+  for (const c of cases) {
+    test(`${c.name} -> both implementations ${c.refuse ? "REFUSE" : "treat as already-gone"}`, async () => {
+      if (c.name.includes("EACCES") && process.getuid?.() === 0) return;   // root ignores the mode
+      const home = await mkdtemp(join(tmpdir(), "shape-"));
+      const sd = join(home, ".wire", "codex-spawn");
+      await mkdir(sd, { recursive: true });
+      await mkdir(join(home, ".codex"), { recursive: true });
+      await writeFile(join(home, ".codex", "auth.json"), "CREDENTIAL-MUST-SURVIVE");
+      const ch = await c.build(sd);
+
+      // ── LOCAL ──
+      let localRefused = false;
+      try { await classifySpawnHome(ch, home); }
+      catch (e) { if (e instanceof SpawnHomeUnreadable) localRefused = true; else throw e; }
+
+      // ── REMOTE ──
+      const p = Bun.spawnSync(["/bin/sh", "-c", buildRemoteTeardownScript()], {
+        env: { ...process.env, AGENT_ID: "agentx", CODEX_HOME: ch,
+               AUTH_TARGET: join(home, ".codex", "auth.json"),
+               RECEIPT: join(sd, ".stopped", "agentx.remote.json") },
+      });
+      const lines = new TextDecoder().decode(p.stdout).split("\n").map((l) => l.trim());
+      const remoteRefused = lines.includes("CREW_HOME_UNREADABLE");
+
+      if (c.name.includes("EACCES")) await chmod(ch, 0o755);
+
+      // ⛔ THE POINT OF THE TABLE: they must agree, and agree on the RIGHT answer.
+      expect({ impl: "local", refused: localRefused }).toEqual({ impl: "local", refused: c.refuse });
+      expect({ impl: "remote", refused: remoteRefused }).toEqual({ impl: "remote", refused: c.refuse });
+      // and a refusal is total — no completion marker, so no receipt claims success
+      if (c.refuse) expect(lines).not.toContain("CREW_TEARDOWN_DONE");
+      else expect(lines).toContain("CREW_TEARDOWN_DONE");
+    });
+  }
+});

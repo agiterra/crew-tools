@@ -190,12 +190,37 @@ export async function classifySpawnHome(codexHome: string, home: string): Promis
   // cross-uid teardown that got EACCES wrote a receipt saying "complete, nothing here" —
   // a permission failure recorded as a clean stop, inside the audit record built to be truthful.
   // ENOENT genuinely means "already gone"; anything else means "I could not look".
+  // ⛔ THE WHOLE AXIS, ENUMERATED (found by me at 4348a46; see the repro in the incident dir).
+  // readdir() alone conflated states that must not be conflated: on a DANGLING SYMLINK it
+  // returns ENOENT, and the C2 code read ENOENT as "already gone" — so a home that exists as a
+  // link but does not resolve produced a clean `complete` receipt asserting "retained 0 entries
+  // including conversation state" about contents nobody had read. A dangling symlink is NOT
+  // "already gone": something is there, it just does not resolve.
+  // This class has now cost one defect per case we failed to list (ENOENT, ENOTDIR, EACCES,
+  // dangling link), so the cases are enumerated here rather than discovered one at a time:
+  //   truly absent        -> "already gone", the ONLY clean outcome
+  //   symlink (any)       -> refuse. A spawn home is a real directory; we never recurse through
+  //                          a link, and `[ -d ]` on the remote side FOLLOWS links, so accepting
+  //                          one here would put the two implementations back out of step.
+  //   not a directory     -> refuse (ENOTDIR)
+  //   unreadable          -> refuse (EACCES et al)
+  let st;
+  try {
+    st = await lstat(codexHome);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") return out;                       // truly absent
+    throw new SpawnHomeUnreadable(codexHome, code ?? String(e));
+  }
+  if (st.isSymbolicLink()) throw new SpawnHomeUnreadable(codexHome, "ESYMLINK");
+  if (!st.isDirectory()) throw new SpawnHomeUnreadable(codexHome, "ENOTDIR");
+
   let names: string[];
   try {
     names = await readdir(codexHome);
   } catch (e) {
     const code = (e as NodeJS.ErrnoException)?.code;
-    if (code === "ENOENT") return out;
+    if (code === "ENOENT") return out;                       // raced away between lstat and readdir
     throw new SpawnHomeUnreadable(codexHome, code ?? String(e));
   }
   const authTarget = join(home, ".codex", "auth.json");
@@ -342,6 +367,10 @@ export function buildRemoteTeardownScript(): string {
     // is its third appearance in this PR. ENOENT is "already gone"; ENOTDIR is "that is not a
     // spawn home", which is a refusal, not a completion.
     'if [ ! -e "$H" ] && [ ! -L "$H" ]; then echo "$H" >> "$B"; CREW_ABSENT=1;',
+    // A SYMLINK is refused before the `-d` test, because `-d` FOLLOWS links: without this, a
+    // symlink-to-a-directory would be accepted here and refused locally — the same divergence
+    // one case over. Dangling links are caught here too, having survived the `-e`/`-L` test.
+    'elif [ -L "$H" ]; then echo CREW_HOME_UNREADABLE; echo "CREW_NOTE SYMLINK AT CODEX_HOME: $H for $AG — refusing; a spawn home is a real directory."; exit 8;',
     'elif [ ! -d "$H" ]; then echo CREW_HOME_UNREADABLE; echo "CREW_NOTE NOT A DIRECTORY: $H for $AG — refusing; this is not \'already gone\'."; exit 8;',
     'else CREW_ABSENT=0;',
     // ⛔ N16: these explanations were on STDERR, and screen.sshRun returns STDOUT ONLY — so
