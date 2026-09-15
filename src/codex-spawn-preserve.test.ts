@@ -10,7 +10,7 @@ import { tmpdir } from "os";
 import { basename, dirname, join } from "path";
 import {
   classifySpawnHome, manifestDigest, buildRemoteTeardownScript,
-  removeCodexSpawnHome, writeReceipt, SpawnHomeUnreadable, DISPOSABLE_BASENAMES, LOCK_DIRS,
+  removeCodexSpawnHome, writeReceipt, DISPOSABLE_BASENAMES, LOCK_DIRS,
   type SpawnEntry, type StopReceipt,
 } from "./codex-spawn.js";
 
@@ -890,9 +890,14 @@ describe("N1 — remote path failure contracts", () => {
 describe("N14 — the remote RESULT contract, via a stdout-only sshRun", () => {
   const stdoutOnly = (f: Fx) => async (_t: unknown, command: string): Promise<string> => {
     const m = command.match(/CODEX_HOME='([^']*)'/);
+    // ⛔ N23-adjacent: this stub previously invented its own AUTH_TARGET/RECEIPT and now also
+    // THREAD_PATH, so it cannot catch teardownRemote computing them wrong. Parse what the real
+    // command line actually carries wherever possible — that is what a production sshRun sees.
+    const t = command.match(/THREAD_PATH='([^']*)'/);
     const p = Bun.spawnSync(["/bin/sh", "-c", buildRemoteTeardownScript()], {
       env: { ...process.env, AGENT_ID: "agentx", CODEX_HOME: m?.[1] ?? f.codexHome,
              AUTH_TARGET: join(f.home, ".codex", "auth.json"),
+             THREAD_PATH: t?.[1] ?? join(f.stateDir, "agentx.thread.json"),
              RECEIPT: join(f.stateDir, ".stopped", "agentx.remote.json") },
     });
     return new TextDecoder().decode(p.stdout);   // ⛔ stdout ONLY, exactly like screen.sshRun
@@ -961,21 +966,33 @@ describe("N21/N22 — remote classification parity, and markers a filename canno
   // that is a regular FILE came out of the remote path as a clean `complete` with a receipt,
   // while the local path refused it. Neither of us had tested ENOTDIR — only EACCES.
   test("N21: a CODEX_HOME that is a FILE is refused on BOTH paths, identically", async () => {
-    const f = await fixture();
-    const notDir = join(f.stateDir, "agentx-file");
+    // ⛔ THIRD TIME THIS EXACT ERROR: the path must have the SHAPE resolveCodexSpawnPaths
+    // accepts — <…>/codex-spawn/<agentId> — or the S1 guard refuses it as an unrecognised
+    // manifest (skipped:"unsafe-path") and nothing is classified at all. Naming it
+    // "agentx-file" tested the guard, exactly as "never-existed" did in the N14 row. The
+    // reviewer warned me to assume I had repeated the class; I had.
+    const alt = await mkdtemp(join(tmpdir(), "notdir-"));
+    const altState = join(alt, ".wire", "codex-spawn");
+    await mkdir(altState, { recursive: true });
+    await mkdir(join(alt, ".codex"), { recursive: true });
+    await writeFile(join(alt, ".codex", "auth.json"), "CREDENTIAL-MUST-SURVIVE");
+    const notDir = join(altState, "agentx");
     await writeFile(notDir, "I am not a directory");
 
     // remote
-    const out = runSh2(notDir, f.stateDir, f.home);
+    const out = runSh2(notDir, altState, alt);
     expect(out.split("\n").map((l) => l.trim())).toContain("CREW_HOME_UNREADABLE");
     expect(out).toContain("NOT A DIRECTORY");
     expect(out.split("\n").map((l) => l.trim())).not.toContain("CREW_TEARDOWN_DONE");
 
-    // local, same input, same classification — this is the parity the finding was about
-    let localSkipped: string | undefined;
-    try { await classifySpawnHome(notDir, f.home); }
-    catch (e) { if (e instanceof SpawnHomeUnreadable) localSkipped = "home-unreadable"; }
-    expect(localSkipped).toBe("home-unreadable");
+    // ⛔ CORRECTED (reviewer, 4348a46): this tested the CLASSIFIER while the row is named
+    // "on BOTH paths, identically" — a result-level claim. Asserting the RESULT now.
+    const localRes = await removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: alt,
+        env: { STATE_DIR: altState, CODEX_HOME: notDir } },
+      { log: () => {} });
+    expect(localRes.skipped).toBe("home-unreadable");   // NOT "unsafe-path": shape is valid
+    expect(localRes.removed).toEqual([]);
   });
 
   test("N21: a genuinely ABSENT home still completes and reports absent (ENOENT ≠ ENOTDIR)", async () => {
@@ -1046,10 +1063,16 @@ describe("CODEX_HOME shape parity — absent / symlink / dangling / not-a-dir / 
       await writeFile(join(home, ".codex", "auth.json"), "CREDENTIAL-MUST-SURVIVE");
       const ch = await c.build(sd);
 
-      // ── LOCAL ──
-      let localRefused = false;
-      try { await classifySpawnHome(ch, home); }
-      catch (e) { if (e instanceof SpawnHomeUnreadable) localRefused = true; else throw e; }
+      // ⛔ CORRECTED (reviewer, 4348a46): this asserted on classifySpawnHome, i.e. that the
+      // CLASSIFIER throws — while the row is named for the IMPLEMENTATIONS, which claims
+      // result-level parity it never checked. A test whose name claims more than its body is
+      // the same species as the stale docstring that cost an operator an hour today. Assert on
+      // the RESULT CONTRACT, which is what a caller actually sees.
+      const localRes = await removeCodexSpawnHome(
+        { agentId: "agentx", runtime: "codex", selfHome: home,
+          env: { STATE_DIR: sd, CODEX_HOME: ch } },
+        { log: () => {} });
+      const localRefused = localRes.skipped === "home-unreadable";
 
       // ── REMOTE ──
       const p = Bun.spawnSync(["/bin/sh", "-c", buildRemoteTeardownScript()], {
@@ -1066,8 +1089,86 @@ describe("CODEX_HOME shape parity — absent / symlink / dangling / not-a-dir / 
       expect({ impl: "local", refused: localRefused }).toEqual({ impl: "local", refused: c.refuse });
       expect({ impl: "remote", refused: remoteRefused }).toEqual({ impl: "remote", refused: c.refuse });
       // and a refusal is total — no completion marker, so no receipt claims success
-      if (c.refuse) expect(lines).not.toContain("CREW_TEARDOWN_DONE");
-      else expect(lines).toContain("CREW_TEARDOWN_DONE");
+      if (c.refuse) {
+        expect(lines).not.toContain("CREW_TEARDOWN_DONE");
+        expect(localRes.removed).toEqual([]);          // a refusal is TOTAL on the result too
+      } else {
+        expect(lines).toContain("CREW_TEARDOWN_DONE");
+        expect(localRes.skipped).toBeUndefined();      // and an accept really accepts
+      }
     });
   }
+});
+
+// ── N25 / N26 (delta review at 4348a46) ───────────────────────────────────────────────────
+describe("N25/N26 — finalize markers at the READER level, and absent-contract parity", () => {
+  const rawSsh = (f: Fx, script: string) => (async (_t: unknown, command: string): Promise<string> => {
+    const ch = command.match(/CODEX_HOME='([^']*)'/)?.[1] ?? f.codexHome;
+    const tp = command.match(/THREAD_PATH='([^']*)'/)?.[1] ?? join(f.stateDir, "agentx.thread.json");
+    const p = Bun.spawnSync(["/bin/sh", "-c", script], {
+      env: { ...process.env, AGENT_ID: "agentx", CODEX_HOME: ch, THREAD_PATH: tp,
+             AUTH_TARGET: join(f.home, ".codex", "auth.json"),
+             RECEIPT: join(f.stateDir, ".stopped", "agentx.remote.json") },
+    });
+    return new TextDecoder().decode(p.stdout);
+  });
+  const sshFor = (f: Fx, script: string) => rawSsh(f, script) as never;
+  const remoteWith = (f: Fx, script: string, log: (m: string) => void = () => {}) =>
+    removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: f.home, runAsUid: "someuid",
+        env: { STATE_DIR: f.stateDir, CODEX_HOME: f.codexHome },
+        target: { runAsUid: "someuid", host: "localhost" } as never },
+      { log, sshRun: sshFor(f, script) });
+
+  // ⛔ N25. Of the five markers, a missed INTENT_FAILED / HOME_UNREADABLE / TEARDOWN_DONE
+  // degrades to a LOUD failure. FINALIZE_FAILED and FINALIZE_RECORD_FAILED are the two whose
+  // miss reads as CLEAN SUCCESS — and they were the only marker->result edges with no
+  // reader-level row: the F3 rows drive the script directly and never touch the reader. An
+  // untested edge whose failure mode is reassurance is the shape this change exists to
+  // distrust, so the two silent guards get the coverage, not the loud ones.
+  test("N25: CREW_FINALIZE_FAILED reaches result.failed through the READER", async () => {
+    const f = await fixture();
+    const script = mutate('rcpt complete "$REMOVEDLIST" "$R"',
+                          'rcpt complete "$REMOVEDLIST" "/nonexistent-dir-for-test/x"');
+    const res = await remoteWith(f, script);
+    expect(res.failed.some((x) => x.error === "finalize-failed")).toBe(true);
+    expect(res.skipped).toBeUndefined();
+    // ⛔ the anti-vacuity half: prove the marker was LIVE in the stream this run
+    expect(await rawSsh(f, script)(null, "CODEX_HOME='x'")).toContain("CREW_FINALIZE_FAILED");
+  });
+
+  test("N25: CREW_FINALIZE_RECORD_FAILED reaches result.failed through the READER", async () => {
+    const f = await fixture();
+    let script = mutate('rcpt complete "$REMOVEDLIST" "$R"',
+                        'rcpt complete "$REMOVEDLIST" "/nonexistent-dir-for-test/x"');
+    script = script.replace('rcpt finalize-failed "$REMOVEDLIST" "$R.finalize-failed"',
+                            'rcpt finalize-failed "$REMOVEDLIST" "/nonexistent-dir-for-test/y"');
+    const res = await remoteWith(f, script);
+    expect(res.failed.some((x) => x.error === "finalize-failure-record-unwritable")).toBe(true);
+    expect(res.skipped).toBeUndefined();
+  });
+
+  // ⛔ N26. `absent` meant different things on the two paths for the SAME state.
+  test("N26: absent is the SAME SET on both implementations for the same state", async () => {
+    const bare = async () => {
+      const home = await mkdtemp(join(tmpdir(), "n26-"));
+      const stateDir = join(home, ".wire", "codex-spawn");
+      await mkdir(stateDir, { recursive: true });
+      await mkdir(join(home, ".codex"), { recursive: true });
+      await writeFile(join(home, ".codex", "auth.json"), "CREDENTIAL-MUST-SURVIVE");
+      return { home, codexHome: join(stateDir, "agentx"), stateDir } as Fx;
+    };
+    const rel = (arr: string[], sd: string) => arr.map((p) => p.replace(`${sd}/`, "")).sort();
+
+    const a = await bare();
+    const local = await removeCodexSpawnHome(
+      { agentId: "agentx", runtime: "codex", selfHome: a.home, env: { STATE_DIR: a.stateDir } },
+      { log: () => {} });
+
+    const b = await bare();
+    const remote = await remoteWith(b, buildRemoteTeardownScript());
+
+    expect(rel(remote.absent, b.stateDir)).toEqual(rel(local.absent, a.stateDir));
+    expect(rel(local.absent, a.stateDir)).toEqual(["agentx", "agentx.thread.json"]);
+  });
 });

@@ -352,7 +352,7 @@ export function buildRemoteTeardownScript(): string {
   const locks = LOCK_DIRS.join(" ");
   return [
     'set -u',
-    'H="$CODEX_HOME"; A="$AUTH_TARGET"; R="$RECEIPT"; AG="$AGENT_ID"',
+    'H="$CODEX_HOME"; A="$AUTH_TARGET"; R="$RECEIPT"; AG="$AGENT_ID"; T="${THREAD_PATH:-}"',
     `BASES="${bases}"; LOCKS="${locks}"`,
     'D=$(mktemp); K=$(mktemp); V=$(mktemp); B=$(mktemp)',
     // ⛔ C2 ON THE REMOTE PATH (review N1). The root loop globs, and a glob over a home we
@@ -420,6 +420,13 @@ export function buildRemoteTeardownScript(): string {
     // ⛔ N14: `absent` reached the RECEIPT and never the RETURNED CONTRACT, because the script
     // gained $B and its reader gained nothing. A field that is right in the audit record and
     // empty in the caller's result is two different answers to one question.
+    // ⛔ N26 (delta review). `absent` MEANT DIFFERENT THINGS ON THE TWO PATHS: local reported
+    // [home, threadPath] while remote reported [home] for the SAME state, so a consumer could
+    // not use membership or length without knowing which implementation produced the result.
+    // A LIVE contract divergence, not a coverage gap — measured before fixing. The thread
+    // pointer lives on the REMOTE host, so only this script can observe it; the reader cannot
+    // stat a path on another machine. Same order as local: home first, then pointer.
+    '[ -n "$T" ] && [ ! -e "$T" ] && [ ! -L "$T" ] && echo "$T" >> "$B"',
     'while IFS= read -r p; do echo "ABSENT $p"; done < "$B"',
     // Every removal takes ONE path from the disposal list, and the list never contains $H:
     // the root loop only ever appends "$H"/<entry>. The `[ "$p" = "$H" ]` guard is the
@@ -652,6 +659,7 @@ async function teardownRemote(
   const command =
     `sudo -n -u ${target.runAsUid} env CODEX_HOME='${paths.codexHome}' ` +
     `AUTH_TARGET='${join(paths.home, ".codex", "auth.json")}' RECEIPT='${receipt}' AGENT_ID='${agentId}' ` +
+    `THREAD_PATH='${paths.threadPath}' ` +
     `/bin/sh -c '${script.replace(/'/g, "'\\''")}'`;
   let out: string;
   try {
