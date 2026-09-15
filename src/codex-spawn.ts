@@ -344,9 +344,23 @@ export async function classifySpawnHome(codexHome: string, home: string): Promis
                      mode: lst.mode & 0o7777, disposition: "retained", reason: "not a .lock file" });
         }
       }
-      // The directory itself goes only if every entry in it was disposable.
-      out.push({ ...base, disposition: allLocks ? "disposable" : "retained",
-                 reason: allLocks ? "lock directory, empty after its locks" : "lock directory holding retained content" });
+      // ⛔ THREE STATES, NOT TWO (review addendum; disposition Brioche 616403). The reason
+      // string said "lock directory holding retained content" for a directory holding NOTHING —
+      // a receipt field asserting a specific fact nobody established, which is this PR's whole
+      // subject reproduced at small scale inside the fix for it. The unreadable cases no longer
+      // reach here at all (they throw above), so exactly two retained shapes remain and they are
+      // not the same thing.
+      // ⚠️ EMPTY STAYS RETAINED. The reviewer proposed making it disposable — an empty lock dir
+      // is arguably pure scaffolding — and Brioche declined it for this PR: "deletion of empty
+      // scaffolding is an unadopted optional scope expansion, not unfinished required work." No
+      // deletion behaviour changes here; only the claim the receipt makes about what it saw.
+      const lockState: { disposition: SpawnEntry["disposition"]; reason: string } =
+        inner.length === 0
+          ? { disposition: "retained", reason: "empty lock directory retained by policy" }
+          : allLocks
+            ? { disposition: "disposable", reason: "lock directory, empty after its locks" }
+            : { disposition: "retained", reason: "lock directory holding retained content" };
+      out.push({ ...base, ...lockState });
       continue;
     }
     // ⛔ EVERYTHING ELSE IS RETAINED, at any depth, including cache/ and tmp/

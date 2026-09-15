@@ -10,7 +10,7 @@ import { tmpdir } from "os";
 import { basename, dirname, join } from "path";
 import {
   classifySpawnHome, manifestDigest, buildRemoteTeardownScript,
-  removeCodexSpawnHome, writeReceipt, UNREADABLE_CODES, DISPOSABLE_BASENAMES, LOCK_DIRS,
+  removeCodexSpawnHome, writeReceipt, UNREADABLE_CODES, SpawnHomeUnreadable, DISPOSABLE_BASENAMES, LOCK_DIRS,
   type SpawnEntry, type StopReceipt,
 } from "./codex-spawn.js";
 
@@ -1340,4 +1340,79 @@ describe("N33 — an unreadable lock directory is 'I could not look', on both pa
     expect(res.skipped).toBeUndefined();
     expect(res.removed.some((p) => p.endsWith("thread-writer-locks"))).toBe(true);
   });
+});
+
+// ── Lock-dir REASON STRINGS — three states, and the string is what an operator reads ──────
+// Brioche 616403: make the truthful reason explicit, distinct from retained user content and
+// from an unreadable refusal, with local/remote consistency checked — and WITHOUT changing the
+// retained set. The reviewer's proposal to make an empty lock dir DISPOSABLE was preserved and
+// NOT adopted; these rows pin the current, deliberate behaviour.
+describe("lock-dir reason strings — empty / has-content / unreadable", () => {
+  const build = async (setup: (lock: string) => Promise<void>, mode?: number) => {
+    const home = await mkdtemp(join(tmpdir(), "reason-"));
+    const stateDir = join(home, ".wire", "codex-spawn");
+    const codexHome = join(stateDir, "agentx");
+    const lock = join(codexHome, "app-server-control");
+    await mkdir(lock, { recursive: true });
+    await mkdir(join(home, ".codex"), { recursive: true });
+    await writeFile(join(home, ".codex", "auth.json"), "CREDENTIAL-MUST-SURVIVE");
+    await writeFile(join(codexHome, "config.toml"), "regenerable");
+    await setup(lock);
+    if (mode !== undefined) await chmod(lock, mode);
+    return { home, codexHome, stateDir, lock };
+  };
+  const lockEntry = async (f: { codexHome: string; home: string }) =>
+    (await classifySpawnHome(f.codexHome, f.home))
+      .find((e) => e.path.endsWith("/app-server-control"));
+
+  test("EMPTY lock dir: retained, and the reason SAYS empty — not 'holding retained content'", async () => {
+    const f = await build(async () => {});
+    const e = await lockEntry(f);
+    expect({ disposition: e?.disposition, reason: e?.reason })
+      .toEqual({ disposition: "retained", reason: "empty lock directory retained by policy" });
+    // ⛔ the old string asserted content that did not exist. It must not come back.
+    expect(e?.reason).not.toContain("holding retained content");
+  });
+
+  test("lock dir WITH user content: retained, and the reason says so truthfully", async () => {
+    const f = await build(async (l) => { await writeFile(join(l, "notes.txt"), "USER"); });
+    const e = await lockEntry(f);
+    expect({ disposition: e?.disposition, reason: e?.reason })
+      .toEqual({ disposition: "retained", reason: "lock directory holding retained content" });
+  });
+
+  test("all-locks dir: disposable, reason unchanged — the accept path for these rows", async () => {
+    const f = await build(async (l) => { await writeFile(join(l, "a.lock"), "l"); });
+    const e = await lockEntry(f);
+    expect({ disposition: e?.disposition, reason: e?.reason })
+      .toEqual({ disposition: "disposable", reason: "lock directory, empty after its locks" });
+  });
+
+  // ⛔ The unreadable shapes never reach a reason string at all — they refuse first. Asserting
+  // that explicitly is what stops a future edit reintroducing a false claim on those paths.
+  for (const [label, mode] of [["unreadable (0000)", 0o000], ["readable-not-searchable (0400)", 0o400]] as const) {
+    test(`${label}: refuses before any reason string is produced, and REMOTE agrees`, async () => {
+      if (process.getuid?.() === 0) return;
+      const f = await build(async (l) => { await writeFile(join(l, "notes.txt"), "USER"); }, mode);
+
+      let threw: string | undefined;
+      try { await lockEntry(f); }
+      catch (e) { if (e instanceof SpawnHomeUnreadable) threw = e.code; else throw e; }
+
+      const p = Bun.spawnSync(["/bin/sh", "-c", buildRemoteTeardownScript()], {
+        env: { ...process.env, AGENT_ID: "agentx", CODEX_HOME: f.codexHome,
+               THREAD_PATH: join(f.stateDir, "agentx.thread.json"),
+               AUTH_TARGET: join(f.home, ".codex", "auth.json"),
+               RECEIPT: join(f.stateDir, ".stopped", "agentx.remote.json") } });
+      const out = new TextDecoder().decode(p.stdout);
+      const lines = out.split("\n").map((l) => l.trim());
+      await chmod(f.lock, 0o755);
+
+      expect({ impl: "local", code: threw }).toEqual({ impl: "local", code: "EACCES" });
+      expect(lines).toContain("CREW_HOME_UNREADABLE");
+      expect(out).toContain("CREW_CODE EACCES");        // local/remote consistency on the CODE
+      expect(lines).not.toContain("CREW_TEARDOWN_DONE");
+      expect(out).not.toContain("holding retained content");
+    });
+  }
 });
