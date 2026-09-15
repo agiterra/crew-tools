@@ -258,19 +258,20 @@ export async function writeReceipt(stateDir: string, agentId: string, stamp: str
  * TypeScript classifier and asserts identical outcomes.
  */
 export function buildRemoteTeardownScript(): string {
-  const bases = [...DISPOSABLE_BASENAMES].map((b) => `'${b}'`).join(" ");
-  const locks = LOCK_DIRS.map((d) => `'${d}'`).join(" ");
+  const bases = [...DISPOSABLE_BASENAMES].join(" ");
+  const locks = LOCK_DIRS.join(" ");
   return [
     'set -u',
-    'H="$CODEX_HOME"; A="$AUTH_TARGET"; R="$RECEIPT"',
-    `BASES="${bases.replace(/'/g, "")}"; LOCKS="${locks.replace(/'/g, "")}"`,
-    'DISP=""; RET=""',
+    'H="$CODEX_HOME"; A="$AUTH_TARGET"; R="$RECEIPT"; AG="$AGENT_ID"',
+    `BASES="${bases}"; LOCKS="${locks}"`,
+    'D=$(mktemp); K=$(mktemp); V=$(mktemp)',
+    // JSON array from a newline list — quoting handled once, in awk.
+    'jarr() { awk \'BEGIN{printf "["} {gsub(/\\\\/,"\\\\\\\\"); gsub(/"/,"\\\\\\""); printf "%s\\"%s\\"",(NR>1?",":""),$0} END{printf "]"}\' "$1"; }',
     'for p in "$H"/* "$H"/.*; do',
     '  n=$(basename "$p"); [ "$n" = "." ] || [ "$n" = ".." ] && continue',
     '  [ -e "$p" ] || [ -L "$p" ] || continue',
     '  d=0',
-    '  if [ -L "$p" ]; then',
-    '    t=$(readlink "$p"); [ "$n" = "auth.json" ] && [ "$t" = "$A" ] && d=1',
+    '  if [ -L "$p" ]; then t=$(readlink "$p"); [ "$n" = "auth.json" ] && [ "$t" = "$A" ] && d=1',
     '  elif [ -S "$p" ]; then d=1',
     '  elif [ -f "$p" ]; then for b in $BASES; do [ "$n" = "$b" ] && d=1; done',
     '  elif [ -d "$p" ]; then',
@@ -280,21 +281,24 @@ export function buildRemoteTeardownScript(): string {
     '      for q in "$p"/* "$p"/.*; do',
     '        m=$(basename "$q"); [ "$m" = "." ] || [ "$m" = ".." ] && continue',
     '        [ -e "$q" ] || continue; any=1',
-    '        case "$m" in *.lock) [ -f "$q" ] && DISP="$DISP\n$q" || all=0;; *) all=0; RET="$RET\n$q";; esac',
+    '        case "$m" in *.lock) [ -f "$q" ] && echo "$q" >> "$D" || { all=0; echo "$q" >> "$K"; };; *) all=0; echo "$q" >> "$K";; esac',
     '      done',
     '      [ "$any" = 1 ] && [ "$all" = 1 ] && d=1',
     '    done',
     '  fi',
-    '  [ "$d" = 1 ] && DISP="$DISP\n$p" || RET="$RET\n$p"',
+    '  if [ "$d" = 1 ]; then echo "$p" >> "$D"; else echo "$p" >> "$K"; fi',
     'done',
-    // INTENT first, fsync'd, and NO removal if it cannot be written.
-    'mkdir -p "$(dirname "$R")" || { echo "CREW_INTENT_FAILED"; exit 9; }',
-    '{ echo "{\"state\":\"in-progress\",\"disposable\":[" ; echo "$DISP" | sed "/^$/d;s/.*/\"&\",/" ; echo "\"\"]}" ; } > "$R" || { echo "CREW_INTENT_FAILED"; exit 9; }',
+    // ⛔ INTENT, valid JSON, durable, BEFORE any removal.
+    'mkdir -p "$(dirname "$R")" 2>/dev/null || { echo CREW_INTENT_FAILED; exit 9; }',
+    'printf \'{"agent":"%s","state":"in-progress","manifest_scope":"root-metadata","disposable":%s,"retained":%s}\' "$AG" "$(jarr "$D")" "$(jarr "$K")" > "$R" 2>/dev/null || { echo CREW_INTENT_FAILED; exit 9; }',
+    'sync; [ -s "$R" ] || { echo CREW_INTENT_FAILED; exit 9; }',
+    'while IFS= read -r p; do echo "DISPOSE $p"; done < "$D"',
+    'while IFS= read -r p; do echo "RETAIN $p"; done < "$K"',
+    'sort -r "$D" | while IFS= read -r p; do rm -rf -- "$p" 2>/dev/null; if [ -e "$p" ] || [ -L "$p" ]; then echo "REMAIN $p"; echo "$p" >> "$V"; else echo "REMOVED $p"; fi; done',
+    // FINALIZE, valid JSON, after removal, reporting what ACTUALLY happened.
+    'printf \'{"agent":"%s","state":"complete","manifest_scope":"root-metadata","disposable":%s,"retained":%s,"failed":%s}\' "$AG" "$(jarr "$D")" "$(jarr "$K")" "$(jarr "$V")" > "$R" 2>/dev/null || echo CREW_FINALIZE_FAILED',
     'sync',
-    '[ -s "$R" ] || { echo "CREW_INTENT_FAILED"; exit 9; }',
-    'echo "$DISP" | sed "/^$/d" | while IFS= read -r p; do echo "DISPOSE $p"; done',
-    'echo "$RET" | sed "/^$/d" | while IFS= read -r p; do echo "RETAIN $p"; done',
-    'echo "$DISP" | sed "/^$/d" | sort -r | while IFS= read -r p; do rm -rf -- "$p" 2>/dev/null; [ -e "$p" ] || [ -L "$p" ] && echo "REMAIN $p" || echo "REMOVED $p"; done',
+    'rm -f "$D" "$K" "$V"',
     'echo CREW_TEARDOWN_DONE',
   ].join("\n");
 }
@@ -430,7 +434,7 @@ async function teardownRemote(
   const receipt = join(stateDir, ".stopped", `${agentId}.${stamp}.json`);
   const command =
     `sudo -n -u ${target.runAsUid} env CODEX_HOME='${paths.codexHome}' ` +
-    `AUTH_TARGET='${join(paths.home, ".codex", "auth.json")}' RECEIPT='${receipt}' ` +
+    `AUTH_TARGET='${join(paths.home, ".codex", "auth.json")}' RECEIPT='${receipt}' AGENT_ID='${agentId}' ` +
     `/bin/sh -c '${script.replace(/'/g, "'\\''")}'`;
   let out: string;
   try {
@@ -443,6 +447,9 @@ async function teardownRemote(
   if (out.includes("CREW_INTENT_FAILED")) {
     result.skipped = "intent-undurable";
     return;
+  }
+  if (out.includes("CREW_FINALIZE_FAILED")) {
+    result.failed.push({ path: receipt, error: "finalize-failed" });
   }
   if (!out.includes("CREW_TEARDOWN_DONE")) {
     result.failed.push({ path: paths.codexHome, error: `remote teardown did not complete: ${out.trim() || "(no output)"}` });
@@ -504,6 +511,9 @@ async function removeRemote(
     const error = e instanceof Error ? e.message : String(e);
     for (const path of targets) result.failed.push({ path, error });
     return;
+  }
+  if (out.includes("CREW_FINALIZE_FAILED")) {
+    result.failed.push({ path: receipt, error: "finalize-failed" });
   }
   if (!out.includes("CREW_TEARDOWN_DONE")) {
     for (const path of targets) {

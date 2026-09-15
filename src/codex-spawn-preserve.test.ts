@@ -166,5 +166,16 @@ describe("remote parity", () => {
     expect([...shDisposable].sort()).toEqual([...tsDisposable].sort());
     // and the credential target must still exist after the remote program ran
     expect(await readFile(join(f.home, ".codex", "auth.json"), "utf8")).toBe("CREDENTIAL-MUST-SURVIVE");
+
+    // ⛔ THE FV FOUND THIS: the remote path wrote a malformed INTENT and never finalized,
+    // so the primary (cross-uid) path left every receipt stuck at "in-progress" forever.
+    // The classification test above passed throughout — a suite can agree with itself.
+    const rec = JSON.parse(await readFile(join(f.stateDir, ".stopped", "agentx.remote.json"), "utf8"));
+    expect(rec.state).toBe("complete");
+    expect(rec.manifest_scope).toBe("root-metadata");
+    expect(Array.isArray(rec.disposable)).toBe(true);
+    expect(rec.disposable.length).toBeGreaterThan(0);
+    expect(rec.retained.some((p: string) => p.endsWith("thread_history_1.sqlite"))).toBe(true);
+    expect(rec.failed).toEqual([]);
   });
 });
