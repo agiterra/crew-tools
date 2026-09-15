@@ -1492,7 +1492,7 @@ describe("codex-spawn teardown (AGI-74)", () => {
     try { rmSync(fakeHome, { recursive: true, force: true }); } catch {}
   });
 
-  test("closeAgent removes the codex home + thread file for THAT agent only", async () => {
+  test("closeAgent removes only THIS agent scaffolding, retaining conversation state", async () => {
     const target = seedSpawn("galette");
     const sibling = seedSpawn("parrozzo");
     const persona = seedSpawn("fondant");
@@ -1502,8 +1502,12 @@ describe("codex-spawn teardown (AGI-74)", () => {
     process.env.HOME = fakeHome;
     await orch.closeAgent("galette", undefined, 250);
 
-    expect(existsSync(target.dir)).toBe(false);
-    expect(existsSync(target.thread)).toBe(false);
+    // PRESERVING TEARDOWN (2026-09-15): scaffolding goes, conversation state stays.
+    // These rows asserted whole-home removal, which destroyed an unpushed clone and
+    // 19.5 MB of thread history. The SCOPING intent below is unchanged.
+    expect(existsSync(join(target.dir, "config.toml"))).toBe(false);
+    expect(existsSync(join(target.dir, "sessions", "rollout.jsonl"))).toBe(true);
+    expect(existsSync(target.thread)).toBe(true);
     // Scoped: a live sibling and the persona's own home are untouched.
     expect(existsSync(sibling.dir)).toBe(true);
     expect(existsSync(sibling.thread)).toBe(true);
@@ -1511,7 +1515,7 @@ describe("codex-spawn teardown (AGI-74)", () => {
     expect(orch.store.getAgent("galette")).toBeNull();
   });
 
-  test("stopAgent (and therefore the idle reaper) removes them too", async () => {
+  test("stopAgent (and the idle reaper) removes scaffolding only, retaining conversation state", async () => {
     const target = seedSpawn("bavarois");
     const sibling = seedSpawn("kouign");
 
@@ -1520,8 +1524,9 @@ describe("codex-spawn teardown (AGI-74)", () => {
     process.env.HOME = fakeHome;
     await orch.stopAgent("bavarois");
 
-    expect(existsSync(target.dir)).toBe(false);
-    expect(existsSync(target.thread)).toBe(false);
+    expect(existsSync(join(target.dir, "config.toml"))).toBe(false);
+    expect(existsSync(join(target.dir, "sessions", "rollout.jsonl"))).toBe(true);
+    expect(existsSync(target.thread)).toBe(true);
     expect(existsSync(sibling.dir)).toBe(true);
   });
 
@@ -1550,7 +1555,7 @@ describe("codex-spawn teardown (AGI-74)", () => {
     expect(orch.store.getAgent("never-ran")).toBeNull();
   });
 
-  test("an unremovable home is logged loudly with the path and never blocks the close", async () => {
+  test("an unwritable spawn root fails CLOSED: nothing removed, said loudly, close unblocked", async () => {
     const stuck = seedSpawn("stuck");
     await orch.launchAgent({ env: { AGENT_ID: "stuck" }, runtime: "codex", projectDir: "/tmp/stuck" });
 
@@ -1567,10 +1572,14 @@ describe("codex-spawn teardown (AGI-74)", () => {
       chmodSync(spawnRoot, 0o700);
     }
 
+    // FAIL CLOSED: the INTENT receipt cannot be written into a 0500 spawn root, so
+    // NOTHING is removed and it is said out loud. Stronger than the old contract,
+    // which logged a failure only after deleting whatever it could.
     expect(existsSync(stuck.dir)).toBe(true);
-    const failure = logs.find((l) => l.includes("codex-spawn teardown FAILED"));
+    expect(existsSync(join(stuck.dir, "config.toml"))).toBe(true);
+    const failure = logs.find((l) => l.includes("INTENT receipt undurable"));
     expect(failure).toBeDefined();
-    expect(failure).toContain(stuck.dir);
+    expect(failure).toContain("NOTHING REMOVED");
     // The agent is still fully torn down — a leaked dir never keeps a row alive.
     expect(orch.store.getAgent("stuck")).toBeNull();
     expect(orch.store.getLatestTombstone("stuck")).not.toBeNull();
@@ -1584,8 +1593,9 @@ describe("codex-spawn teardown (AGI-74)", () => {
       runAsUid: "_ephemeral",
     });
     screenState.sshRunResult =
-      "PRE /Users/_ephemeral/.wire/codex-spawn/ephem\n" +
-      "PRE /Users/_ephemeral/.wire/codex-spawn/ephem.thread.json\n" +
+      "DISPOSE /Users/_ephemeral/.wire/codex-spawn/ephem/config.toml\n" +
+      "RETAIN /Users/_ephemeral/.wire/codex-spawn/ephem/sessions\n" +
+      "REMOVED /Users/_ephemeral/.wire/codex-spawn/ephem/config.toml\n" +
       "CREW_TEARDOWN_DONE\n";
 
     await orch.closeAgent("ephem", undefined, 250);
@@ -1593,9 +1603,13 @@ describe("codex-spawn teardown (AGI-74)", () => {
     const teardown = screenState.sshRunCalls.map((c) => c.command).find((c) => c.includes("codex-spawn"));
     expect(teardown).toBeDefined();
     expect(teardown).toContain("sudo -n -u _ephemeral");
-    expect(teardown).toContain("P1='/Users/_ephemeral/.wire/codex-spawn/ephem'");
-    expect(teardown).toContain("P2='/Users/_ephemeral/.wire/codex-spawn/ephem.thread.json'");
-    expect(teardown).not.toContain("*");
+    expect(teardown).toContain("CODEX_HOME='/Users/_ephemeral/.wire/codex-spawn/ephem'");
+    // NO-GLOB-TO-RM, the intent of the old not.toContain("*"): the script globs to
+    // ENUMERATE, but every removal takes ONE explicit path. Asserting that directly is
+    // stronger than asserting the command string contains no asterisk anywhere.
+    for (const line of teardown!.split("\n").filter((l) => l.includes("rm -rf"))) {
+      expect(line).toContain('rm -rf -- "$p"');
+    }
     expect(orch.store.getAgent("ephem")).toBeNull();
   });
 
