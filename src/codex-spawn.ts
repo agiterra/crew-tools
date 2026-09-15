@@ -305,13 +305,36 @@ export async function classifySpawnHome(codexHome: string, home: string): Promis
       continue;
     }
     if (kind === "dir" && LOCK_DIRS.includes(name)) {
+      // ⛔ N33 (review). This read `catch { /* unreadable: retain */ }`, and the retention was
+      // real but INCIDENTAL: readdir failed -> inner stayed [] -> `inner.length > 0` was false
+      // -> retained. Safe because a counter stayed at its seed, not because any rule said
+      // refuse. An ordinary `let allLocks = true;` refactor flipped the classification to
+      // DISPOSABLE — measured — and the contents then survived only because rm -rf could not
+      // recurse into a 0000 directory. THE FILESYSTEM REFUSED, NOT THE CODE, and no test in
+      // this suite would have noticed. The root loop learned this at N27; one level down, in
+      // the same function, it had not.
       let inner: string[] = [];
-      try { inner = await readdir(path); } catch { /* unreadable: retain */ }
+      try {
+        inner = await readdir(path);
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException)?.code;
+        // ENOENT: the lock dir vanished between the root readdir and now — a benign race.
+        if (code !== "ENOENT") throw new SpawnHomeUnreadable(codexHome, code, name);
+      }
+      // Reaching here means the directory WAS readable, so this now means exactly what it says:
+      // a lock directory with no entries has no locks to have been cleaned, and is not disposable.
       let allLocks = inner.length > 0;
       for (const ln of inner.sort()) {
         const lp = join(path, ln);
         let lst;
-        try { lst = await lstat(lp); } catch { allLocks = false; continue; }
+        try {
+          lst = await lstat(lp);
+        } catch (e) {
+          // Same rule as the root loop and the readdir above: only ENOENT is benign.
+          const code = (e as NodeJS.ErrnoException)?.code;
+          if (code !== "ENOENT") throw new SpawnHomeUnreadable(codexHome, code, `${name}/${ln}`);
+          allLocks = false; continue;
+        }
         if (lst.isFile() && ln.endsWith(".lock")) {
           out.push({ path: lp, kind: "file", size: lst.size, mode: lst.mode & 0o7777,
                      disposition: "disposable", reason: ".lock in a named lock directory" });
@@ -442,6 +465,10 @@ export function buildRemoteTeardownScript(): string {
     '  elif [ -d "$p" ]; then',
     '    for l in $LOCKS; do',
     '      [ "$n" = "$l" ] || continue',
+    // ⛔ N33 on the remote side. An unreadable lock dir globbed to nothing, so `any` stayed 0
+    // and `d` was never set — retained for the same incidental reason as the local seed. Make
+    // the refusal explicit, matching the root-level check and the local path.
+    '      ls -A "$p" >/dev/null 2>&1 || { echo CREW_HOME_UNREADABLE; echo "CREW_CODE EACCES"; echo "CREW_NOTE LOCK DIR UNREADABLE: $p for $AG — refusing; this is not \'no locks here\'."; exit 8; }',
     '      all=1; any=0',
     '      for q in "$p"/* "$p"/.*; do',
     '        m=$(basename "$q"); [ "$m" = "." ] || [ "$m" = ".." ] && continue',

@@ -1276,3 +1276,68 @@ describe("N31/N32 — skipped carries no free text, and both paths agree", () =>
     expect({ impl: "remote", skipped: remote.skipped }).toEqual({ impl: "remote", skipped: "home-unreadable:EACCES" });
   });
 });
+
+// ── N33 (review addendum at 6bb1c60) — an unreadable LOCK DIR is a refusal ────────────────
+// The rows the suite did not have. The reviewer grepped for lock × unread|chmod|0o000|0o400|
+// eacces and found nothing anywhere in crew-tools, which is why a one-token refactor
+// (`let allLocks = true;`) could turn an unreadable lock dir DISPOSABLE and pass CI. Measured
+// then: classification flipped to disposable, and the contents survived only because rm -rf
+// could not recurse into a 0000 directory — the filesystem refused, not the code.
+describe("N33 — an unreadable lock directory is 'I could not look', on both paths", () => {
+  const build = async (mode: number) => {
+    const home = await mkdtemp(join(tmpdir(), "n33-"));
+    const stateDir = join(home, ".wire", "codex-spawn");
+    const codexHome = join(stateDir, "agentx");
+    const lock = join(codexHome, "app-server-control");
+    await mkdir(lock, { recursive: true });
+    await mkdir(join(home, ".codex"), { recursive: true });
+    await writeFile(join(home, ".codex", "auth.json"), "CREDENTIAL-MUST-SURVIVE");
+    await writeFile(join(codexHome, "config.toml"), "regenerable");
+    await writeFile(join(lock, "IRREPLACEABLE.txt"), "USER CONTENT INSIDE A LOCK DIR");
+    await chmod(lock, mode);
+    return { home, codexHome, stateDir, lock } as Fx & { lock: string };
+  };
+
+  for (const [label, mode] of [["unreadable (0000)", 0o000], ["readable but not searchable (0400)", 0o400]] as const) {
+    test(`${label} lock dir -> BOTH implementations refuse, nothing removed`, async () => {
+      if (process.getuid?.() === 0) return;          // root ignores the mode
+
+      // ── LOCAL: the RESULT contract, not the classifier ──
+      const a = await build(mode);
+      const local = await removeCodexSpawnHome(
+        { agentId: "agentx", runtime: "codex", selfHome: a.home, env: { STATE_DIR: a.stateDir } },
+        { log: () => {} });
+      await chmod(a.lock, 0o755);
+      expect(local.skipped).toMatch(/^home-unreadable:/);
+      expect(local.removed).toEqual([]);
+      // ⛔ the refusal is TOTAL: config.toml is ordinary scaffolding and must survive too
+      expect(await alive(join(a.codexHome, "config.toml"))).toBe(true);
+      expect(await readFile(join(a.lock, "IRREPLACEABLE.txt"), "utf8")).toBe("USER CONTENT INSIDE A LOCK DIR");
+      let stopped: string[] = [];
+      try { stopped = await readdir(join(a.stateDir, ".stopped")); } catch { /* never created */ }
+      expect(stopped).toEqual([]);                   // no receipt may claim a completed stop
+
+      // ── REMOTE: same input, same answer ──
+      const b = await build(mode);
+      const p = Bun.spawnSync(["/bin/sh", "-c", buildRemoteTeardownScript()], {
+        env: { ...process.env, AGENT_ID: "agentx", CODEX_HOME: b.codexHome,
+               THREAD_PATH: join(b.stateDir, "agentx.thread.json"),
+               AUTH_TARGET: join(b.home, ".codex", "auth.json"),
+               RECEIPT: join(b.stateDir, ".stopped", "agentx.remote.json") } });
+      await chmod(b.lock, 0o755);
+      const lines = new TextDecoder().decode(p.stdout).split("\n").map((l) => l.trim());
+      expect(lines).toContain("CREW_HOME_UNREADABLE");
+      expect(lines).not.toContain("CREW_TEARDOWN_DONE");
+      expect(await readFile(join(b.lock, "IRREPLACEABLE.txt"), "utf8")).toBe("USER CONTENT INSIDE A LOCK DIR");
+    });
+  }
+
+  // ⛔ THE ACCEPT PATH, so the two rows above cannot pass by refusing everything: a READABLE
+  // lock dir holding only .lock files is still disposed, exactly as before.
+  test("a READABLE lock dir holding only locks is still disposed", async () => {
+    const f = await fixture();
+    const res = await runWith(f);
+    expect(res.skipped).toBeUndefined();
+    expect(res.removed.some((p) => p.endsWith("thread-writer-locks"))).toBe(true);
+  });
+});
