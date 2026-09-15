@@ -4,7 +4,23 @@ import { join } from "path";
 import { tmpdir } from "os";
 
 // Mock screen so runCli can construct Orchestrator without real screen ops.
+import * as __realScreen from "./screen";
+// ⛔ CROSS-FILE MOCK CONTAMINATION (CI, Bun 1.4.2; hypothesis from Brioche's source read,
+// reproduced locally). `mock.module` replaces the module PROCESS-WIDE for every later import.
+// This mock enumerated the handful of functions this file needs and omitted the rest — so once
+// this file had run, `screen.test.ts`'s `import { parseScreenList } from "./screen"` resolved
+// against the MOCK and failed with:
+//     SyntaxError: Export named 'parseScreenList' not found in module 'screen.ts'
+// ORDER-DEPENDENT, and therefore invisible until something changed the order — which adding a
+// large test file to this suite did. Measured: cli.test.ts then screen.test.ts -> 10 pass,
+// 1 fail, 1 error; screen.test.ts first -> 17 pass, 0 fail.
+// ⚠️ I had inferred "pre-existing, not mine" from the production files being untouched. That is
+// a NON-SEQUITUR: an unchanged production file does not rule out a SUITE INTEGRATION fault.
+// ⇒ SPREAD THE REAL MODULE and override only what this file mocks, so the mock is complete BY
+//   CONSTRUCTION and a new export can never be silently dropped again. Same rule as
+//   derive-the-list-never-duplicate-it: never hand-maintain a second copy of a surface.
 mock.module("./screen", () => ({
+  ...__realScreen,
   createSession: async (name: string) => ({ name, pid: 12345 }),
   listSessions: async () => [],
   getSessionPid: async () => null,

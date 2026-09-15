@@ -7,3 +7,30 @@ on:
 jobs:
   plugin-check:
     uses: agiterra/.github/.github/workflows/plugin-check.yml@main
+
+  # ⛔ N8 (PR 91 re-review). The suite and the typecheck both existed and NEITHER RAN IN CI —
+  # only the shared plugin-check did. A gate nobody runs is indistinguishable from one that
+  # does not exist, and the typecheck earned its place on its first run by finding a real
+  # defect in this PR's own F4 fix. Wire them, so they are green by evidence and not by
+  # assertion in a PR description.
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      # ⛔ AGENT_ID SCRUBBED ON PURPOSE. Review finding F1: the remote-parity test was green
+      # only because the author's shell exported AGENT_ID; the generated script runs `set -u`
+      # and exits before its first loop iteration without it. Green locally, red in CI — which
+      # is exactly why C1 stayed invisible. This env line is the acceptance check.
+      # ⛔ N15: `AGENT_ID: ""` DOES NOT SCRUB. `set -u` fires on UNSET, not empty — measured:
+      # env -u AGENT_ID -> "unbound variable", rc 127;  AGENT_ID="" -> runs clean, rc 0.
+      # So the env-block form let the generated script run with an empty-but-set AG, the parity
+      # test's assertions never check the agent field, and CI would have sailed past exactly the
+      # F1 regression this step exists to catch. A gate that cannot fail is decoration.
+      - name: Test suite (AGENT_ID genuinely unset)
+        run: env -u AGENT_ID bun test ./src/
+      - name: Typecheck
+        run: bash scripts/typecheck.sh

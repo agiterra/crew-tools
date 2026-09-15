@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect } from "bun:test";
 import { getClaudeCodeSessionId } from "./claude-session";
 import { mkdtempSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";

@@ -5,7 +5,6 @@
  * into the operations that MCP adapters expose as tools.
  */
 
-import { join } from "path";
 import { randomUUID } from "crypto";
 import {
   resolveDefaultDb,
@@ -13,12 +12,11 @@ import {
   type Agent,
   type Tab,
   type Pane,
-  type AgentTombstone,
   type Machine,
 } from "./store.js";
 import * as screen from "./screen.js";
 import type { TerminalBackend } from "./terminal.js";
-import { getLaunchCommand, RuntimeNotProvisionedError, type LaunchResolveOpts } from "./runtimes.js";
+import { getLaunchCommand, type LaunchResolveOpts } from "./runtimes.js";
 import { reconcile, formatReport } from "./reconciler.js";
 import { RealityLayer } from "./reality.js";
 import type { HealOpts, HealResult } from "./reality.js";
@@ -26,7 +24,7 @@ import { pickName, backgroundImagePath, loadTheme, updateTheme, listThemes } fro
 import { getClaudeCodeSessionId } from "./claude-session.js";
 import { assertClaudeCredentialLive } from "./credentials.js";
 import { buildConfigDirSetup } from "./config-dir.js";
-import { removeCodexSpawnHome } from "./codex-spawn.js";
+import { removeCodexSpawnHome, type CodexSpawnTeardownResult } from "./codex-spawn.js";
 
 /** The agent/lane id contract, enforced by launchAgent. Mirrored by wallet-browser-register.sh and lane-reap.sh. */
 export const AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -92,7 +90,19 @@ export type SpawnManifest = {
   run_as_uid?: string;
 };
 
+export type StopAgentResult = {
+  /** F4: teardown outcome; absent when the runtime has no codex spawn home. */
+  teardown?: { skipped?: string; removed: number; failed: Array<{ path: string; error: string }> };
+};
+
 export type CloseAgentResult = {
+  /**
+   * F4 (PR 91 review): teardown outcome, surfaced so a caller can see a fail-closed stop.
+   * Absent when the agent's runtime has no codex spawn home. `skipped` carries the reason the
+   * teardown declined to act (e.g. "intent-undurable", "home-unreadable"); `failed` names paths
+   * that could not be removed. A stop that removed nothing must not read as a clean stop.
+   */
+  teardown?: { skipped?: string; removed: number; failed: Array<{ path: string; error: string }> };
   /** True when close had to move past the graceful path and reap the screen. */
   fallbackUsed: boolean;
 };
@@ -1513,18 +1523,19 @@ export class Orchestrator {
     }
 
     await this.cleanupAuxSurface(agent.id, auxSurface);
-    await this.cleanupCodexSpawn(agent, target);
+    const teardown = await this.cleanupCodexSpawn(agent, target);
 
     this.store.tombstoneAgent(agent);
     this.store.deleteAgentByScreen(agent.screen_name);
-    return { fallbackUsed };
+    // F4: a stop that removed nothing must not read as a clean stop at the API boundary.
+    return { fallbackUsed, ...(teardown ? { teardown: { ...(teardown.skipped ? { skipped: teardown.skipped } : {}), removed: teardown.removed.length, failed: teardown.failed } } : {}) };
   }
 
   /**
    * Stop an agent — kills the screen session.
    * Accepts optional ccSessionId to target a specific instance during handoff.
    */
-  async stopAgent(id: string, ccSessionId?: string): Promise<void> {
+  async stopAgent(id: string, ccSessionId?: string): Promise<StopAgentResult> {
     let agent: Agent | null;
     if (ccSessionId) {
       agent = this.store.getAgentBySession(ccSessionId);
@@ -1575,10 +1586,13 @@ export class Orchestrator {
       );
     }
     await this.cleanupAuxSurface(agent.id, auxSurface);
-    await this.cleanupCodexSpawn(agent, target);
+    const teardown = await this.cleanupCodexSpawn(agent, target);
     // Leave a tombstone so agent_resume can reconstruct the spawn later.
     this.store.tombstoneAgent(agent);
     this.store.deleteAgentByScreen(agent.screen_name);
+    // F4: surface the teardown outcome. agent_stop previously returned success whether the
+    // teardown failed closed, finalize failed, or every removal errored.
+    return teardown ? { teardown: { ...(teardown.skipped ? { skipped: teardown.skipped } : {}), removed: teardown.removed.length, failed: teardown.failed } } : {};
   }
 
   /**
@@ -1599,28 +1613,98 @@ export class Orchestrator {
   }
 
   /**
-   * Remove the agent's per-agent CODEX_HOME and its `<id>.thread.json` (AGI-74).
+   * Remove the DISPOSABLE SCAFFOLDING from the agent's per-agent CODEX_HOME, and
+   * its `<id>.thread.json`.
+   *
+   * ⛔ THE NAME AND THE OLD DOCSTRING BOTH LIED, and the lie is the incident
+   * (ENG-4161). This has NOT removed the spawn home since the stop-preservation
+   * change: it removes only entries POSITIVELY IDENTIFIED as regenerable —
+   * the auth.json symlink (unlinked, never dereferenced), the socket, `*.lock`
+   * files in the three named lock dirs, and an exact list of regenerated
+   * basenames. Conversation state (`thread_history_1.sqlite` and its -wal/-shm),
+   * memories, queues, `cache/**`, `tmp/**`, and anything unrecognised are
+   * RETAINED. Unknown names from a future Codex release fail SAFE, i.e. retained.
+   * See docs/stop-preservation-spec-20260915.md; classification is in codex-spawn.ts.
    *
    * Shared by closeAgent, stopAgent and therefore the idle reaper (reap() ->
    * stopAgent). A claude-code agent has no such directory, so this is a silent
    * no-op for it; a missing directory is normal too (never-started spawn,
    * already-pruned home).
    *
-   * Scoped to THIS agent's two derived paths — see codex-spawn.ts for the
-   * no-glob rule and how CODEX_HOME resolves per spawn path (the dir lives in
-   * the HOME of the uid the agent ran as, i.e. /Users/<run_as_uid> for a
-   * cross-uid spawn). Failure is logged loudly with the path and never raised:
-   * a leaked 48 MB home must not keep a dead agent's row alive.
+   * ── RETENTION / STORAGE CONTRACT (review finding C4) ────────────────────────
+   * AGI-74 was a real disk-leak fix and this change REVERTS its mechanism. That
+   * is deliberate, and the cost is not hypothetical: measured 2026-09-15, spawn
+   * homes hold 305 MB (_ephemeral), 241 MB (brioche), 189 MB (vacherin), 97 MB
+   * (fondant) — ~832 MB across four uids. Stop no longer reclaims any of it.
+   *
+   * There is deliberately NO autonomous janitor to replace it. Reclamation is an
+   * OPERATOR action: `/opt/agiterra/bin/codex-spawn-prune.sh` (dry-run by default,
+   * `--apply` to act, refuses a root that is not a codex-spawn dir, keeps live
+   * agents). Verified 2026-09-15: it is not in any launchd plist, any uid's
+   * crontab, or the watch table, and this change does not schedule it.
+   *
+   * ⚠️ N3 (re-review): THIS PARAGRAPH USED TO SAY the prune script "still does a
+   * whole-home rm -rf … the sharp edge, not the safety net". That was TRUE WHEN
+   * WRITTEN and FALSE BY THE TIME IT SHIPPED — I reconciled the script hours later
+   * and never came back to the source that describes it. A stale true statement
+   * becomes a false one silently, and this is the second instance of that class in
+   * this PR. Current, verified state:
+   *
+   * codex-spawn-prune.sh now applies a CONTENT gate derived from this file's own
+   * DISPOSABLE_BASENAMES/LOCK_DIRS (read from the installed classifier, failing
+   * closed if unreadable or empty): a home is prunable only when every entry is
+   * positively identified as regenerable scaffolding. It refuses homes holding
+   * conversation state, unrecognised names, unreadable homes, unreadable lock
+   * dirs, and an auth.json symlink whose target is not the owner's credential; it
+   * never removes a `<id>.thread.json`; and it refuses `--apply` on an empty
+   * live-id list. Receipts in `.stopped/` hold a home on their own.
+   *
+   * ⚠️ IT IS STILL A SEPARATE IMPLEMENTATION OF THIS FILE'S RULE, IN SHELL. Data is
+   * derived, ALGORITHM parity is not established and must not be claimed; the gate
+   * is built so divergence costs a missed prune rather than a deletion, and the
+   * enumerated fail-closed cases carry controls. Full reconciliation remains
+   * follow-up.
+   *
+   * The principle the incident bought: AGENT DEATH IS NOT PROOF THAT ITS
+   * UNPUBLISHED WORK IS DISPOSABLE. Disk is cheaper than a lost thread.
+   *
+   * Scoped to THIS agent's derived paths — see codex-spawn.ts for the no-glob
+   * rule and how CODEX_HOME resolves per spawn path (the dir lives in the HOME
+   * of the uid the agent ran as, i.e. /Users/<run_as_uid> for a cross-uid
+   * spawn). Failure is logged loudly with the path and never raised.
    */
-  private async cleanupCodexSpawn(agent: Agent, target: screen.RemoteTarget | undefined): Promise<void> {
+  private async cleanupCodexSpawn(
+    agent: Agent,
+    target: screen.RemoteTarget | undefined,
+  ): Promise<CodexSpawnTeardownResult | null> {
     let manifest: SpawnManifest | null = null;
     try {
       manifest = agent.spawn_manifest ? (JSON.parse(agent.spawn_manifest) as SpawnManifest) : null;
     } catch {
       manifest = null;
     }
+    // ⛔ F4 (PR 91 review). This discarded the result entirely — skipped, failed and removed all
+    // dropped — so agent_stop/agent_close returned SUCCESS whether INTENT failed closed, finalize
+    // failed, or every removal errored. That is the same shape as the incident this change exists
+    // to fix: there, an INTENT was routed into a field with no executor; here, an OUTCOME is
+    // routed into a field with no reader. Return it so the RPC CAN surface it.
+    //
+    // ⛔ N2 (re-review): "CAN" IS DOING REAL WORK IN THAT SENTENCE, AND MY DISPOSITION
+    // CLAIMED MORE. The result now leaves this method, and it currently reaches NOTHING:
+    //   crew-service/src/methods.ts:849  `await orch.stopAgent(p.id);`  <- return discarded
+    //   crew-service/src/methods.ts:50   re-declares `stopAgent(id: string): Promise<void>`
+    //   agent_close reads only `fallbackUsed`; agent_stop sets outcome:"stopped" unconditionally
+    // crew-service keeps its OWN structural copy of this interface instead of importing it,
+    // so widening the return type here is invisible over there BY CONSTRUCTION — the same
+    // divergence-between-two-declarations shape as review finding C1, at the service
+    // boundary. A package-level test cannot prove this boundary and must not claim to.
+    // ⇒ Tracked as a ROLLOUT BLOCKER with companion wiring prepared (not deployed):
+    //   the companion patch lives OUTSIDE this repo (N17: `patches/…` does not resolve here) —
+    //   it is in the Fondant vault at patches/crew-service-f4-teardown-wiring/, mirrored into
+    //   the ENG-4161 incident directory. Until it lands, agent_stop/agent_close
+    //   still report success regardless of skipped/failed, and this comment is the warning.
     try {
-      await removeCodexSpawnHome({
+      return await removeCodexSpawnHome({
         agentId: agent.id,
         runtime: agent.runtime,
         runAsUid: target?.runAsUid ?? manifest?.run_as_uid,
@@ -1631,9 +1715,17 @@ export class Orchestrator {
       // removeCodexSpawnHome already swallows its own failures; this is the
       // belt-and-braces guard that keeps ANY surprise (a bad manifest, a
       // throwing mock) from blocking the close.
+      const error = e instanceof Error ? e.message : String(e);
       console.error(
-        `[crew] cleanupCodexSpawn: unexpected failure for agent '${agent.id}': ${e instanceof Error ? e.message : String(e)}`,
+        `[crew] cleanupCodexSpawn: unexpected failure for agent '${agent.id}': ${error}`,
       );
+      // ⛔ FOUND BY THE TYPECHECK ADDED FOR M4, in the F4 fix itself (TS2366: function lacks
+      // ending return statement). Falling out of this catch returns `undefined`, which the
+      // call sites treat exactly like "no teardown ran" — so an unexpected crash would be
+      // reported to the RPC as a clean no-op. That is F4's own defect one level up, and it
+      // is precisely the class M4 says goes unnoticed in a repo nothing typechecks.
+      return { removed: [], absent: [], failed: [{ path: "<cleanupCodexSpawn>", error }],
+               skipped: "unexpected-error" };
     }
   }
 

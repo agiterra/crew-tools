@@ -18,7 +18,11 @@ async function derivePublicKeyB64(privateKey: CryptoKey): Promise<string> {
 }
 
 export async function generateKeyPair(): Promise<KeyPair> {
-  const kp = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  // generateKey's signature is CryptoKey | CryptoKeyPair; "Ed25519" with these usages always
+  // yields a pair. Narrowed rather than asserted so a future algorithm change fails loudly here
+  // instead of at `kp.privateKey`. (Pre-existing; surfaced by the typecheck added for M4.)
+  const kp = (await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair;
+  if (!kp.privateKey) throw new Error("generateKey did not return a CryptoKeyPair for Ed25519");
   const publicKey = await derivePublicKeyB64(kp.privateKey);
   return { publicKey, privateKey: kp.privateKey };
 }
