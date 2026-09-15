@@ -316,10 +316,15 @@ function mutate(find: string, replace: string): string {
 // ---- the four mutants, TS side -----------------------------------------------------------
 
 /** Commit bf3fdb0 itself: the whole home is one disposable entry. This IS the incident. */
-const mutantWholeHome: Classifier = async (codexHome) => [
-  { path: codexHome, disposition: "disposable", reason: "MUTANT: whole-home removal",
-    kind: "dir", size: 0, mode: 0o700 },
-];
+// ⛔ After N10 added a local whole-home guard, a mutant naming the home itself is REFUSED —
+// which is correct, and would have made spec row 15 untestable if left that way. Row 15 is about
+// the AUDITOR catching whole-home destruction, so the mutant now expresses the same EFFECT the
+// way it can still reach: every root entry disposable. The guard gets its own row below.
+const mutantWholeHome: Classifier = async (codexHome, home) =>
+  (await classifySpawnHome(codexHome, home)).map((e) =>
+    dirname(e.path) === codexHome
+      ? { ...e, disposition: "disposable" as const, reason: "MUTANT: whole-home removal" }
+      : e);
 
 /** Revision 1 of the spec: an ALLOWLIST of what to keep. It named goals_1.sqlite (32 KB)
  *  and would have deleted thread_history_1.sqlite (19.5 MB). */
@@ -382,7 +387,20 @@ describe("spec rows 15-18 — mutant controls", () => {
     const f = await armed();
     await runWith(f, mutantWholeHome);
     expect(await failedRows(f)).toEqual(expect.arrayContaining([1, 4, 5, 6, 9, 10]));
-    expect(await alive(f.codexHome)).toBe(false);
+  });
+
+  // ⛔ N10: the guard itself, on the LOCAL path — the remote one has had a row since T4.
+  test("N10 TS: the home itself in the disposal set is REFUSED, nothing removed", async () => {
+    const f = await armed();
+    const res = await runWith(f, async (codexHome, home) => [
+      ...(await classifySpawnHome(codexHome, home)),
+      { path: codexHome, disposition: "disposable" as const, reason: "MUTANT: whole home",
+        kind: "dir" as const, size: 0, mode: 0o700 },
+    ]);
+    expect(res.skipped).toBe("whole-home-in-disposal-set");
+    expect(res.removed).toEqual([]);
+    expect(await alive(f.codexHome)).toBe(true);
+    expect(await failedRows(f)).toEqual([2]);   // refusal is TOTAL: even scaffolding stays
   });
 
   test("15 shell: whole-home mutant fails rows 1, 4, 5, 6, 9, 10", async () => {
@@ -776,5 +794,89 @@ describe("spec row 7 — stop then re-provision (Phase A: persistence, not conti
     expect(retained.some((p) => p.endsWith("thread_history_1.sqlite"))).toBe(true);
     expect(retained.some((p) => p.endsWith("/workspaces"))).toBe(true);
     expect(retained.length).toBeGreaterThan(3);
+  });
+});
+
+// ── N1 (re-review): the REMOTE path's failure contracts ───────────────────────────────────
+// F2, F3, C2 and C3 were fixed locally and NOT carried into the generated script. The remote
+// path is where the incident happened, so "fixed" that stops at the language boundary is the
+// same defect the first review named, one layer in. These rows are the boundary.
+describe("N1 — remote path failure contracts", () => {
+  const shellEnv = (f: Fx, over: Record<string, string> = {}) => ({
+    ...process.env, AGENT_ID: "agentx", CODEX_HOME: f.codexHome,
+    AUTH_TARGET: join(f.home, ".codex", "auth.json"),
+    RECEIPT: join(f.stateDir, ".stopped", "agentx.remote.json"), ...over,
+  });
+  const runSh = (f: Fx, script: string, over: Record<string, string> = {}) => {
+    const p = Bun.spawnSync(["/bin/sh", "-c", script], { env: shellEnv(f, over) });
+    return { out: new TextDecoder().decode(p.stdout), err: new TextDecoder().decode(p.stderr), code: p.exitCode };
+  };
+
+  test("C2 remote: an UNREADABLE home is refused, not read as empty", async () => {
+    if (process.getuid?.() === 0) return;              // root ignores the mode; skip honestly
+    const f = await fixture();
+    await chmod(f.codexHome, 0o000);
+    const r = runSh(f, buildRemoteTeardownScript());
+    await chmod(f.codexHome, 0o755);
+    expect(r.out).toContain("CREW_HOME_UNREADABLE");
+    expect(r.out).not.toContain("CREW_TEARDOWN_DONE");
+    expect(r.err).toContain("I could not look");
+    // nothing removed, and no receipt claiming completeness
+    expect(await alive(join(f.codexHome, "thread_history_1.sqlite"))).toBe(true);
+    expect(await alive(join(f.stateDir, ".stopped", "agentx.remote.json"))).toBe(false);
+  });
+
+  test("C3 remote: an ABSENT home completes and reports it as absent, not removed", async () => {
+    const f = await fixture();
+    const gone = join(f.stateDir, "never-existed");
+    const r = runSh(f, buildRemoteTeardownScript(), { CODEX_HOME: gone });
+    expect(r.out).toContain("CREW_TEARDOWN_DONE");
+    const rec = JSON.parse(await readFile(join(f.stateDir, ".stopped", "agentx.remote.json"), "utf8"));
+    expect(rec.state).toBe("complete");
+    expect(rec.absent).toContain(gone);
+    expect(rec.removed).toEqual([]);
+    expect(rec.disposable).toEqual([]);
+  });
+
+  test("F3 remote: a failing FINALIZE writes a finalize-failed receipt, never 'complete'", async () => {
+    const f = await fixture();
+    // force only the FINALIZE write to fail; INTENT already succeeded at $R
+    const script = mutate('rcpt complete "$REMOVEDLIST" "$R"',
+                          'rcpt complete "$REMOVEDLIST" "/nonexistent-dir-for-test/x"');
+    const r = runSh(f, script);
+    expect(r.out).toContain("CREW_FINALIZE_FAILED");
+    expect(r.err).toContain("Not reported as success");
+
+    // ⛔ F2 remote, the whole point: the durable INTENT is STILL INTACT and parses.
+    const intent = JSON.parse(await readFile(join(f.stateDir, ".stopped", "agentx.remote.json"), "utf8"));
+    expect(intent.state).toBe("in-progress");
+    expect(intent.retained.some((p: string) => p.endsWith("thread_history_1.sqlite"))).toBe(true);
+
+    const ff = JSON.parse(await readFile(join(f.stateDir, ".stopped", "agentx.remote.json.finalize-failed"), "utf8"));
+    expect(ff.state).toBe("finalize-failed");
+    expect(ff.removed.length).toBeGreaterThan(0);        // removal ALREADY RAN; say so
+    expect(ff.retained.some((p: string) => p.endsWith("thread_history_1.sqlite"))).toBe(true);
+  });
+
+  test("F3 remote: when the failure receipt ALSO cannot be written, it says so", async () => {
+    const f = await fixture();
+    let script = mutate('rcpt complete "$REMOVEDLIST" "$R"',
+                        'rcpt complete "$REMOVEDLIST" "/nonexistent-dir-for-test/x"');
+    script = script.replace('rcpt finalize-failed "$REMOVEDLIST" "$R.finalize-failed"',
+                            'rcpt finalize-failed "$REMOVEDLIST" "/nonexistent-dir-for-test/y"');
+    const r = runSh(f, script);
+    expect(r.out).toContain("CREW_FINALIZE_RECORD_FAILED");
+    expect(r.err).toContain("storage will not accept a failure record");
+    expect(r.err).toContain("INTENT is the only durable record");
+    const intent = JSON.parse(await readFile(join(f.stateDir, ".stopped", "agentx.remote.json"), "utf8"));
+    expect(intent.state).toBe("in-progress");           // intact, per F2
+  });
+
+  test("F2 remote: the receipt is written via temp+mv, never truncated in place", () => {
+    const script = buildRemoteTeardownScript();
+    expect(script).toContain('"$3.tmp"');
+    expect(script).toContain('mv -f "$3.tmp" "$3"');
+    // the old in-place form must not reappear
+    expect(script).not.toContain('> "$R" 2>/dev/null');
   });
 });

@@ -57,7 +57,24 @@ const SAFE_UID = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/;
 
 /** Directory name that must be the parent of anything we delete. */
 const SPAWN_PARENT = "codex-spawn";
-/** Any character that could break out of single-quoted shell interpolation, plus control chars. */
+/**
+ * Any character that could break out of single-quoted shell interpolation, plus control chars.
+ *
+ * ⚠️ N11 DISPOSITION (re-review): this is applied in resolveCodexSpawnPaths, so it refuses a
+ * path for the LOCAL teardown too, where no shell is involved and the characters are harmless.
+ * The reviewer is right that the hazard lives at the shell boundary and the check is therefore
+ * broader than the risk. KEPT AS IS, deliberately:
+ *   · the two paths must agree on what they will act on — a path the remote side refuses and
+ *     the local side accepts is a divergence between implementations, which is finding C1's
+ *     whole shape, and I am not introducing one to narrow a guard;
+ *   · the failure is LOUD and fail-safe: resolveCodexSpawnPaths returns null, the caller logs
+ *     "unsafe or unrecognised CODEX_HOME … remove it by hand if it exists" and sets
+ *     skipped:"unsafe-path". Nothing is removed and nothing is claimed.
+ * The cost is real and stated rather than hidden: a lane whose HOME legitimately contains one
+ * of these characters is never torn down automatically and accumulates. If that ever occurs in
+ * practice, the fix is to scope the check to the shell interpolation site AND prove both
+ * implementations still agree — not to relax it here.
+ */
 const SHELL_UNSAFE = /['"`$\\;&|<>(){}\n\r\t*?!#~\[\]]|[\x00-\x1f]/;
 
 /**
@@ -279,6 +296,17 @@ export async function writeReceipt(stateDir: string, agentId: string, stamp: str
     await fh.close();
   }
   await rename(tmp, path);
+  // ⛔ N9 (re-review). rename() is ATOMIC but not DURABLE: the fsync above flushes the file's
+  // CONTENT, while the directory entry that makes it visible under this name is a separate
+  // write. A power loss between them can leave the content safe and the name gone — which,
+  // for a receipt whose whole job is to survive a crash, is the failure mode it exists for.
+  // fsync the containing directory so the rename itself is on disk. Best effort: some
+  // filesystems refuse a directory fsync, and failing the receipt over that would be worse
+  // than the durability gap it closes.
+  try {
+    const dh = await fsOpen(dir, "r");
+    try { await dh.sync(); } finally { await dh.close(); }
+  } catch { /* directory fsync unsupported here; content is still fsynced */ }
   return path;
 }
 
@@ -296,10 +324,17 @@ export function buildRemoteTeardownScript(): string {
     'set -u',
     'H="$CODEX_HOME"; A="$AUTH_TARGET"; R="$RECEIPT"; AG="$AGENT_ID"',
     `BASES="${bases}"; LOCKS="${locks}"`,
-    'D=$(mktemp); K=$(mktemp); V=$(mktemp)',
+    'D=$(mktemp); K=$(mktemp); V=$(mktemp); B=$(mktemp)',
+    // ⛔ C2 ON THE REMOTE PATH (review N1). The root loop globs, and a glob over a home we
+    // cannot READ yields nothing — indistinguishable from a home that is genuinely empty.
+    // Locally this is SpawnHomeUnreadable; here it was silently "nothing to do, complete".
+    // ENOENT really is "already gone"; anything else is "I could not look".
+    'if [ ! -d "$H" ]; then echo "$H" >> "$B"; CREW_ABSENT=1; else CREW_ABSENT=0;',
+    '  ls -A "$H" >/dev/null 2>&1 || { echo CREW_HOME_UNREADABLE; echo "NOTHING REMOVED for $AG at $H — this is not \'already gone\', it is \'I could not look\'." >&2; exit 8; }',
+    'fi',
     // JSON array from a newline list — quoting handled once, in awk.
     'jarr() { awk \'BEGIN{printf "["} {gsub(/\\\\/,"\\\\\\\\"); gsub(/"/,"\\\\\\""); printf "%s\\"%s\\"",(NR>1?",":""),$0} END{printf "]"}\' "$1"; }',
-    'for p in "$H"/* "$H"/.*; do',
+    '[ "$CREW_ABSENT" = 1 ] || for p in "$H"/* "$H"/.*; do',
     '  n=$(basename "$p"); [ "$n" = "." ] || [ "$n" = ".." ] && continue',
     '  [ -e "$p" ] || [ -L "$p" ] || continue',
     '  d=0',
@@ -328,8 +363,12 @@ export function buildRemoteTeardownScript(): string {
     'done',
     // ⛔ INTENT, valid JSON, durable, BEFORE any removal.
     'mkdir -p "$(dirname "$R")" 2>/dev/null || { echo CREW_INTENT_FAILED; exit 9; }',
-    'printf \'{"agent":"%s","state":"in-progress","manifest_scope":"root-metadata","disposable":%s,"retained":%s}\' "$AG" "$(jarr "$D")" "$(jarr "$K")" > "$R" 2>/dev/null || { echo CREW_INTENT_FAILED; exit 9; }',
-    'sync; [ -s "$R" ] || { echo CREW_INTENT_FAILED; exit 9; }',
+    // ⛔ F2 ON THE REMOTE PATH (review N1). This wrote `> "$R"` directly, so FINALIZE
+    // truncated the durable INTENT in place: a crash inside that window left a receipt that
+    // PARSES and says nothing was at risk. Fixed locally, not carried here. Temp, sync, mv.
+    'rcpt() { printf \'{"agent":"%s","state":"%s","manifest_scope":"root-metadata","disposable":%s,"retained":%s,"removed":%s,"failed":%s,"absent":%s}\' "$AG" "$1" "$(jarr "$D")" "$(jarr "$K")" "$(jarr "$2")" "$(jarr "$V")" "$(jarr "$B")" > "$3.tmp" 2>/dev/null && sync && [ -s "$3.tmp" ] && mv -f "$3.tmp" "$3" 2>/dev/null; }',
+    'EMPTY=$(mktemp)',
+    'rcpt in-progress "$EMPTY" "$R" || { echo CREW_INTENT_FAILED; exit 9; }',
     'while IFS= read -r p; do echo "DISPOSE $p"; done < "$D"',
     'while IFS= read -r p; do echo "RETAIN $p"; done < "$K"',
     // Every removal takes ONE path from the disposal list, and the list never contains $H:
@@ -340,9 +379,23 @@ export function buildRemoteTeardownScript(): string {
     // property of today's code; an edit can change it, and that test is what notices.
     'sort -r "$D" | while IFS= read -r p; do [ "$p" = "$H" ] && continue; rm -rf -- "$p" 2>/dev/null; if [ -e "$p" ] || [ -L "$p" ]; then echo "REMAIN $p"; echo "$p" >> "$V"; else echo "REMOVED $p"; fi; done',
     // FINALIZE, valid JSON, after removal, reporting what ACTUALLY happened.
-    'printf \'{"agent":"%s","state":"complete","manifest_scope":"root-metadata","disposable":%s,"retained":%s,"failed":%s}\' "$AG" "$(jarr "$D")" "$(jarr "$K")" "$(jarr "$V")" > "$R" 2>/dev/null || echo CREW_FINALIZE_FAILED',
+    // ⛔ F3 ON THE REMOTE PATH (review N1). Finalize failure echoed a marker and left the
+    // receipt saying "in-progress" forever, with removal ALREADY RUN. The spec's row-13
+    // contract — an honest partial report, never success, never "everything retained" —
+    // existed only locally. Now: try finalize; on failure write finalize-failed beside it;
+    // if that also fails, say the storage will not accept a failure record.
+    'REMOVEDLIST=$(mktemp); grep -v -x -F -f "$V" "$D" 2>/dev/null > "$REMOVEDLIST" || cp "$D" "$REMOVEDLIST"',
+    'if ! rcpt complete "$REMOVEDLIST" "$R"; then',
+    '  echo CREW_FINALIZE_FAILED',
+    '  if rcpt finalize-failed "$REMOVEDLIST" "$R.finalize-failed"; then',
+    '    echo "FINALIZE receipt failed for $AG — removal ALREADY RAN; honest partial report written to $R.finalize-failed. Not reported as success." >&2',
+    '  else',
+    '    echo CREW_FINALIZE_RECORD_FAILED',
+    '    echo "Could not write the finalize-failed receipt either for $AG — storage will not accept a failure record. The in-progress INTENT is the only durable record and it is INTACT." >&2',
+    '  fi',
+    'fi',
     'sync',
-    'rm -f "$D" "$K" "$V"',
+    'rm -f "$D" "$K" "$V" "$B" "$EMPTY" "$REMOVEDLIST"',
     'echo CREW_TEARDOWN_DONE',
   ].join("\n");
 }
@@ -464,6 +517,17 @@ async function teardownLocal(
 
   const disposable = entries.filter((e) => e.disposition === "disposable");
   const retained = entries.filter((e) => e.disposition === "retained");
+  // ⛔ N10 (re-review). The remote path refuses a whole-home target (`[ "$p" = "$H" ]`); the
+  // LOCAL path had no equivalent, so the guard existed on one implementation only — the same
+  // asymmetry as C1 and N1, in the safety direction. bf3fdb0 removed the home itself; a
+  // classifier that returns the home as one disposable entry reproduces the incident exactly.
+  if (disposable.some((e) => e.path === paths.codexHome)) {
+    log(`[crew] codex-spawn: REFUSING a whole-home disposal target ${paths.codexHome} for ` +
+        `'${agentId}' — removal is per-entry by construction and the home is never an entry. ` +
+        `Nothing removed.`);
+    result.skipped = "whole-home-in-disposal-set";
+    return;
+  }
   // The thread pointer must never reach the disposal loop. Cheap, and it is the exact edit
   // a future refactor would make innocently.
   if (disposable.some((e) => e.path === paths.threadPath)) {

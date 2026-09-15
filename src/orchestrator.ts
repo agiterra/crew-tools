@@ -1643,11 +1643,27 @@ export class Orchestrator {
    * agents). Verified 2026-09-15: it is not in any launchd plist, any uid's
    * crontab, or the watch table, and this change does not schedule it.
    *
-   * ⚠️ AND IT DOES NOT HONOUR THIS SPEC. codex-spawn-prune.sh predates it and
-   * still does a whole-home `rm -rf` — run against a stopped-but-preserved home
-   * it destroys exactly what this code retained. Reconciling the two is
-   * follow-up work and it is NOT done; until then the prune script is the sharp
-   * edge, not the safety net.
+   * ⚠️ N3 (re-review): THIS PARAGRAPH USED TO SAY the prune script "still does a
+   * whole-home rm -rf … the sharp edge, not the safety net". That was TRUE WHEN
+   * WRITTEN and FALSE BY THE TIME IT SHIPPED — I reconciled the script hours later
+   * and never came back to the source that describes it. A stale true statement
+   * becomes a false one silently, and this is the second instance of that class in
+   * this PR. Current, verified state:
+   *
+   * codex-spawn-prune.sh now applies a CONTENT gate derived from this file's own
+   * DISPOSABLE_BASENAMES/LOCK_DIRS (read from the installed classifier, failing
+   * closed if unreadable or empty): a home is prunable only when every entry is
+   * positively identified as regenerable scaffolding. It refuses homes holding
+   * conversation state, unrecognised names, unreadable homes, unreadable lock
+   * dirs, and an auth.json symlink whose target is not the owner's credential; it
+   * never removes a `<id>.thread.json`; and it refuses `--apply` on an empty
+   * live-id list. Receipts in `.stopped/` hold a home on their own.
+   *
+   * ⚠️ IT IS STILL A SEPARATE IMPLEMENTATION OF THIS FILE'S RULE, IN SHELL. Data is
+   * derived, ALGORITHM parity is not established and must not be claimed; the gate
+   * is built so divergence costs a missed prune rather than a deletion, and the
+   * enumerated fail-closed cases carry controls. Full reconciliation remains
+   * follow-up.
    *
    * The principle the incident bought: AGENT DEATH IS NOT PROOF THAT ITS
    * UNPUBLISHED WORK IS DISPOSABLE. Disk is cheaper than a lost thread.
@@ -1671,7 +1687,20 @@ export class Orchestrator {
     // dropped — so agent_stop/agent_close returned SUCCESS whether INTENT failed closed, finalize
     // failed, or every removal errored. That is the same shape as the incident this change exists
     // to fix: there, an INTENT was routed into a field with no executor; here, an OUTCOME is
-    // routed into a field with no reader. Return it so the RPC can surface it.
+    // routed into a field with no reader. Return it so the RPC CAN surface it.
+    //
+    // ⛔ N2 (re-review): "CAN" IS DOING REAL WORK IN THAT SENTENCE, AND MY DISPOSITION
+    // CLAIMED MORE. The result now leaves this method, and it currently reaches NOTHING:
+    //   crew-service/src/methods.ts:849  `await orch.stopAgent(p.id);`  <- return discarded
+    //   crew-service/src/methods.ts:50   re-declares `stopAgent(id: string): Promise<void>`
+    //   agent_close reads only `fallbackUsed`; agent_stop sets outcome:"stopped" unconditionally
+    // crew-service keeps its OWN structural copy of this interface instead of importing it,
+    // so widening the return type here is invisible over there BY CONSTRUCTION — the same
+    // divergence-between-two-declarations shape as review finding C1, at the service
+    // boundary. A package-level test cannot prove this boundary and must not claim to.
+    // ⇒ Tracked as a ROLLOUT BLOCKER with companion wiring prepared (not deployed):
+    //   patches/crew-service-f4-teardown-wiring/ . Until that lands, agent_stop/agent_close
+    //   still report success regardless of skipped/failed, and this comment is the warning.
     try {
       return await removeCodexSpawnHome({
         agentId: agent.id,
