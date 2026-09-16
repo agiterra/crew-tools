@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach, afterAll, mock } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { execSync } from "child_process";
+import { readFileSync } from "node:fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import type { TerminalBackend } from "./terminal";
@@ -2528,4 +2529,32 @@ describe("P2 · the grace loop stops on an unobservable probe", () => {
     // early break. Generous bound so this cannot flake on a loaded machine.
     expect(Date.now() - started).toBeLessThan(5_000);
   });
+});
+
+test("R4 GUARD: resetScreenState covers EVERY declared screenState field", () => {
+  // ⛔ WHY A TEST AND NOT A CAREFUL LIST. The reset list has now drifted from the
+  // declared surface three separate times: afterAll once held 5 of 16; extracting the
+  // single list revealed `isAliveResult` was in NEITHER copy; and the re-review found
+  // afterAll had "gained a field it does not reset". Each time the fix was to look
+  // harder, and each time it drifted again on the next edit.
+  //
+  // A list that must match another list is not a discipline problem, it is a missing
+  // assertion. This reads both from the source and fails the moment they diverge, so
+  // adding a field to screenState without resetting it cannot ship.
+  const src = readFileSync(new URL("./orchestrator.test.ts", import.meta.url), "utf8");
+
+  const declStart = src.indexOf("const screenState = {");
+  expect(declStart).toBeGreaterThan(-1);
+  const decl = src.slice(declStart, src.indexOf("\n};", declStart));
+  const declared = [...decl.matchAll(/^  ([a-zA-Z][a-zA-Z0-9]*):/gm)].map((m) => m[1]);
+
+  const fnStart = src.indexOf("function resetScreenState(): void {");
+  expect(fnStart).toBeGreaterThan(-1);
+  const fn = src.slice(fnStart, src.indexOf("\n}", fnStart));
+  const reset = new Set([...fn.matchAll(/screenState\.([a-zA-Z][a-zA-Z0-9]*)/g)].map((m) => m[1]));
+
+  expect(declared.length).toBeGreaterThan(10); // the parse found a real declaration
+  const missing = declared.filter((f) => !reset.has(f));
+  expect({ missing, declared: declared.length, reset: reset.size })
+    .toEqual({ missing: [], declared: declared.length, reset: declared.length });
 });
