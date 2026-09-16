@@ -225,6 +225,25 @@ let orch: InstanceType<typeof Orchestrator>;
  * Called per-test AND at file scope: mock.module replaces ./screen PROCESS-WIDE, so
  * whatever the last test here leaves behind is still in effect for the NEXT FILE.
  */
+/**
+ * ⛔ CAPTURED AT MODULE SCOPE, BEFORE ANY beforeEach HAS RUN.
+ *
+ * The R4 guard below snapshots pristine values from HERE, not from inside the test.
+ * Snapshotting inside the test baselines on the POST-RESET state — which can only prove
+ * the reset is STABLE, never that it RESTORES anything. A reset that assigns the wrong
+ * value every single time is perfectly stable. (Found by the reviewer in their own
+ * prototype, then reproduced against mine: making resetScreenState assign
+ * `isAliveResult = true` left the suite at 138 pass / 0 fail.)
+ */
+function snapshotScreenState(): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(screenState as unknown as Record<string, unknown>)) {
+    out[k] = Array.isArray(v) ? [...v] : v && typeof v === "object" ? { ...v } : v;
+  }
+  return out;
+}
+const PRISTINE_SCREEN_STATE = snapshotScreenState();
+
 function resetScreenState(): void {
   // ⓘ isAliveResult was in NEITHER list when this was extracted — beforeEach never
   //   reset it (individual tests used `finally`), and the old afterAll DID. So the two
@@ -2530,36 +2549,30 @@ describe("P2 · the grace loop stops on an unobservable probe", () => {
   });
 });
 
-test("R4 GUARD: resetScreenState actually RESETS every declared screenState field", () => {
-  // ⛔ THIS IS THE THIRD VERSION, AND THE FIRST TWO WERE TEXTUAL. Both were wrong in a
-  // way worth recording, because the failure was in the APPROACH, not the patterns.
+test("R4 GUARD: resetScreenState RESTORES every declared field to its pristine value", () => {
+  // ⛔ FOURTH VERSION. The first three were each defeated, and the shape repeated:
+  //   v1  evidence = "the identifier appears somewhere" ....... 5 of 6 shapes evaded
+  //   v2  evidence = "an assignment is written" .............. declaration-side shapes
+  //                                                            still evaded; and `\s*=`
+  //                                                            matched the first `=` of
+  //                                                            `===`, so a COMPARISON
+  //                                                            satisfied the assignment
+  //                                                            requirement
+  //   v3  evidence = "a sentinel was overwritten" ............ proves the reset is
+  //                                                            STABLE, not that it
+  //                                                            RESTORES. Verified:
+  //                                                            making the reset assign
+  //                                                            `isAliveResult = true`
+  //                                                            passed 138/0.
   //
-  // v1 scanned the source: declared fields via /^  (\w+):/ and "reset" fields via any
-  // occurrence of /screenState\.(\w+)/. The independent reviewer probed it with six
-  // shapes and FIVE got past:
-  //   E0  declared, unreset, unmentioned .............. CAUGHT (so it was not vacuous)
-  //   E1  a COMMENT naming the field inside the fn .... EVADED
-  //   E2  the name in a STRING LITERAL ................ EVADED
-  //   E3  declared with an UNDERSCORE in the name ..... EVADED
-  //   E4  declared as a QUOTED KEY .................... EVADED
-  //   E5  declared at FOUR-SPACE indent ............... EVADED
-  //
-  // v2 fixed only E1/E2 by stripping comments and requiring an assignment. ⚠️ E3–E5 are
-  // the WORSE half and v2 did not touch them: there the guard never learns the field
-  // exists at all, so `declared.length` is wrong, `missing` is empty, and the assertion
-  // still BALANCES — a confident, arithmetically consistent "17 of 17" while an 18th
-  // field goes unreset. A sanity check on `declared.length` cannot help; it catches a
-  // wholesale parse failure, not one missed field.
-  //
-  // ⇒ v3 stops parsing text. `Object.keys(screenState)` IS the declared surface — no
-  //   regex can disagree with it — and dirtying every field then calling the real
-  //   `resetScreenState()` tests WHETHER THE RESET HAPPENED rather than whether the
-  //   name appears. It also needs no `readFileSync`, so it no longer depends on its own
-  //   source layout. Verified by the reviewer against all six shapes: every one caught.
+  // ⇒ Each fix closed the probed instance while the CLASS survived, because each new
+  //   evidence was still a proxy. v4 compares against values captured at MODULE SCOPE,
+  //   before any beforeEach ran — so the assertion is "the field is back to what it was",
+  //   which is the property itself rather than a stand-in for it.
   const SENTINEL = "__R4_SENTINEL__";
   const bag = screenState as unknown as Record<string, unknown>;
   const keys = Object.keys(bag);
-  expect(keys.length).toBeGreaterThan(10); // the surface is real, not an empty object
+  expect(keys.length).toBeGreaterThan(10);
 
   for (const k of keys) {
     const v = bag[k];
@@ -2570,11 +2583,19 @@ test("R4 GUARD: resetScreenState actually RESETS every declared screenState fiel
 
   resetScreenState();
 
-  const stillDirty = keys.filter((k) => {
-    const v = bag[k];
-    if (Array.isArray(v)) return v.includes(SENTINEL);
-    if (v && typeof v === "object") return SENTINEL in (v as Record<string, unknown>);
-    return v === SENTINEL;
-  });
-  expect({ stillDirty, checked: keys.length }).toEqual({ stillDirty: [], checked: keys.length });
+  const same = (a: unknown, b: unknown): boolean => {
+    if (Array.isArray(a) || Array.isArray(b)) {
+      return Array.isArray(a) && Array.isArray(b) && a.length === b.length &&
+        a.every((x, n) => x === b[n]);
+    }
+    if (a && b && typeof a === "object" && typeof b === "object") {
+      const ka = Object.keys(a as object), kb = Object.keys(b as object);
+      return ka.length === kb.length &&
+        ka.every((n) => (a as Record<string, unknown>)[n] === (b as Record<string, unknown>)[n]);
+    }
+    return Object.is(a, b);
+  };
+
+  const notRestored = keys.filter((k) => !same(bag[k], PRISTINE_SCREEN_STATE[k]));
+  expect({ notRestored, checked: keys.length }).toEqual({ notRestored: [], checked: keys.length });
 });
