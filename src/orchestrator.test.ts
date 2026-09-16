@@ -151,6 +151,10 @@ mock.module("./screen", () => ({
     screenState.remoteProbeFailure
       ? { ok: false as const, reason: screenState.remoteProbeFailure }
       : { ok: true as const, pid: screenState.remoteSessionPidResult },
+  isRemoteAliveChecked: async () =>
+    screenState.remoteProbeFailure
+      ? { ok: false as const, reason: screenState.remoteProbeFailure }
+      : { ok: true as const, alive: screenState.isAliveResult },
   pidLooksAlive: (pid: number) => screenState.pidLooksAliveResult ?? realPidLooksAlive(pid),
   pollRemoteSessionPid: async () => null,
   // Post-spawn verify chain (v2.26.0). Tests inject channelProbe/argvReader
@@ -2035,4 +2039,182 @@ describe("F5 · registration → consumer data flow (run_as_uid in the manifest)
     await orch.stopAgent("fondant");
     expect(screenState.sshRunCalls.filter((c) => (c.target as { runAsUid?: string })?.runAsUid).length).toBe(0);
   });
+});
+
+describe("N4 · an unobservable probe must not authorise a delete or a spawn", () => {
+  // ⛔ THE FAILURE THIS PREVENTS. A cross-uid liveness probe can fail — sudo refused,
+  // SCREENDIR unreadable — and the old boolean reported that as `false`, i.e. "not
+  // running". Both call sites below then DELETED the row. In resumeAgent's case it
+  // went further and resumed a SECOND INSTANCE against a live screen.
+  //
+  // Losing an agent row is not recoverable by any other path: registerAgent is
+  // self-registration, so no other process can put it back.
+  //
+  // ⓘ Nothing destructive runs here. Screen operations are mocked throughout, so a
+  // "spawn" would be a recorded createSession call, and we assert there is none.
+  function seedCrossUid(id = "ephemeral-lane") {
+    return orch.store.createAgent({
+      id,
+      display_name: "Ephemeral",
+      runtime: "claude-code",
+      screen_name: `wire-${id}`,
+      screen_pid: 4242,
+      cc_session_id: "sess-keep",
+      spawn_manifest: JSON.stringify({ run_as_uid: "_ephemeral", env: { A: "1" }, project_dir: "/opt/x", display_name: "E", runtime: "claude-code" }),
+    });
+  }
+
+  test("launchAgent ABORTS and preserves the row when liveness is UNKNOWN", async () => {
+    const before = seedCrossUid();
+    screenState.remoteProbeFailure = "sudo refused for uid '_ephemeral'";
+    createSessionCalls.length = 0;
+
+    await expect(orch.launchAgent({ env: { AGENT_ID: "ephemeral-lane", AGENT_NAME: "Ephemeral" } }))
+      .rejects.toThrow(/UNKNOWN, not disproved/);
+
+    const after = orch.store.getAgent("ephemeral-lane");
+    expect(after).not.toBeNull();
+    expect(after!.screen_name).toBe(before.screen_name);
+    expect(after!.cc_session_id).toBe("sess-keep");
+    expect(after!.spawn_manifest).toBe(before.spawn_manifest);
+    // ⇒ AND NOTHING WAS STARTED.
+    expect(createSessionCalls.length).toBe(0);
+  });
+
+  test("resumeAgent ABORTS and preserves the row when liveness is UNKNOWN", async () => {
+    const before = seedCrossUid();
+    screenState.remoteProbeFailure = "SCREENDIR unreadable for uid '_ephemeral'";
+    createSessionCalls.length = 0;
+
+    await expect(orch.resumeAgent({ id: "ephemeral-lane", projectDir: "/opt/x" }))
+      .rejects.toThrow(/UNKNOWN, not disproved/);
+
+    const after = orch.store.getAgent("ephemeral-lane");
+    expect(after).not.toBeNull();
+    expect(after!.spawn_manifest).toBe(before.spawn_manifest);
+    expect(createSessionCalls.length).toBe(0);
+  });
+
+  test("CONTROL: with an OBSERVABLE dead probe, launchAgent still prunes and spawns", async () => {
+    // Without this the two tests above would pass against a launchAgent that had
+    // simply stopped working. The uid path is identical; only observability differs.
+    seedCrossUid();
+    screenState.remoteProbeFailure = null;
+    screenState.isAliveResult = false; // observed, and genuinely not running
+    createSessionCalls.length = 0;
+
+    await orch.launchAgent({ env: { AGENT_ID: "ephemeral-lane", AGENT_NAME: "Ephemeral" } });
+    expect(createSessionCalls.length).toBeGreaterThan(0);
+  });
+
+  test("closeAgent does NOT certify a clean exit from an unobservable probe", async () => {
+    // ⛔ The third deletion-adjacent consumer. Here UNKNOWN must NOT abort — we are
+    // mid-teardown and abandoning it is worse — but it must not suppress the fallback
+    // either. `fallbackUsed:false` would mean "it exited cleanly on its own", which a
+    // probe that could not look has no standing to claim.
+    orch.store.createAgent({
+      id: "ephemeral-lane",
+      display_name: "Ephemeral",
+      runtime: "claude-code",
+      screen_name: "wire-ephemeral-lane",
+      screen_pid: 4242,
+      spawn_manifest: JSON.stringify({ run_as_uid: "_ephemeral", env: {}, project_dir: "/opt/x", display_name: "E", runtime: "claude-code" }),
+    });
+    screenState.remoteProbeFailure = "sudo refused for uid '_ephemeral'";
+    const r = await orch.closeAgent("ephemeral-lane", undefined, 250);
+    expect(r.fallbackUsed).toBe(true);
+  });
+
+  test("CONTROL: an OBSERVED clean exit does report fallbackUsed:false", async () => {
+    // Proves the assertion above discriminates rather than always reading true.
+    orch.store.createAgent({
+      id: "local-lane",
+      display_name: "Local",
+      runtime: "claude-code",
+      screen_name: "wire-local-lane",
+      screen_pid: 4242,
+      spawn_manifest: JSON.stringify({ env: {}, project_dir: "/opt/x", display_name: "L", runtime: "claude-code" }),
+    });
+    screenState.remoteProbeFailure = null;
+    screenState.isAliveResult = false; // observed, and genuinely gone
+    const r = await orch.closeAgent("local-lane", undefined, 250);
+    expect(r.fallbackUsed).toBe(false);
+  });
+
+  test("CONTROL: an OBSERVABLE live probe blocks a double resume with the running error", async () => {
+    seedCrossUid();
+    screenState.remoteProbeFailure = null;
+    screenState.isAliveResult = true;
+    await expect(orch.resumeAgent({ id: "ephemeral-lane", projectDir: "/opt/x" }))
+      .rejects.toThrow(/is already running/);
+    expect(orch.store.getAgent("ephemeral-lane")).not.toBeNull();
+  });
+});
+
+describe("N5 · the uid acceptance contract, stated rather than implied", () => {
+  // SAFE_UID replaced a local regex and the swap is NOT a pure tightening. These pin
+  // the contract in both directions so a future edit cannot widen or narrow it silently.
+  // ⓘ The policy is NOT changed here to make a review note go away — it is recorded.
+  const caller = JSON.stringify({ terminal_session_id: "iterm-session-9", screen_name: "wire-fondant", screen_pid: 31337, sty: "31337.wire-fondant" });
+  const reg = (runAsUid: unknown) =>
+    orch.registerAgent({ id: "fondant", displayName: "Fondant", callerSessionId: caller, runAsUid } as never);
+
+  function seed() {
+    orch.store.createAgent({ id: "fondant", display_name: "Fondant", runtime: "claude-code", screen_name: "wire-fondant", screen_pid: 1 });
+    screenState.remoteSessionPidResult = 31337;
+    screenState.pidLooksAliveResult = true;
+  }
+
+  test("an EMPTY uid is now REJECTED, where it used to fall through to the local path", () => {
+    // Deliberate behaviour change from the `!== undefined` guard: explicit over
+    // implicit. `runAsUid: ""` asked for a cross-uid registration and must not be
+    // silently downgraded to a same-uid one.
+    seed();
+    return expect(reg("")).rejects.toThrow(/invalid owning UID/);
+  });
+
+  test("ACCEPTED: dotted and numeric-leading uids (SAFE_UID admits both)", async () => {
+    seed();
+    await expect(reg("svc.worker")).resolves.toBeDefined();
+    orch.store.deleteAgentByScreen("wire-fondant");
+    seed();
+    // Numeric-leading is accepted and is NOT a root path: `sudo -u` resolves a bare
+    // `0` as a USER NAME; a numeric uid requires a `#` prefix. It yields a nonsense
+    // HOME rather than a dangerous one. Recorded so the widening is deliberate.
+    await expect(reg("0")).resolves.toBeDefined();
+  });
+
+  test("REJECTED: over-length, leading dash, slash, and shell metacharacters", async () => {
+    for (const bad of ["a".repeat(65), "-u", "a/b", "a;b", "a b", "a$b", "a`b", "a|b"]) {
+      seed();
+      await expect(reg(bad)).rejects.toThrow(/invalid owning UID/);
+      orch.store.deleteAgentByScreen("wire-fondant");
+    }
+  });
+
+  test("undefined still means same-uid, and is not rejected", async () => {
+    seed();
+    screenState.isAliveResult = true;
+    await expect(reg(undefined)).resolves.toBeDefined();
+  });
+});
+
+// ⛔ FILE-SCOPED RESET — beforeEach is NOT sufficient for these two.
+//
+// `mock.module("./screen", …)` replaces the module PROCESS-WIDE, so `screenState`
+// outlives this file. beforeEach clears the fields before each test HERE, but whatever
+// the LAST test leaves behind is still in effect when the NEXT FILE runs — and
+// screen.test.ts imports the mocked module and asserts on the REAL pidLooksAlive.
+//
+// Measured, not theorised: with `pidLooksAliveResult` left `true` by the final test in
+// this file, `pidLooksAlive > a reaped process is provably dead (ESRCH)` fails in
+// screen.test.ts, and mock-isolation.test.ts catches it as an ORDER failure. The
+// reviewer called this leak "latent, not live"; adding tests that set the field made it
+// live. The scope of the reset has to match the scope of the leak.
+afterAll(() => {
+  screenState.pidLooksAliveResult = null;
+  screenState.remoteProbeFailure = null;
+  screenState.remoteSessionPidResult = null;
+  screenState.isAttachedResult = false;
+  screenState.isAliveResult = false;
 });

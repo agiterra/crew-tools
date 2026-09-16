@@ -784,9 +784,22 @@ export class Orchestrator {
   }
 
   /** Target-aware screen liveness for an agent row. */
-  private async agentScreenAlive(agent: { screen_name: string; spawn_manifest: string | null; machine_name: string | null }): Promise<boolean> {
+  /**
+   * `agentScreenAlive`, propagating UNKNOWN rather than folding it to a boolean.
+   *
+   * ⛔ Every caller whose next step DELETES A ROW or SPAWNS A PROCESS must use this.
+   * A cross-uid probe can fail (sudo refused, SCREENDIR unreadable) and the old
+   * boolean reported that as `false` — "the session is not running" — so the caller
+   * pruned a LIVE row and carried on. Losing an agent row is not recoverable by any
+   * other path: registerAgent is self-registration, so no other process can put it
+   * back.
+   */
+  private async agentScreenAliveChecked(
+    agent: { screen_name: string; spawn_manifest: string | null; machine_name: string | null },
+  ): Promise<{ ok: true; alive: boolean } | { ok: false; reason: string }> {
     const target = this.targetFor(agent);
-    return target ? screen.isRemoteAlive(agent.screen_name, target) : screen.isAlive(agent.screen_name);
+    if (!target) return { ok: true, alive: await screen.isAlive(agent.screen_name) };
+    return screen.isRemoteAliveChecked(agent.screen_name, target);
   }
 
   /** Runtimes whose normal shutdown is a typed slash command in the TUI. */
@@ -800,9 +813,19 @@ export class Orchestrator {
     target: screen.RemoteTarget | undefined,
     timeoutMs: number,
   ): Promise<number> {
-    return target
-      ? screen.terminateRemoteSessionTree(agent.screen_name, target, timeoutMs)
-      : screen.terminateSessionTree(agent.screen_name, timeoutMs);
+    if (!target) return screen.terminateSessionTree(agent.screen_name, timeoutMs);
+    try {
+      return await screen.terminateRemoteSessionTree(agent.screen_name, target, timeoutMs);
+    } catch (e) {
+      if (!(e instanceof screen.ScreenProbeUnavailable)) throw e;
+      // ⛔ FAIL CLOSED, and do not abort the teardown. "Unknown survivors" must not
+      // become "zero survivors" — report one so the caller escalates to the hard reap.
+      console.error(
+        `[crew] terminateAgentTree: ${e.reason} for '${agent.screen_name}' — survivor count is ` +
+        `UNKNOWN; reporting a survivor so escalation proceeds rather than certifying a clean term`,
+      );
+      return 1;
+    }
   }
 
   /** Reap the runtime process group, then quit the screen wrapper. */
@@ -894,8 +917,18 @@ export class Orchestrator {
     // Check for existing agent with the same ID
     const existing = this.store.getAgent(id);
     if (existing) {
-      const alive = await this.agentScreenAlive(existing);
-      if (alive) {
+      // ⛔ UNKNOWN ABORTS — before the delete below AND before any spawn. A probe that
+      // could not look must not authorise pruning a row that may be live, nor a second
+      // process against a screen that may already be running.
+      const probe = await this.agentScreenAliveChecked(existing);
+      if (!probe.ok) {
+        throw new Error(
+          `launchAgent: could not observe the screen namespace for '${id}' (${probe.reason}). ` +
+          `Liveness is UNKNOWN, not disproved — refusing to prune the existing row or spawn ` +
+          `alongside it. The row is unchanged and nothing was started.`,
+        );
+      }
+      if (probe.alive) {
         // During handoff, the old agent is still running.
         // Use a suffixed screen name to avoid collision.
         screenName = `${SCREEN_PREFIX}${id}-${Date.now()}`;
@@ -1174,8 +1207,18 @@ export class Orchestrator {
     // Refuse to double-resume
     const existing = this.store.getAgent(opts.id);
     if (existing) {
-      const alive = await this.agentScreenAlive(existing);
-      if (alive) {
+      // ⛔ UNKNOWN ABORTS. This guard's failure mode is the worst of the three: a
+      // probe failure used to read as "not running", so the live row was pruned and a
+      // SECOND INSTANCE was resumed against a live screen.
+      const probe = await this.agentScreenAliveChecked(existing);
+      if (!probe.ok) {
+        throw new Error(
+          `resumeAgent: could not observe the screen namespace for '${opts.id}' (${probe.reason}). ` +
+          `Liveness is UNKNOWN, not disproved — refusing to prune the row or resume a second ` +
+          `instance. The row is unchanged and nothing was started.`,
+        );
+      }
+      if (probe.alive) {
         throw new Error(
           `resumeAgent: agent '${opts.id}' is already running (screen '${existing.screen_name}'). ` +
           `Stop it first with agent_stop or use agent_attach to view it.`,
@@ -1463,6 +1506,13 @@ export class Orchestrator {
           `own screen session, not yours.`,
         );
       }
+      // ⛔ N1 — THIS GUARANTEE IS COUPLED TO THE PANE GUARD ABOVE. "The row is
+      // unchanged" holds only because no EARLIER side effect is possible: runAsUid set
+      // ⇒ registerTarget set ⇒ `attached` false ⇒ the pane auto-link block is skipped,
+      // so autoRegisterPane never writes a profile file or a pane row before this
+      // refusal. Relax `!registerTarget &&` on pane-shaped reasoning alone and a
+      // malformed-manifest cross-uid registration starts leaving artefacts behind.
+      //
       // ⛔ F1: PREPARE EVERYTHING THAT CAN FAIL **BEFORE** THE FIRST WRITE.
       // Previously the pid and runtime updates were committed and then the manifest
       // parse threw, leaving the row in a state no successful path produces: new pid,
@@ -1476,6 +1526,12 @@ export class Orchestrator {
 
       // ---- from here nothing throws; the row moves or it does not ----
       this.store.updateAgentPid(existingByScreen.id, screenPid);
+      // ⚠️ N6 — ORDER IS LOAD-BEARING, and the method name understates what it does.
+      // `updateAgentRuntime` promises one column and mutates three: it also NULLs
+      // cc_session_id when the new runtime is not claude-code, and bumps last_seen.
+      // It must run BEFORE the guarded cc-session write below, so that a move away
+      // from claude-code clears the stale id and the guard then declines to rewrite
+      // it. Reordering these two silently resurrects a dead session id.
       if (opts.runtime) this.store.updateAgentRuntime(existingByScreen.id, opts.runtime);
       if (nextManifest !== undefined) this.store.updateAgentManifest(existingByScreen.id, nextManifest);
       // F8: a supplied cc_session_id that is dropped must leave a record. The id itself
@@ -1577,13 +1633,25 @@ export class Orchestrator {
       // Wait for the runtime to exit on its own. Polls every 250ms.
       const deadline = Date.now() + timeoutMs;
       let aliveAfterGrace = true;
+      // ⛔ UNKNOWN STAYS ALIVE here rather than aborting: we are mid-teardown, and
+      // abandoning it would be worse than escalating. But an unobservable namespace
+      // must NEVER certify "it exited cleanly" — that would suppress the fallback.
+      const graceProbe = async (): Promise<boolean> => {
+        const probe = await this.agentScreenAliveChecked(agent);
+        if (probe.ok) return probe.alive;
+        console.error(
+          `[crew] closeAgent: ${probe.reason} for '${agent.id}' — treating as STILL ALIVE ` +
+          `and escalating, because a clean exit cannot be certified by a probe that could not look`,
+        );
+        return true;
+      };
       while (Date.now() < deadline) {
-        aliveAfterGrace = await this.agentScreenAlive(agent);
+        aliveAfterGrace = await graceProbe();
         if (!aliveAfterGrace) break;
         await new Promise((r) => setTimeout(r, 250));
       }
       if (aliveAfterGrace) {
-        aliveAfterGrace = await this.agentScreenAlive(agent);
+        aliveAfterGrace = await graceProbe();
       }
       fallbackUsed = aliveAfterGrace;
     } else {
