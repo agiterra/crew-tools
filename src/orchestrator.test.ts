@@ -2550,8 +2550,24 @@ test("R4 GUARD: resetScreenState covers EVERY declared screenState field", () =>
 
   const fnStart = src.indexOf("function resetScreenState(): void {");
   expect(fnStart).toBeGreaterThan(-1);
-  const fn = src.slice(fnStart, src.indexOf("\n}", fnStart));
-  const reset = new Set([...fn.matchAll(/screenState\.([a-zA-Z][a-zA-Z0-9]*)/g)].map((m) => m[1]));
+  const fnRaw = src.slice(fnStart, src.indexOf("\n}", fnStart));
+
+  // ⛔ STRIP COMMENTS, THEN REQUIRE AN ASSIGNMENT — not a mention.
+  //
+  // The first version of this guard scanned the raw function text for
+  // /screenState\.(\w+)/ and counted any occurrence as "reset". VERIFIED by probe on a
+  // copy of the frozen tree: delete `screenState.isAliveResult = false;` and leave a
+  // comment reading "screenState.isAliveResult is handled by each test's finally
+  // block", and the suite reports 138 pass / 0 fail. The field is genuinely not reset
+  // and the guard that exists to catch exactly that says green.
+  //
+  // ⇒ A guard whose evidence is "the identifier appears somewhere" is satisfied by
+  //   talking about the thing instead of doing it — and a comment explaining why a
+  //   field does not need resetting is the single most likely text to appear here.
+  const fn = fnRaw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  const reset = new Set(
+    [...fn.matchAll(/screenState\.([a-zA-Z][a-zA-Z0-9]*)(?:\.[a-zA-Z]+)?\s*=/g)].map((m) => m[1]),
+  );
 
   expect(declared.length).toBeGreaterThan(10); // the parse found a real declaration
   const missing = declared.filter((f) => !reset.has(f));
