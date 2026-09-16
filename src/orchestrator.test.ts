@@ -1,7 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach, afterAll, mock } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { execSync } from "child_process";
-import { readFileSync } from "node:fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import type { TerminalBackend } from "./terminal";
@@ -2531,46 +2530,51 @@ describe("P2 · the grace loop stops on an unobservable probe", () => {
   });
 });
 
-test("R4 GUARD: resetScreenState covers EVERY declared screenState field", () => {
-  // ⛔ WHY A TEST AND NOT A CAREFUL LIST. The reset list has now drifted from the
-  // declared surface three separate times: afterAll once held 5 of 16; extracting the
-  // single list revealed `isAliveResult` was in NEITHER copy; and the re-review found
-  // afterAll had "gained a field it does not reset". Each time the fix was to look
-  // harder, and each time it drifted again on the next edit.
+test("R4 GUARD: resetScreenState actually RESETS every declared screenState field", () => {
+  // ⛔ THIS IS THE THIRD VERSION, AND THE FIRST TWO WERE TEXTUAL. Both were wrong in a
+  // way worth recording, because the failure was in the APPROACH, not the patterns.
   //
-  // A list that must match another list is not a discipline problem, it is a missing
-  // assertion. This reads both from the source and fails the moment they diverge, so
-  // adding a field to screenState without resetting it cannot ship.
-  const src = readFileSync(new URL("./orchestrator.test.ts", import.meta.url), "utf8");
-
-  const declStart = src.indexOf("const screenState = {");
-  expect(declStart).toBeGreaterThan(-1);
-  const decl = src.slice(declStart, src.indexOf("\n};", declStart));
-  const declared = [...decl.matchAll(/^  ([a-zA-Z][a-zA-Z0-9]*):/gm)].map((m) => m[1]);
-
-  const fnStart = src.indexOf("function resetScreenState(): void {");
-  expect(fnStart).toBeGreaterThan(-1);
-  const fnRaw = src.slice(fnStart, src.indexOf("\n}", fnStart));
-
-  // ⛔ STRIP COMMENTS, THEN REQUIRE AN ASSIGNMENT — not a mention.
+  // v1 scanned the source: declared fields via /^  (\w+):/ and "reset" fields via any
+  // occurrence of /screenState\.(\w+)/. The independent reviewer probed it with six
+  // shapes and FIVE got past:
+  //   E0  declared, unreset, unmentioned .............. CAUGHT (so it was not vacuous)
+  //   E1  a COMMENT naming the field inside the fn .... EVADED
+  //   E2  the name in a STRING LITERAL ................ EVADED
+  //   E3  declared with an UNDERSCORE in the name ..... EVADED
+  //   E4  declared as a QUOTED KEY .................... EVADED
+  //   E5  declared at FOUR-SPACE indent ............... EVADED
   //
-  // The first version of this guard scanned the raw function text for
-  // /screenState\.(\w+)/ and counted any occurrence as "reset". VERIFIED by probe on a
-  // copy of the frozen tree: delete `screenState.isAliveResult = false;` and leave a
-  // comment reading "screenState.isAliveResult is handled by each test's finally
-  // block", and the suite reports 138 pass / 0 fail. The field is genuinely not reset
-  // and the guard that exists to catch exactly that says green.
+  // v2 fixed only E1/E2 by stripping comments and requiring an assignment. ⚠️ E3–E5 are
+  // the WORSE half and v2 did not touch them: there the guard never learns the field
+  // exists at all, so `declared.length` is wrong, `missing` is empty, and the assertion
+  // still BALANCES — a confident, arithmetically consistent "17 of 17" while an 18th
+  // field goes unreset. A sanity check on `declared.length` cannot help; it catches a
+  // wholesale parse failure, not one missed field.
   //
-  // ⇒ A guard whose evidence is "the identifier appears somewhere" is satisfied by
-  //   talking about the thing instead of doing it — and a comment explaining why a
-  //   field does not need resetting is the single most likely text to appear here.
-  const fn = fnRaw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
-  const reset = new Set(
-    [...fn.matchAll(/screenState\.([a-zA-Z][a-zA-Z0-9]*)(?:\.[a-zA-Z]+)?\s*=/g)].map((m) => m[1]),
-  );
+  // ⇒ v3 stops parsing text. `Object.keys(screenState)` IS the declared surface — no
+  //   regex can disagree with it — and dirtying every field then calling the real
+  //   `resetScreenState()` tests WHETHER THE RESET HAPPENED rather than whether the
+  //   name appears. It also needs no `readFileSync`, so it no longer depends on its own
+  //   source layout. Verified by the reviewer against all six shapes: every one caught.
+  const SENTINEL = "__R4_SENTINEL__";
+  const bag = screenState as unknown as Record<string, unknown>;
+  const keys = Object.keys(bag);
+  expect(keys.length).toBeGreaterThan(10); // the surface is real, not an empty object
 
-  expect(declared.length).toBeGreaterThan(10); // the parse found a real declaration
-  const missing = declared.filter((f) => !reset.has(f));
-  expect({ missing, declared: declared.length, reset: reset.size })
-    .toEqual({ missing: [], declared: declared.length, reset: declared.length });
+  for (const k of keys) {
+    const v = bag[k];
+    if (Array.isArray(v)) v.push(SENTINEL);
+    else if (v && typeof v === "object") (v as Record<string, unknown>)[SENTINEL] = 1;
+    else bag[k] = SENTINEL;
+  }
+
+  resetScreenState();
+
+  const stillDirty = keys.filter((k) => {
+    const v = bag[k];
+    if (Array.isArray(v)) return v.includes(SENTINEL);
+    if (v && typeof v === "object") return SENTINEL in (v as Record<string, unknown>);
+    return v === SENTINEL;
+  });
+  expect({ stillDirty, checked: keys.length }).toEqual({ stillDirty: [], checked: keys.length });
 });
