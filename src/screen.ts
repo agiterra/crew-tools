@@ -295,7 +295,16 @@ export async function terminateRemoteSessionTree(
   return terminateTree(pid, `sudo -n -u ${t.runAsUid}`, timeoutMs, (cmd) => sshRun(t, cmd));
 }
 
-/** PID of a named screen session on a remote host, or null. */
+/**
+ * PID of a named screen session on a remote host, or null.
+ *
+ * @deprecated ⛔ RETURNS `null` FOR BOTH "no such session" AND "I could not look".
+ * That conflation is the defect `getRemoteSessionPidChecked` exists to eliminate — a
+ * failed probe reported as absence is what lets a caller delete a live row. No
+ * production code in this repo calls this any more, but it remains exported through
+ * `index.ts`, so an out-of-repo consumer can still reach it, and it sits next to a
+ * longer-named function that is the correct one. Use `getRemoteSessionPidChecked`.
+ */
 export async function getRemoteSessionPid(name: string, t: RemoteTarget): Promise<number | null> {
   const out = await sshRun(t, `${remoteScreen(t)} -ls`);
   for (const line of out.split("\n")) {
@@ -332,6 +341,16 @@ export class ScreenProbeUnavailable extends Error {
  * ⓘ Exit status is NOT the discriminator: `screen -ls` exits 1 for a legitimately
  * EMPTY list and prints `No Sockets found …` to STDOUT (observed on 4.00.03 and
  * 5.0.1). So "rc != 0" would classify every empty namespace as unreadable.
+ *
+ * ⚠️ KNOWN GAP, MEASURED: a NONEXISTENT SCREENDIR also prints `No Sockets found …` to
+ * stdout, so a directory screen could not read classifies as ABSENT, not unobservable —
+ * the exact conflation this exists to prevent, arriving through a door the fixtures do
+ * not model. It is bounded: the ok/not-ok decision reads STDOUT ONLY, so the synthetic
+ * stderr fixtures pin the category STRING, not the classification.
+ *
+ * ⚠️ PRECONDITION: this assumes ENGLISH screen output. The locale that guarantees it
+ * (`LANG`/`LC_ALL=en_US.UTF-8`) is pinned by `remoteScreen`, i.e. by the CALLER — not
+ * here. A caller that builds its own command without that env breaks this silently.
  */
 export function classifyRemotePidProbe(r: SshRunResult, name: string, runAsUid: string): RemotePidProbe {
   const looksLikeScreenOutput = /No Sockets found|Sockets? in |^\t\d+\./m.test(r.stdout);

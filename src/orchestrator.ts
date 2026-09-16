@@ -818,11 +818,22 @@ export class Orchestrator {
       return await screen.terminateRemoteSessionTree(agent.screen_name, target, timeoutMs);
     } catch (e) {
       if (!(e instanceof screen.ScreenProbeUnavailable)) throw e;
-      // ⛔ FAIL CLOSED, and do not abort the teardown. "Unknown survivors" must not
-      // become "zero survivors" — report one so the caller escalates to the hard reap.
+      // ⛔ FAIL CLOSED: "unknown survivors" must never become "zero survivors".
+      //
+      // ⚠️ AND BE HONEST ABOUT WHAT THE 1 BUYS. An earlier version of this comment said
+      // "so escalation proceeds", which overstated it. The escalation this triggers is
+      // killAgentSession → killRemoteSession → requireObserved, which probes the SAME
+      // name under the SAME target. For a PERSISTENT cause — a missing NOPASSWD grant,
+      // an unreadable SCREENDIR — that throws one line later and this return value never
+      // mattered. The 1 is consequential only for a TRANSIENT failure that clears between
+      // the two probes, e.g. a sudo timestamp refreshing.
+      //
+      // It still must not be 0: 0 is the value that certifies a clean term, and the next
+      // person to make killRemoteSession stop throwing would silently turn it into one.
       console.error(
         `[crew] terminateAgentTree: ${e.reason} for '${agent.screen_name}' — survivor count is ` +
-        `UNKNOWN; reporting a survivor so escalation proceeds rather than certifying a clean term`,
+        `UNKNOWN, so a clean term is NOT certified. The hard reap that follows will itself ` +
+        `refuse on the same unobservable namespace unless the failure was transient.`,
       );
       return 1;
     }
@@ -1636,9 +1647,16 @@ export class Orchestrator {
       // ⛔ UNKNOWN STAYS ALIVE here rather than aborting: we are mid-teardown, and
       // abandoning it would be worse than escalating. But an unobservable namespace
       // must NEVER certify "it exited cleanly" — that would suppress the fallback.
+      // ⛔ P2: A PROBE THAT CANNOT LOOK DOES NOT BECOME TRUE BY REPETITION. This rule was
+      // already written three functions away, in pollRemoteSessionPid, and not carried
+      // here: the loop used to spend the whole 10s window issuing ~40 failed sudo probes
+      // and ~40 identical log lines before throwing in killAgentSession anyway. On the
+      // first unobservable probe, log once and stop polling — the decision cannot change.
+      let probeUnobservable = false;
       const graceProbe = async (): Promise<boolean> => {
         const probe = await this.agentScreenAliveChecked(agent);
         if (probe.ok) return probe.alive;
+        probeUnobservable = true;
         console.error(
           `[crew] closeAgent: ${probe.reason} for '${agent.id}' — treating as STILL ALIVE ` +
           `and escalating, because a clean exit cannot be certified by a probe that could not look`,
@@ -1647,10 +1665,10 @@ export class Orchestrator {
       };
       while (Date.now() < deadline) {
         aliveAfterGrace = await graceProbe();
-        if (!aliveAfterGrace) break;
+        if (!aliveAfterGrace || probeUnobservable) break;
         await new Promise((r) => setTimeout(r, 250));
       }
-      if (aliveAfterGrace) {
+      if (aliveAfterGrace && !probeUnobservable) {
         aliveAfterGrace = await graceProbe();
       }
       fallbackUsed = aliveAfterGrace;

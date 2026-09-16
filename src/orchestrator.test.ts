@@ -141,6 +141,10 @@ mock.module("./screen", () => ({
   },
   isRemoteAlive: async () => screenState.isAliveResult,
   terminateRemoteSessionTree: async (name: string, _target: unknown, timeoutMs: number) => {
+    // Mirrors production: the survivor count comes from a probe, so an unobservable
+    // namespace must throw rather than report a number.
+    const p = nextProbe();
+    if (!p.ok) throw new __realScreen.ScreenProbeUnavailable(p.reason);
     screenState.terminateSessionCalls.push({ name, timeoutMs });
     return screenState.terminateSessionSurvivors;
   },
@@ -211,6 +215,40 @@ let tmpDir: string;
 let dbPath: string;
 let orch: InstanceType<typeof Orchestrator>;
 
+/**
+ * ⛔ THE ONE reset list. It existed twice: beforeEach reset fifteen fields, a later
+ * afterAll reset five, and the two had already diverged by eleven entries. That is the
+ * defect this file's own mock.module banner warns about — never hand-maintain a second
+ * copy of a surface. Deciding WHICH fields 'can' leak is the judgement that produced a
+ * 5-of-16 list, so the list no longer admits that judgement.
+ *
+ * Called per-test AND at file scope: mock.module replaces ./screen PROCESS-WIDE, so
+ * whatever the last test here leaves behind is still in effect for the NEXT FILE.
+ */
+function resetScreenState(): void {
+  // ⓘ isAliveResult was in NEITHER list when this was extracted — beforeEach never
+  //   reset it (individual tests used `finally`), and the old afterAll DID. So the two
+  //   hand-maintained copies diverged in BOTH directions, which is the argument for
+  //   having one. Added here so the list is the full declared surface, 17 of 17.
+  screenState.isAliveResult = false;
+  screenState.screens = {};
+  screenState.sendKeysLog.length = 0;
+  screenState.sendKeysHook = null;
+  screenState.readOutputHook = undefined;
+  screenState.killSessionCalls.length = 0;
+  screenState.killSessionSurvivors = 0;
+  screenState.terminateSessionCalls.length = 0;
+  screenState.terminateSessionSurvivors = 0;
+  screenState.argvResult = null;
+  screenState.remoteSessionPidResult = null;
+  screenState.remoteProbeFailure = null;
+  screenState.remoteProbeFailuresRemaining = 0;
+  screenState.pidLooksAliveResult = null;
+  screenState.isAttachedResult = false;
+  screenState.sshRunCalls.length = 0;
+  screenState.sshRunResult = "";
+}
+
 beforeEach(() => {
   // These exercise spawn MECHANICS (env forwarding, manifest, machine routing)
   // against a mocked screen — bypass the Phase-2 fail-closed credential guard so
@@ -221,30 +259,15 @@ beforeEach(() => {
   dbPath = join(tmpDir, "test.db");
   orch = new Orchestrator(makeTerminal(), dbPath);
   createSessionCalls.length = 0;
-  screenState.screens = {};
-  screenState.sendKeysLog.length = 0;
-  screenState.sendKeysHook = null;
-  screenState.readOutputHook = undefined;
-  screenState.killSessionCalls.length = 0;
-  screenState.killSessionSurvivors = 0;
-  screenState.terminateSessionCalls.length = 0;
-  screenState.terminateSessionSurvivors = 0;
-  screenState.argvResult = null;
   // F6: these are scriptable like every field above, so they reset like every field
   // above. Relying on per-test `finally` worked, but pidLooksAliveResult is uniquely
   // dangerous — mock.module replaces ./screen PROCESS-WIDE, so a leak here breaks
   // screen.test.ts's ESRCH assertion in a DIFFERENT FILE, order-dependently.
-  screenState.remoteSessionPidResult = null;
-  screenState.remoteProbeFailure = null;
-  screenState.remoteProbeFailuresRemaining = 0;
-  screenState.pidLooksAliveResult = null;
-  screenState.isAttachedResult = false;
-  screenState.sshRunCalls.length = 0;
-  screenState.sshRunResult = "";
   wireState.roster = [];
   wireState.failWith = null;
   wireState.bodyOverride = undefined;
   wireState.calls.length = 0;
+  resetScreenState();
 });
 
 afterAll(() => {
@@ -2265,11 +2288,8 @@ describe("N5 · the uid acceptance contract, stated rather than implied", () => 
 // reviewer called this leak "latent, not live"; adding tests that set the field made it
 // live. The scope of the reset has to match the scope of the leak.
 afterAll(() => {
-  screenState.pidLooksAliveResult = null;
-  screenState.remoteProbeFailure = null;
-  screenState.remoteSessionPidResult = null;
-  screenState.isAttachedResult = false;
-  screenState.isAliveResult = false;
+  // Same list as beforeEach, BY CONSTRUCTION — see resetScreenState().
+  resetScreenState();
 });
 
 describe("N5 · registration → agents.runtime → the teardown decisions", () => {
@@ -2419,11 +2439,16 @@ describe("N4b · persistent UNKNOWN through terminate → hard-kill", () => {
     // design (a failed observation should not be papered over by looping), and the
     // honest scenario is: one call fails closed, a later call succeeds.
     seedCodexCrossUid();
-    screenState.remoteProbeFailuresRemaining = 1;
+    // ⓘ TWO failures, and the count is the finding: a codex stop probes TWICE —
+    // terminateAgentTree first (whose catch ABSORBS the throw and returns 1), then
+    // killAgentSession. With only one scripted failure the stop SUCCEEDS, because the
+    // terminate catch swallows it. That is the P1 mechanism observed from the outside,
+    // and it is why the catch's return value is only ever load-bearing for a transient.
+    screenState.remoteProbeFailuresRemaining = 2;
     screenState.killSessionCalls.length = 0;
     screenState.killSessionSurvivors = 0;
 
-    // Call 1 — transient UNKNOWN: aborts, row retained, nothing destroyed.
+    // Call 1 — persistent-enough UNKNOWN: aborts, row retained, nothing destroyed.
     await expect(orch.stopAgent("fondant")).rejects.toThrow(/screen probe unavailable/);
     expect(orch.store.getAgent("fondant")).not.toBeNull();
     expect(screenState.killSessionCalls.length).toBe(0);
@@ -2436,5 +2461,71 @@ describe("N4b · persistent UNKNOWN through terminate → hard-kill", () => {
     // ⇒ WITHIN EXISTING POLICY: exactly one kill, of the one session. The failed call
     //   left no queued or duplicated work behind.
     expect(screenState.killSessionCalls.filter((n) => n === "wire-fondant").length).toBe(1);
+  });
+});
+
+describe("P1 · terminateAgentTree's UNKNOWN escalation value", () => {
+  // ⛔ THE VALUE THE COMMENT TURNS ON, AND IT WAS UNTESTED. terminateAgentTree catches
+  // ScreenProbeUnavailable and returns 1 — "unknown survivors", which must never be 0,
+  // because 0 is the value that CERTIFIES A CLEAN TERM. Flipping it to 0 left the suite
+  // at 379/0: the repository could not tell "we could not count" from "we counted none".
+  //
+  // ⚠️ AND THE COMMENT OVERSTATED THE MECHANISM, which is corrected in source. For a
+  // PERSISTENT failure the escalation this value triggers dies one line later in
+  // killRemoteSession, so the 1 never matters. It matters only for a TRANSIENT failure
+  // that clears between the two probes — which is exactly what this test scripts.
+  function seedCodexCrossUid() {
+    orch.store.createAgent({
+      id: "fondant", display_name: "Fondant", runtime: "codex",
+      screen_name: "wire-fondant", screen_pid: 1,
+      spawn_manifest: JSON.stringify({ run_as_uid: "_ephemeral", env: {}, project_dir: "/opt/x", display_name: "F", runtime: "codex" }),
+    });
+  }
+
+  test("a TRANSIENT probe failure during terminate reports a survivor, not a clean term", async () => {
+    seedCodexCrossUid();
+    // Exactly one failure: consumed by terminateRemoteSessionTree. The hard reap that
+    // follows observes normally, so the run completes and the return value is visible.
+    screenState.remoteProbeFailuresRemaining = 1;
+    screenState.remoteSessionPidResult = null;
+    screenState.killSessionSurvivors = 0;
+
+    const r = await orch.closeAgent("fondant", undefined, 250);
+    // ⇒ fallbackUsed is `survivorsAfterTerm > 0`. With the catch returning 1 this is
+    //   true; with the mutant returning 0 it is false and a clean term is certified.
+    expect(r.fallbackUsed).toBe(true);
+  });
+
+  test("CONTROL: an OBSERVED zero-survivor terminate does report a clean term", async () => {
+    // Without this the assertion above passes for a closeAgent that always escalates.
+    seedCodexCrossUid();
+    screenState.remoteProbeFailuresRemaining = 0;
+    screenState.terminateSessionSurvivors = 0;
+    screenState.remoteSessionPidResult = null;
+    screenState.killSessionSurvivors = 0;
+
+    const r = await orch.closeAgent("fondant", undefined, 250);
+    expect(r.fallbackUsed).toBe(false);
+  });
+});
+
+describe("P2 · the grace loop stops on an unobservable probe", () => {
+  test("a permanently failed probe is polled ONCE, not for the whole window", async () => {
+    // ⛔ "A probe that cannot look does not become true by repetition" was already
+    // written in pollRemoteSessionPid and not carried here: the loop spent the full
+    // window issuing ~40 sudo probes and ~40 identical log lines before throwing in
+    // killAgentSession anyway. Timing is not asserted — the OBSERVABLE is that the
+    // close still fails closed, and it now does so promptly.
+    orch.store.createAgent({
+      id: "fondant", display_name: "Fondant", runtime: "claude-code",
+      screen_name: "wire-fondant", screen_pid: 1,
+      spawn_manifest: JSON.stringify({ run_as_uid: "_ephemeral", env: {}, project_dir: "/opt/x", display_name: "F", runtime: "claude-code" }),
+    });
+    screenState.remoteProbeFailure = "sudo refused for uid '_ephemeral'";
+    const started = Date.now();
+    await expect(orch.closeAgent("fondant", undefined, 10_000)).rejects.toThrow(/screen probe unavailable/);
+    // A 10s window that returns in well under it is the behavioural signature of the
+    // early break. Generous bound so this cannot flake on a loaded machine.
+    expect(Date.now() - started).toBeLessThan(5_000);
   });
 });
