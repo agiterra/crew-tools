@@ -32,6 +32,18 @@ const screenState = {
   // saw nothing (the argv-unreadable path).
   argvResult: null as string | null,
   sshRunCalls: [] as Array<{ target: unknown; command: string }>,
+  // Cross-uid registration (coupled registration patch): the runAsUid path
+  // resolves liveness through getRemoteSessionPid + pidLooksAlive instead of
+  // the local isAlive, so both must be scriptable to cover it.
+  remoteSessionPidResult: null as number | null,
+  /** When set, getRemoteSessionPidChecked reports PROBE FAILURE with this reason. */
+  remoteProbeFailure: null as string | null,
+  /** When >0, the next N probes fail then recovery is observed. Decremented per probe. */
+  remoteProbeFailuresRemaining: 0,
+  // null = DELEGATE to the real pidLooksAlive. An unconditional override here would
+  // replace it PROCESS-WIDE (mock.module), breaking screen.test.ts's ESRCH test —
+  // which is exactly what mock-isolation.test.ts caught. Opt in per test, never by default.
+  pidLooksAliveResult: null as boolean | null,
   sshRunResult: "",
 };
 
@@ -54,6 +66,11 @@ globalThis.fetch = (async (input: unknown) => {
   return { ok: true, status: 200, json: async () => body } as unknown as Response;
 }) as unknown as typeof fetch;
 import * as __realScreen from "./screen";
+// ⛔ Captured EAGERLY, before mock.module runs. A late `__realScreen.pidLooksAlive(pid)`
+// inside the mock resolves through the LIVE namespace — which mock.module has by then
+// replaced with this very mock — so the wrapper calls itself. Infinite recursion, and it
+// presents as the paired run HANGING, not as a failed assertion.
+const realPidLooksAlive = __realScreen.pidLooksAlive;
 // ⛔ CROSS-FILE MOCK CONTAMINATION (CI, Bun 1.4.2; hypothesis from Brioche's source read,
 // reproduced locally). `mock.module` replaces the module PROCESS-WIDE for every later import.
 // This mock enumerated the handful of functions this file needs and omitted the rest — so once
@@ -68,6 +85,17 @@ import * as __realScreen from "./screen";
 // ⇒ SPREAD THE REAL MODULE and override only what this file mocks, so the mock is complete BY
 //   CONSTRUCTION and a new export can never be silently dropped again. Same rule as
 //   derive-the-list-never-duplicate-it: never hand-maintain a second copy of a surface.
+/** The single source of probe-failure truth for every mocked probe path. */
+function nextProbe(): { ok: true; pid: number | null } | { ok: false; reason: string } {
+  if (screenState.remoteProbeFailuresRemaining > 0) {
+    screenState.remoteProbeFailuresRemaining -= 1;
+    return { ok: false, reason: "transient: sudo refused" };
+  }
+  return screenState.remoteProbeFailure
+    ? { ok: false, reason: screenState.remoteProbeFailure }
+    : { ok: true, pid: screenState.remoteSessionPidResult };
+}
+
 mock.module("./screen", () => ({
   ...__realScreen,
   createSession: async (name: string, command: string) => {
@@ -112,11 +140,11 @@ mock.module("./screen", () => ({
     return s.queue.length > 0 ? s.queue.shift()! : s.fallback;
   },
   isRemoteAlive: async () => screenState.isAliveResult,
-  killRemoteSession: async (name: string) => {
-    screenState.killSessionCalls.push(name);
-    return screenState.killSessionSurvivors;
-  },
   terminateRemoteSessionTree: async (name: string, _target: unknown, timeoutMs: number) => {
+    // Mirrors production: the survivor count comes from a probe, so an unobservable
+    // namespace must throw rather than report a number.
+    const p = nextProbe();
+    if (!p.ok) throw new __realScreen.ScreenProbeUnavailable(p.reason);
     screenState.terminateSessionCalls.push({ name, timeoutMs });
     return screenState.terminateSessionSurvivors;
   },
@@ -131,7 +159,24 @@ mock.module("./screen", () => ({
     screenState.sshRunCalls.push({ target, command });
     return screenState.sshRunResult;
   },
-  getRemoteSessionPid: async () => null,
+  getRemoteSessionPid: async () => screenState.remoteSessionPidResult,
+  // ⛔ ONE probe-failure decision, consumed by EVERY probe path. Two copies is how the
+  // transient countdown got decremented by one caller and not another, and a test then
+  // passed for the wrong reason.
+  getRemoteSessionPidChecked: async () => nextProbe(),
+  killRemoteSession: async (name: string, t: unknown) => {
+    // Mirrors production: a probe that could not look must not certify zero survivors.
+    const p = nextProbe();
+    if (!p.ok) throw new __realScreen.ScreenProbeUnavailable(p.reason);
+    screenState.killSessionCalls.push(name);
+    void t;
+    return screenState.killSessionSurvivors;
+  },
+  isRemoteAliveChecked: async () => {
+    const p = nextProbe();
+    return p.ok ? { ok: true as const, alive: screenState.isAliveResult } : p;
+  },
+  pidLooksAlive: (pid: number) => screenState.pidLooksAliveResult ?? realPidLooksAlive(pid),
   pollRemoteSessionPid: async () => null,
   // Post-spawn verify chain (v2.26.0). Tests inject channelProbe/argvReader
   // explicitly; these defaults make un-injected background chains resolve
@@ -170,6 +215,59 @@ let tmpDir: string;
 let dbPath: string;
 let orch: InstanceType<typeof Orchestrator>;
 
+/**
+ * ⛔ THE ONE reset list. It existed twice: beforeEach reset fifteen fields, a later
+ * afterAll reset five, and the two had already diverged by eleven entries. That is the
+ * defect this file's own mock.module banner warns about — never hand-maintain a second
+ * copy of a surface. Deciding WHICH fields 'can' leak is the judgement that produced a
+ * 5-of-16 list, so the list no longer admits that judgement.
+ *
+ * Called per-test AND at file scope: mock.module replaces ./screen PROCESS-WIDE, so
+ * whatever the last test here leaves behind is still in effect for the NEXT FILE.
+ */
+/**
+ * ⛔ CAPTURED AT MODULE SCOPE, BEFORE ANY beforeEach HAS RUN.
+ *
+ * The R4 guard below snapshots pristine values from HERE, not from inside the test.
+ * Snapshotting inside the test baselines on the POST-RESET state — which can only prove
+ * the reset is STABLE, never that it RESTORES anything. A reset that assigns the wrong
+ * value every single time is perfectly stable. (Found by the reviewer in their own
+ * prototype, then reproduced against mine: making resetScreenState assign
+ * `isAliveResult = true` left the suite at 138 pass / 0 fail.)
+ */
+function snapshotScreenState(): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(screenState as unknown as Record<string, unknown>)) {
+    out[k] = Array.isArray(v) ? [...v] : v && typeof v === "object" ? { ...v } : v;
+  }
+  return out;
+}
+const PRISTINE_SCREEN_STATE = snapshotScreenState();
+
+function resetScreenState(): void {
+  // ⓘ isAliveResult was in NEITHER list when this was extracted — beforeEach never
+  //   reset it (individual tests used `finally`), and the old afterAll DID. So the two
+  //   hand-maintained copies diverged in BOTH directions, which is the argument for
+  //   having one. Added here so the list is the full declared surface, 17 of 17.
+  screenState.isAliveResult = false;
+  screenState.screens = {};
+  screenState.sendKeysLog.length = 0;
+  screenState.sendKeysHook = null;
+  screenState.readOutputHook = undefined;
+  screenState.killSessionCalls.length = 0;
+  screenState.killSessionSurvivors = 0;
+  screenState.terminateSessionCalls.length = 0;
+  screenState.terminateSessionSurvivors = 0;
+  screenState.argvResult = null;
+  screenState.remoteSessionPidResult = null;
+  screenState.remoteProbeFailure = null;
+  screenState.remoteProbeFailuresRemaining = 0;
+  screenState.pidLooksAliveResult = null;
+  screenState.isAttachedResult = false;
+  screenState.sshRunCalls.length = 0;
+  screenState.sshRunResult = "";
+}
+
 beforeEach(() => {
   // These exercise spawn MECHANICS (env forwarding, manifest, machine routing)
   // against a mocked screen — bypass the Phase-2 fail-closed credential guard so
@@ -180,21 +278,15 @@ beforeEach(() => {
   dbPath = join(tmpDir, "test.db");
   orch = new Orchestrator(makeTerminal(), dbPath);
   createSessionCalls.length = 0;
-  screenState.screens = {};
-  screenState.sendKeysLog.length = 0;
-  screenState.sendKeysHook = null;
-  screenState.readOutputHook = undefined;
-  screenState.killSessionCalls.length = 0;
-  screenState.killSessionSurvivors = 0;
-  screenState.terminateSessionCalls.length = 0;
-  screenState.terminateSessionSurvivors = 0;
-  screenState.argvResult = null;
-  screenState.sshRunCalls.length = 0;
-  screenState.sshRunResult = "";
+  // F6: these are scriptable like every field above, so they reset like every field
+  // above. Relying on per-test `finally` worked, but pidLooksAliveResult is uniquely
+  // dangerous — mock.module replaces ./screen PROCESS-WIDE, so a leak here breaks
+  // screen.test.ts's ESRCH assertion in a DIFFERENT FILE, order-dependently.
   wireState.roster = [];
   wireState.failWith = null;
   wireState.bodyOverride = undefined;
   wireState.calls.length = 0;
+  resetScreenState();
 });
 
 afterAll(() => {
@@ -1658,4 +1750,852 @@ describe("codex-spawn teardown (AGI-74)", () => {
     expect(failure).toContain("/Users/_ephemeral/.wire/codex-spawn/ephem2");
     expect(orch.store.getAgent("ephem2")).toBeNull();
   });
+});
+
+describe("registerAgent cross-uid path (coupled registration patch)", () => {
+  // A central service does not share the registering persona's screen namespace,
+  // so registerAgent resolves liveness through the REMOTE pid probe when the
+  // caller supplies runAsUid. This path was hot-patched into the deployed tree
+  // and existed in no commit; these are the only tests it has ever had.
+  const caller = JSON.stringify({
+    terminal_session_id: "iterm-session-9",
+    screen_name: "wire-fondant",
+    screen_pid: 31337,
+    sty: "31337.wire-fondant",
+  });
+
+  test("rejects a runAsUid that is not a valid unix username, and writes no row", async () => {
+    await expect(
+      orch.registerAgent({
+        id: "fondant", displayName: "Fondant", runAsUid: "bad uid; rm -rf /", callerSessionId: caller,
+      }),
+    ).rejects.toThrow(/invalid owning UID/);
+    expect(orch.store.getAgent("fondant")).toBeNull();
+  });
+
+  test("uses the REMOTE pid probe, not the local isAlive, when runAsUid is given", async () => {
+    // The local probe is made to say ALIVE. If the cross-uid path were not taken
+    // this would register successfully — so the throw is what proves the branch.
+    screenState.isAliveResult = true;
+    screenState.remoteSessionPidResult = null;
+    try {
+      await expect(
+        orch.registerAgent({
+          id: "fondant", displayName: "Fondant", runAsUid: "fondant", callerSessionId: caller,
+        }),
+      ).rejects.toThrow(/is not running with pid 31337 as fondant/);
+    } finally {
+      screenState.isAliveResult = false;
+      screenState.remoteSessionPidResult = null;
+    }
+  });
+
+  test("registers and records run_as_uid in the manifest when the remote pid matches", async () => {
+    // The manifest write is the COUPLING: this orchestrator path calls the
+    // store's updateAgentManifest/createAgent. If the store half is reverted
+    // while this half survives, the call is to a method that no longer exists.
+    screenState.isAliveResult = false;
+    screenState.remoteSessionPidResult = 31337;
+    screenState.pidLooksAliveResult = true;
+    // F3: isAttachedResult is false by default, which makes `attached` false with or
+    // without the `!registerTarget &&` guard — so the pane assertion below proved
+    // nothing until this line existed.
+    screenState.isAttachedResult = true;
+    try {
+      const agent = await orch.registerAgent({
+        id: "fondant", displayName: "Fondant", runAsUid: "fondant", callerSessionId: caller,
+      });
+      expect(agent.screen_name).toBe("wire-fondant");
+      expect(agent.screen_pid).toBe(31337);
+      expect(JSON.parse(orch.store.getAgent("fondant")!.spawn_manifest!).run_as_uid).toBe("fondant");
+      // A cross-uid registration must not claim an attached pane — and with
+      // isAttachedResult TRUE above, this now discriminates (mutant A kills it).
+      expect(agent.pane).toBeNull();
+    } finally {
+      screenState.remoteSessionPidResult = null;
+      screenState.pidLooksAliveResult = null;
+    }
+  });
+
+  test("without runAsUid the local isAlive path still governs (no regression)", async () => {
+    screenState.isAliveResult = true;
+    screenState.remoteSessionPidResult = null; // remote probe would refuse if consulted
+    try {
+      const agent = await orch.registerAgent({
+        id: "fondant", displayName: "Fondant", callerSessionId: caller,
+      });
+      expect(agent.screen_pid).toBe(31337);
+      expect(orch.store.getAgent("fondant")!.spawn_manifest).toBeNull();
+    } finally {
+      screenState.isAliveResult = false;
+    }
+  });
+});
+
+describe("registerAgent re-registration branch (existingByScreen)", () => {
+  // ⛔ THE COVERAGE GAP THIS CLOSES. The first three cross-uid tests all go through
+  // createAgent, because beforeEach builds a fresh DB so getAgentByScreen is always
+  // null. Every changed line on the re-registration path therefore had NO test, and
+  // four single-line mutants survived the full suite. These enter the branch.
+  const caller = JSON.stringify({
+    terminal_session_id: "iterm-session-9",
+    screen_name: "wire-fondant",
+    screen_pid: 31337,
+    sty: "31337.wire-fondant",
+  });
+  const FULL_MANIFEST = {
+    env: { AGENT_PARENT: "brioche" },
+    runtime: "claude-code",
+    project_dir: "/opt/work",
+    display_name: "Fondant",
+    ttl_idle_minutes: 90,
+    channels: ["dev"],
+    aux_surface: "pane-7",
+  };
+
+  function seedRow(opts: { manifest?: string; runtime?: string; cc?: string } = {}) {
+    return orch.store.createAgent({
+      id: "fondant",
+      display_name: "Fondant",
+      runtime: opts.runtime ?? "claude-code",
+      screen_name: "wire-fondant",
+      screen_pid: 1,
+      cc_session_id: opts.cc ?? "sess-old",
+      spawn_manifest: opts.manifest,
+    });
+  }
+  function crossUidAlive() {
+    screenState.remoteSessionPidResult = 31337;
+    screenState.pidLooksAliveResult = true;
+  }
+  const register = (extra: Record<string, unknown> = {}) =>
+    orch.registerAgent({ id: "fondant", displayName: "Fondant", callerSessionId: caller, ...extra });
+
+  // --- MUTANT D: the manifest merge must not become a clobber ---
+  test("preserves every existing manifest field and adds run_as_uid", async () => {
+    seedRow({ manifest: JSON.stringify(FULL_MANIFEST) });
+    crossUidAlive();
+    await register({ runAsUid: "fondant" });
+    const stored = JSON.parse(orch.store.getAgent("fondant")!.spawn_manifest!);
+    // Each asserted by name: a clobber that kept only run_as_uid passes any
+    // assertion that merely checks run_as_uid is present.
+    expect(stored.env).toEqual({ AGENT_PARENT: "brioche" });
+    expect(stored.project_dir).toBe("/opt/work");
+    expect(stored.ttl_idle_minutes).toBe(90);
+    expect(stored.channels).toEqual(["dev"]);
+    expect(stored.aux_surface).toBe("pane-7");
+    expect(stored.display_name).toBe("Fondant");
+    expect(stored.run_as_uid).toBe("fondant");
+  });
+
+  // --- MUTANT C: the runtime update must actually land ---
+  test("updateAgentRuntime lands on the existing row", async () => {
+    seedRow({ runtime: "claude-code" });
+    crossUidAlive();
+    await register({ runAsUid: "fondant", runtime: "codex" });
+    expect(orch.store.getAgent("fondant")!.runtime).toBe("codex");
+  });
+
+  // --- MUTANT B: the cc-session guard, both directions ---
+  test("a supplied cc_session_id IS written when the row stays claude-code", async () => {
+    seedRow({ runtime: "claude-code", cc: "sess-old" });
+    crossUidAlive();
+    await register({ runAsUid: "fondant", runtime: "claude-code", ccSessionId: "sess-new" });
+    expect(orch.store.getAgent("fondant")!.cc_session_id).toBe("sess-new");
+  });
+
+  test("a supplied cc_session_id is DISCARDED when the passed runtime is not claude-code", async () => {
+    seedRow({ runtime: "claude-code", cc: "sess-old" });
+    crossUidAlive();
+    await register({ runAsUid: "fondant", runtime: "codex", ccSessionId: "sess-new" });
+    // updateAgentRuntime's CASE WHEN nulls it on the move away from claude-code;
+    // the point is that "sess-new" was NOT written.
+    expect(orch.store.getAgent("fondant")!.cc_session_id).not.toBe("sess-new");
+  });
+
+  // --- F8: the omitted-runtime case, called out explicitly ---
+  test("F8: with NO runtime passed, the row's own runtime governs and the id is dropped", async () => {
+    seedRow({ runtime: "codex", cc: "sess-old" });
+    crossUidAlive();
+    await register({ runAsUid: "fondant", ccSessionId: "sess-new" });
+    const row = orch.store.getAgent("fondant")!;
+    expect(row.runtime).toBe("codex");          // inherited, not overwritten
+    expect(row.cc_session_id).toBe("sess-old"); // the supplied id never landed
+  });
+
+  // --- F1: refuse, and leave the row byte-for-byte unchanged ---
+  for (const [label, bad, kind] of [
+    ["unparseable", "{not json", /unparseable spawn_manifest/],
+    ["non-object (array)", "[1,2]", /non-object spawn_manifest \(parsed as array\)/],
+    ["non-object (string)", "\"just a string\"", /non-object spawn_manifest \(parsed as string\)/],
+    ["non-object (null)", "null", /non-object spawn_manifest \(parsed as null\)/],
+  ] as const) {
+    test(`F1: a ${label} manifest is REFUSED and the row is unchanged`, async () => {
+      seedRow({ manifest: bad, runtime: "claude-code", cc: "sess-old" });
+      const before = orch.store.getAgent("fondant")!;
+      crossUidAlive();
+      await expect(register({ runAsUid: "fondant", runtime: "codex", ccSessionId: "sess-new" }))
+        .rejects.toThrow(kind);
+      // ⇒ UNCHANGED-ROW EVIDENCE. The old code committed pid and runtime before the
+      // parse threw, leaving a torn write. Every column must be as it was.
+      const after = orch.store.getAgent("fondant")!;
+      expect(after.spawn_manifest).toBe(before.spawn_manifest);
+      expect(after.screen_pid).toBe(before.screen_pid);
+      expect(after.runtime).toBe(before.runtime);
+      expect(after.cc_session_id).toBe(before.cc_session_id);
+    });
+  }
+
+  test("F1: the refusal never puts the manifest, env or session id in its message", async () => {
+    seedRow({ manifest: '{"env":{"SECRET_TOKEN":"swordfish"},', cc: "sess-old" });
+    crossUidAlive();
+    let msg = "";
+    try { await register({ runAsUid: "fondant", ccSessionId: "sess-new" }); }
+    catch (e) { msg = e instanceof Error ? e.message : String(e); }
+    expect(msg).toMatch(/unparseable spawn_manifest/);
+    expect(msg).not.toContain("swordfish");
+    expect(msg).not.toContain("SECRET_TOKEN");
+    expect(msg).not.toContain("sess-new");
+    expect(msg).toContain("fondant"); // the agent id IS a safe identifier
+  });
+
+  // --- MUTANT A / F3: the pane guard, with isAttached actually true ---
+  test("F3: a cross-uid registration claims no pane even when one IS attached and resolvable", async () => {
+    // ⛔ TWO preconditions, and the assertion is vacuous without BOTH:
+    //   1. isAttachedResult must be true, or `attached` is false regardless of the guard;
+    //   2. a pane whose iterm_id matches the caller must EXIST, or callerPane resolves
+    //      to null anyway and removing the guard changes nothing.
+    // My first attempt set only (1) and mutant A still survived.
+    orch.store.createTab("eng");
+    orch.store.createPane("eng-nw", "eng");
+    orch.store.setPaneItermId("eng-nw", "iterm-session-9");
+    seedRow();
+    crossUidAlive();
+    screenState.isAttachedResult = true;
+    const agent = await register({ runAsUid: "fondant" });
+    expect(agent.pane).toBeNull();
+    expect(orch.store.getAgent("fondant")!.pane).toBeNull();
+  });
+
+  test("F3 control: the SAME setup WITHOUT runAsUid does claim the pane", async () => {
+    // Proves the preconditions above are real — if this did not link, the test
+    // above would pass for the wrong reason.
+    orch.store.createTab("eng");
+    orch.store.createPane("eng-nw", "eng");
+    orch.store.setPaneItermId("eng-nw", "iterm-session-9");
+    seedRow();
+    screenState.isAliveResult = true;
+    screenState.isAttachedResult = true;
+    const agent = await register({});
+    expect(agent.pane).toBe("eng-nw");
+  });
+
+  // --- F4: a failed probe must not be reported as the session's absence ---
+  test("F4: an unobservable screen namespace reports UNKNOWN, not 'not running'", async () => {
+    seedRow();
+    screenState.remoteProbeFailure = "sudo refused for uid 'fondant'";
+    let msg = "";
+    try { await register({ runAsUid: "fondant" }); }
+    catch (e) { msg = e instanceof Error ? e.message : String(e); }
+    expect(msg).toMatch(/could not observe screen namespace/);
+    expect(msg).toMatch(/UNKNOWN, not disproved/);
+    expect(msg).not.toMatch(/is not running with pid/);
+  });
+
+  test("F4: a genuinely absent session still reports 'not running'", async () => {
+    seedRow();
+    screenState.remoteSessionPidResult = null; // probe worked; no such session
+    await expect(register({ runAsUid: "fondant" }))
+      .rejects.toThrow(/is not running with pid 31337 as fondant/);
+  });
+
+  // --- F7: one validator, and it is length-bounded ---
+  test("F7: a uid containing '.' is accepted (SAFE_UID admits it; the old local regex did not)", async () => {
+    seedRow();
+    screenState.remoteSessionPidResult = 31337;
+    screenState.pidLooksAliveResult = true;
+    await expect(register({ runAsUid: "svc.worker" })).resolves.toBeDefined();
+  });
+
+  test("F7: an over-length uid is rejected", async () => {
+    seedRow();
+    crossUidAlive();
+    await expect(register({ runAsUid: "a".repeat(65) })).rejects.toThrow(/invalid owning UID/);
+  });
+
+  test("F7: a uid starting with '-' is rejected (sudo option injection)", async () => {
+    seedRow();
+    crossUidAlive();
+    await expect(register({ runAsUid: "-u" })).rejects.toThrow(/invalid owning UID/);
+  });
+});
+
+describe("F5 · registration → consumer data flow (run_as_uid in the manifest)", () => {
+  // ⛔ WHY THIS EXISTS. The reconciliation touches NO PR 91 source, and verifying that
+  // proves nothing: registerAgent writes `run_as_uid` into agents.spawn_manifest, and
+  // PR 91's teardown READS that column to choose which uid's home it operates on. The
+  // coupling is a DATABASE COLUMN, so a source diff cannot see it.
+  //
+  //   registerAgent   →  writes run_as_uid into spawn_manifest
+  //   targetFor       →  reads it → screen.RemoteTarget
+  //   stopAgent       →  const target = this.targetFor(agent)      (PR 91's function)
+  //   removeCodexSpawnHome → runAsUid: target?.runAsUid ?? manifest?.run_as_uid
+  //                          env:      manifest?.env
+  //
+  // ⓘ NOTHING DESTRUCTIVE RUNS HERE. The cross-uid path goes through the mocked
+  // `sshRun`, so the teardown command is CONSTRUCTED AND RECORDED, never executed.
+  // These assert on the command string, which is the decision under test.
+  const caller = JSON.stringify({
+    terminal_session_id: "iterm-session-9",
+    screen_name: "wire-fondant",
+    screen_pid: 31337,
+    sty: "31337.wire-fondant",
+  });
+
+  test("a registration-written run_as_uid redirects the codex teardown to that uid's home", async () => {
+    orch.store.createAgent({
+      id: "fondant",
+      display_name: "Fondant",
+      runtime: "codex",
+      screen_name: "wire-fondant",
+      screen_pid: 1,
+      spawn_manifest: JSON.stringify({
+        env: { AGENT_PARENT: "brioche" },
+        runtime: "codex",
+        project_dir: "/opt/work",
+        display_name: "Fondant",
+      }),
+    });
+    screenState.remoteSessionPidResult = 31337;
+    screenState.pidLooksAliveResult = true;
+    await orch.registerAgent({ id: "fondant", displayName: "Fondant", callerSessionId: caller, runAsUid: "_ephemeral" });
+
+    // The manifest now carries the uid, and env survived the merge.
+    const m = JSON.parse(orch.store.getAgent("fondant")!.spawn_manifest!);
+    expect(m.run_as_uid).toBe("_ephemeral");
+    expect(m.env).toEqual({ AGENT_PARENT: "brioche" });
+
+    screenState.sshRunCalls.length = 0;
+    await orch.stopAgent("fondant");
+
+    // ⇒ The teardown addressed the OTHER uid's home because registration said so.
+    const teardown = screenState.sshRunCalls.map((c) => c.command).join("\n");
+    expect(teardown).toContain("/Users/_ephemeral/.wire/codex-spawn/fondant");
+    expect(teardown).not.toContain("/Users/fondant/.wire/codex-spawn/fondant");
+    expect(screenState.sshRunCalls.some((c) => (c.target as { runAsUid?: string })?.runAsUid === "_ephemeral")).toBe(true);
+  });
+
+  test("registration preserves env.AGENT_PARENT — an AUTHORIZATION input, not just metadata", async () => {
+    // ⛔ WHY THIS IS SINGLED OUT FROM THE GENERAL env ASSERTION. crew-service's
+    // authz.ts resolves an agent's SPAWNER from `spawn_manifest.env.AGENT_PARENT`
+    // (authz.ts:88-93) and uses it for `canManageDescendant` and the restart guard
+    // (authz.ts:254). So this key is not metadata — it decides WHO MAY ACT ON THE ROW.
+    //
+    // A clobbering merge would therefore not merely make an agent unresumable: it
+    // would silently change authorization outcomes, in a repo whose own fixtures
+    // never exercise a registration-rewritten manifest (authz.test.ts references
+    // spawn_manifest but never run_as_uid).
+    orch.store.createAgent({
+      id: "fondant",
+      display_name: "Fondant",
+      runtime: "claude-code",
+      screen_name: "wire-fondant",
+      screen_pid: 1,
+      spawn_manifest: JSON.stringify({ env: { AGENT_PARENT: "brioche", OTHER: "x" }, runtime: "claude-code", project_dir: "/opt/x", display_name: "F" }),
+    });
+    screenState.remoteSessionPidResult = 31337;
+    screenState.pidLooksAliveResult = true;
+    await orch.registerAgent({ id: "fondant", displayName: "Fondant", callerSessionId: caller, runAsUid: "_ephemeral" });
+
+    const m = JSON.parse(orch.store.getAgent("fondant")!.spawn_manifest!);
+    expect(m.env.AGENT_PARENT).toBe("brioche");
+    expect(m.env.OTHER).toBe("x");
+    expect(m.run_as_uid).toBe("_ephemeral");
+  });
+
+  test("with NO run_as_uid the same stop stays local — the uid is the only difference", async () => {
+    // The control. Without it, the assertion above could pass for an unrelated reason.
+    orch.store.createAgent({
+      id: "fondant",
+      display_name: "Fondant",
+      runtime: "codex",
+      screen_name: "wire-fondant",
+      screen_pid: 1,
+      spawn_manifest: JSON.stringify({ env: {}, runtime: "codex", project_dir: "/opt/work", display_name: "Fondant" }),
+    });
+    screenState.sshRunCalls.length = 0;
+    await orch.stopAgent("fondant");
+    expect(screenState.sshRunCalls.filter((c) => (c.target as { runAsUid?: string })?.runAsUid).length).toBe(0);
+  });
+});
+
+describe("N4 · an unobservable probe must not authorise a delete or a spawn", () => {
+  // ⛔ THE FAILURE THIS PREVENTS. A cross-uid liveness probe can fail — sudo refused,
+  // SCREENDIR unreadable — and the old boolean reported that as `false`, i.e. "not
+  // running". Both call sites below then DELETED the row. In resumeAgent's case it
+  // went further and resumed a SECOND INSTANCE against a live screen.
+  //
+  // Losing an agent row is not recoverable by any other path: registerAgent is
+  // self-registration, so no other process can put it back.
+  //
+  // ⓘ Nothing destructive runs here. Screen operations are mocked throughout, so a
+  // "spawn" would be a recorded createSession call, and we assert there is none.
+  function seedCrossUid(id = "ephemeral-lane") {
+    return orch.store.createAgent({
+      id,
+      display_name: "Ephemeral",
+      runtime: "claude-code",
+      screen_name: `wire-${id}`,
+      screen_pid: 4242,
+      cc_session_id: "sess-keep",
+      spawn_manifest: JSON.stringify({ run_as_uid: "_ephemeral", env: { A: "1" }, project_dir: "/opt/x", display_name: "E", runtime: "claude-code" }),
+    });
+  }
+
+  test("launchAgent ABORTS and preserves the row when liveness is UNKNOWN", async () => {
+    const before = seedCrossUid();
+    screenState.remoteProbeFailure = "sudo refused for uid '_ephemeral'";
+    createSessionCalls.length = 0;
+
+    await expect(orch.launchAgent({ env: { AGENT_ID: "ephemeral-lane", AGENT_NAME: "Ephemeral" } }))
+      .rejects.toThrow(/UNKNOWN, not disproved/);
+
+    const after = orch.store.getAgent("ephemeral-lane");
+    expect(after).not.toBeNull();
+    expect(after!.screen_name).toBe(before.screen_name);
+    expect(after!.cc_session_id).toBe("sess-keep");
+    expect(after!.spawn_manifest).toBe(before.spawn_manifest);
+    // ⇒ AND NOTHING WAS STARTED.
+    expect(createSessionCalls.length).toBe(0);
+  });
+
+  test("resumeAgent ABORTS and preserves the row when liveness is UNKNOWN", async () => {
+    const before = seedCrossUid();
+    screenState.remoteProbeFailure = "SCREENDIR unreadable for uid '_ephemeral'";
+    createSessionCalls.length = 0;
+
+    await expect(orch.resumeAgent({ id: "ephemeral-lane", projectDir: "/opt/x" }))
+      .rejects.toThrow(/UNKNOWN, not disproved/);
+
+    const after = orch.store.getAgent("ephemeral-lane");
+    expect(after).not.toBeNull();
+    expect(after!.spawn_manifest).toBe(before.spawn_manifest);
+    expect(createSessionCalls.length).toBe(0);
+  });
+
+  test("CONTROL: with an OBSERVABLE dead probe, launchAgent still prunes and spawns", async () => {
+    // Without this the two tests above would pass against a launchAgent that had
+    // simply stopped working. The uid path is identical; only observability differs.
+    seedCrossUid();
+    screenState.remoteProbeFailure = null;
+    screenState.isAliveResult = false; // observed, and genuinely not running
+    createSessionCalls.length = 0;
+
+    await orch.launchAgent({ env: { AGENT_ID: "ephemeral-lane", AGENT_NAME: "Ephemeral" } });
+    expect(createSessionCalls.length).toBeGreaterThan(0);
+  });
+
+  test("closeAgent does NOT certify a clean exit from an unobservable probe", async () => {
+    // ⛔ The third deletion-adjacent consumer. Here UNKNOWN must NOT abort — we are
+    // mid-teardown and abandoning it is worse — but it must not suppress the fallback
+    // either. `fallbackUsed:false` would mean "it exited cleanly on its own", which a
+    // probe that could not look has no standing to claim.
+    orch.store.createAgent({
+      id: "ephemeral-lane",
+      display_name: "Ephemeral",
+      runtime: "claude-code",
+      screen_name: "wire-ephemeral-lane",
+      screen_pid: 4242,
+      spawn_manifest: JSON.stringify({ run_as_uid: "_ephemeral", env: {}, project_dir: "/opt/x", display_name: "E", runtime: "claude-code" }),
+    });
+    // ⚠️ REVISED. This test first used a PERSISTENT failure and asserted on
+    // fallbackUsed — and it passed only because the mock's killRemoteSession did not
+    // throw, i.e. the mock did not implement the production contract. With a faithful
+    // mock, a persistent UNKNOWN aborts the close entirely (see N4b). The grace
+    // decision is a TRANSIENT-failure question, so script exactly one failing probe:
+    // timeoutMs 0 skips the poll loop, leaving the single post-loop probe.
+    screenState.remoteProbeFailuresRemaining = 1;
+    const r = await orch.closeAgent("ephemeral-lane", undefined, 0);
+    expect(r.fallbackUsed).toBe(true);
+  });
+
+  test("CONTROL: an OBSERVED clean exit does report fallbackUsed:false", async () => {
+    // Proves the assertion above discriminates rather than always reading true.
+    orch.store.createAgent({
+      id: "local-lane",
+      display_name: "Local",
+      runtime: "claude-code",
+      screen_name: "wire-local-lane",
+      screen_pid: 4242,
+      spawn_manifest: JSON.stringify({ env: {}, project_dir: "/opt/x", display_name: "L", runtime: "claude-code" }),
+    });
+    screenState.remoteProbeFailure = null;
+    screenState.remoteProbeFailuresRemaining = 0;
+    screenState.isAliveResult = false; // observed, and genuinely gone
+    const r = await orch.closeAgent("local-lane", undefined, 0);
+    expect(r.fallbackUsed).toBe(false);
+  });
+
+  test("CONTROL: an OBSERVABLE live probe blocks a double resume with the running error", async () => {
+    seedCrossUid();
+    screenState.remoteProbeFailure = null;
+    screenState.isAliveResult = true;
+    await expect(orch.resumeAgent({ id: "ephemeral-lane", projectDir: "/opt/x" }))
+      .rejects.toThrow(/is already running/);
+    expect(orch.store.getAgent("ephemeral-lane")).not.toBeNull();
+  });
+});
+
+describe("N5 · the uid acceptance contract, stated rather than implied", () => {
+  // SAFE_UID replaced a local regex and the swap is NOT a pure tightening. These pin
+  // the contract in both directions so a future edit cannot widen or narrow it silently.
+  // ⓘ The policy is NOT changed here to make a review note go away — it is recorded.
+  const caller = JSON.stringify({ terminal_session_id: "iterm-session-9", screen_name: "wire-fondant", screen_pid: 31337, sty: "31337.wire-fondant" });
+  const reg = (runAsUid: unknown) =>
+    orch.registerAgent({ id: "fondant", displayName: "Fondant", callerSessionId: caller, runAsUid } as never);
+
+  function seed() {
+    orch.store.createAgent({ id: "fondant", display_name: "Fondant", runtime: "claude-code", screen_name: "wire-fondant", screen_pid: 1 });
+    screenState.remoteSessionPidResult = 31337;
+    screenState.pidLooksAliveResult = true;
+  }
+
+  test("an EMPTY uid is now REJECTED, where it used to fall through to the local path", () => {
+    // Deliberate behaviour change from the `!== undefined` guard: explicit over
+    // implicit. `runAsUid: ""` asked for a cross-uid registration and must not be
+    // silently downgraded to a same-uid one.
+    seed();
+    return expect(reg("")).rejects.toThrow(/invalid owning UID/);
+  });
+
+  test("ACCEPTED: dotted and numeric-leading uids (SAFE_UID admits both)", async () => {
+    seed();
+    await expect(reg("svc.worker")).resolves.toBeDefined();
+    orch.store.deleteAgentByScreen("wire-fondant");
+    seed();
+    // Numeric-leading is accepted and is NOT a root path: `sudo -u` resolves a bare
+    // `0` as a USER NAME; a numeric uid requires a `#` prefix. It yields a nonsense
+    // HOME rather than a dangerous one. Recorded so the widening is deliberate.
+    await expect(reg("0")).resolves.toBeDefined();
+  });
+
+  test("REJECTED: over-length, leading dash, slash, and shell metacharacters", async () => {
+    for (const bad of ["a".repeat(65), "-u", "a/b", "a;b", "a b", "a$b", "a`b", "a|b"]) {
+      seed();
+      await expect(reg(bad)).rejects.toThrow(/invalid owning UID/);
+      orch.store.deleteAgentByScreen("wire-fondant");
+    }
+  });
+
+  test("undefined still means same-uid, and is not rejected", async () => {
+    seed();
+    screenState.isAliveResult = true;
+    await expect(reg(undefined)).resolves.toBeDefined();
+  });
+});
+
+// ⛔ FILE-SCOPED RESET — beforeEach is NOT sufficient for these two.
+//
+// `mock.module("./screen", …)` replaces the module PROCESS-WIDE, so `screenState`
+// outlives this file. beforeEach clears the fields before each test HERE, but whatever
+// the LAST test leaves behind is still in effect when the NEXT FILE runs — and
+// screen.test.ts imports the mocked module and asserts on the REAL pidLooksAlive.
+//
+// Measured, not theorised: with `pidLooksAliveResult` left `true` by the final test in
+// this file, `pidLooksAlive > a reaped process is provably dead (ESRCH)` fails in
+// screen.test.ts, and mock-isolation.test.ts catches it as an ORDER failure. The
+// reviewer called this leak "latent, not live"; adding tests that set the field made it
+// live. The scope of the reset has to match the scope of the leak.
+afterAll(() => {
+  // Same list as beforeEach, BY CONSTRUCTION — see resetScreenState().
+  resetScreenState();
+});
+
+describe("N5 · registration → agents.runtime → the teardown decisions", () => {
+  // ⛔ THE SECOND DATA COUPLING, AND THE MORE REACHABLE ONE. registerAgent writes
+  // `agents.runtime`, and three teardown decisions read that column:
+  //   runtimeUsesSlashExit  — closeAgent: /exit keystrokes vs not
+  //   runtimeUsesSlashExit  — stopAgent:  SIGTERM-then-escalate vs not
+  //   usesCodexSpawnHome    — whether the codex-home RECURSIVE DELETE happens at all,
+  //                           or returns skipped:"not-a-codex-runtime"
+  //
+  // ⚠️ Unlike run_as_uid — which crew-service resolves from observed screen state and
+  // never accepts from a caller — `runtime` IS declared on the MCP schema and forwarded
+  // by the dispatch. So this input is CALLER-SUPPLIED, which makes the reach that
+  // follows it more consequential, not less.
+  //
+  // The behaviour is correct and predates this batch; what was missing is any test that
+  // the column's REACH works. Every existing teardown test seeds runtime through
+  // createAgent, never through registerAgent.
+  //
+  // ⓘ NOTHING DESTRUCTIVE RUNS. These use the cross-uid path, so the delete is
+  // constructed and recorded through the mocked sshRun, never executed.
+  const caller = JSON.stringify({
+    terminal_session_id: "iterm-session-9",
+    screen_name: "wire-fondant",
+    screen_pid: 31337,
+    sty: "31337.wire-fondant",
+  });
+  function seed(runtime: string) {
+    orch.store.createAgent({
+      id: "fondant",
+      display_name: "Fondant",
+      runtime,
+      screen_name: "wire-fondant",
+      screen_pid: 1,
+      spawn_manifest: JSON.stringify({ run_as_uid: "_ephemeral", env: {}, project_dir: "/opt/x", display_name: "F", runtime }),
+    });
+    screenState.remoteSessionPidResult = 31337;
+    screenState.pidLooksAliveResult = true;
+  }
+  const register = (extra: Record<string, unknown>) =>
+    orch.registerAgent({ id: "fondant", displayName: "Fondant", callerSessionId: caller, runAsUid: "_ephemeral", ...extra });
+
+  test("claude-code → codex: registration ENABLES the codex-home teardown", async () => {
+    seed("claude-code");
+    await register({ runtime: "codex" });
+    expect(orch.store.getAgent("fondant")!.runtime).toBe("codex");
+
+    screenState.sshRunCalls.length = 0;
+    const r = await orch.stopAgent("fondant");
+    // ⇒ No longer skipped: the registration decided the delete may proceed.
+    expect(r.teardown?.skipped).not.toBe("not-a-codex-runtime");
+    expect(screenState.sshRunCalls.map((c) => c.command).join("\n")).toContain("/Users/_ephemeral/.wire/codex-spawn/fondant");
+  });
+
+  test("codex → claude-code: registration DISABLES it, and the delete is not constructed", async () => {
+    seed("codex");
+    await register({ runtime: "claude-code" });
+    expect(orch.store.getAgent("fondant")!.runtime).toBe("claude-code");
+
+    screenState.sshRunCalls.length = 0;
+    const r = await orch.stopAgent("fondant");
+    expect(r.teardown?.skipped).toBe("not-a-codex-runtime");
+    expect(screenState.sshRunCalls.map((c) => c.command).join("\n")).not.toContain("codex-spawn/fondant");
+  });
+
+  test("runtime OMITTED: the row's own runtime is preserved and still governs the teardown", async () => {
+    // The third direction, and the one a two-case test would miss: registering without
+    // a runtime must not reset the column, or a re-registration would silently disable
+    // a codex agent's cleanup.
+    seed("codex");
+    await register({});
+    expect(orch.store.getAgent("fondant")!.runtime).toBe("codex");
+
+    screenState.sshRunCalls.length = 0;
+    const r = await orch.stopAgent("fondant");
+    expect(r.teardown?.skipped).not.toBe("not-a-codex-runtime");
+  });
+
+  test("registration also flips the SHUTDOWN MODE that runtime selects", async () => {
+    // runtimeUsesSlashExit: claude-code gets /exit keystrokes; codex does not.
+    // Asserted through the recorded keystroke log rather than an internal.
+    seed("codex");
+    await register({ runtime: "claude-code" });
+    screenState.sendKeysLog.length = 0;
+    await orch.closeAgent("fondant", undefined, 250);
+    expect(screenState.sendKeysLog.some((k) => k.keys.includes("/exit"))).toBe(true);
+  });
+
+  test("CONTROL: with the row left on codex, close does NOT send /exit", async () => {
+    seed("codex");
+    await register({});
+    screenState.sendKeysLog.length = 0;
+    await orch.closeAgent("fondant", undefined, 250);
+    expect(screenState.sendKeysLog.some((k) => k.keys.includes("/exit"))).toBe(false);
+  });
+});
+
+describe("N4b · persistent UNKNOWN through terminate → hard-kill", () => {
+  // ⚠️ MY EARLIER CLAIM "never an abort" WAS TOO BROAD, and the ED was right to
+  // challenge it. terminateAgentTree converts UNKNOWN into an escalation (survivors=1),
+  // but the escalation's next step is killAgentSession → killRemoteSession, which
+  // THROWS on UNKNOWN. So a PERSISTENTLY unobservable namespace does abort the stop.
+  //
+  // That is the correct outcome — but only if it aborts BEFORE anything destructive or
+  // irreversible. These pin exactly that: the row survives, no tombstone, and no
+  // teardown command is ever constructed.
+  const manifest = JSON.stringify({ run_as_uid: "_ephemeral", env: { A: "1" }, project_dir: "/opt/x", display_name: "F", runtime: "codex" });
+  function seedCodexCrossUid() {
+    orch.store.createAgent({
+      id: "fondant", display_name: "Fondant", runtime: "codex",
+      screen_name: "wire-fondant", screen_pid: 1, spawn_manifest: manifest,
+    });
+  }
+
+  test("stopAgent THROWS and the row, its manifest and its tombstone state are all retained", async () => {
+    seedCodexCrossUid();
+    screenState.remoteProbeFailure = "sudo refused for uid '_ephemeral'";
+    screenState.sshRunCalls.length = 0;
+
+    await expect(orch.stopAgent("fondant")).rejects.toThrow(/screen probe unavailable/);
+
+    const row = orch.store.getAgent("fondant");
+    expect(row).not.toBeNull();
+    expect(row!.spawn_manifest).toBe(manifest);
+    // ⇒ AND NOTHING DESTRUCTIVE WAS EVEN CONSTRUCTED: no codex-home delete command.
+    expect(screenState.sshRunCalls.map((c) => c.command).join("\n")).not.toContain("codex-spawn/fondant");
+  });
+
+  test("closeAgent THROWS and retains the row the same way", async () => {
+    seedCodexCrossUid();
+    screenState.remoteProbeFailure = "SCREENDIR unreadable for uid '_ephemeral'";
+    screenState.sshRunCalls.length = 0;
+
+    await expect(orch.closeAgent("fondant", undefined, 250)).rejects.toThrow(/screen probe unavailable/);
+
+    expect(orch.store.getAgent("fondant")).not.toBeNull();
+    expect(screenState.sshRunCalls.map((c) => c.command).join("\n")).not.toContain("codex-spawn/fondant");
+  });
+
+  test("UNKNOWN → later OBSERVED recovers within the existing policy, with no extra kill", async () => {
+    // A transient refusal must not permanently wedge a stop, and must not cause the
+    // recovery path to do anything the normal path would not. Two probes fail, then
+    // observation resumes.
+    // ⚠️ RECOVERY IS A LATER CALL, NOT A RETRY. My first version of this test assumed
+    // stopAgent would retry past a transient failure. It does not — there is no retry
+    // loop around killAgentSession, so the first call aborts. That is the correct
+    // design (a failed observation should not be papered over by looping), and the
+    // honest scenario is: one call fails closed, a later call succeeds.
+    seedCodexCrossUid();
+    // ⓘ TWO failures, and the count is the finding: a codex stop probes TWICE —
+    // terminateAgentTree first (whose catch ABSORBS the throw and returns 1), then
+    // killAgentSession. With only one scripted failure the stop SUCCEEDS, because the
+    // terminate catch swallows it. That is the P1 mechanism observed from the outside,
+    // and it is why the catch's return value is only ever load-bearing for a transient.
+    screenState.remoteProbeFailuresRemaining = 2;
+    screenState.killSessionCalls.length = 0;
+    screenState.killSessionSurvivors = 0;
+
+    // Call 1 — persistent-enough UNKNOWN: aborts, row retained, nothing destroyed.
+    await expect(orch.stopAgent("fondant")).rejects.toThrow(/screen probe unavailable/);
+    expect(orch.store.getAgent("fondant")).not.toBeNull();
+    expect(screenState.killSessionCalls.length).toBe(0);
+
+    // Call 2 — the probe now observes. Proceeds through the ORDINARY path.
+    screenState.remoteSessionPidResult = null;
+    const r = await orch.stopAgent("fondant");
+    expect(orch.store.getAgent("fondant")).toBeNull();
+    expect(r.teardown?.skipped).not.toBe("not-a-codex-runtime");
+    // ⇒ WITHIN EXISTING POLICY: exactly one kill, of the one session. The failed call
+    //   left no queued or duplicated work behind.
+    expect(screenState.killSessionCalls.filter((n) => n === "wire-fondant").length).toBe(1);
+  });
+});
+
+describe("P1 · terminateAgentTree's UNKNOWN escalation value", () => {
+  // ⛔ THE VALUE THE COMMENT TURNS ON, AND IT WAS UNTESTED. terminateAgentTree catches
+  // ScreenProbeUnavailable and returns 1 — "unknown survivors", which must never be 0,
+  // because 0 is the value that CERTIFIES A CLEAN TERM. Flipping it to 0 left the suite
+  // at 379/0: the repository could not tell "we could not count" from "we counted none".
+  //
+  // ⚠️ AND THE COMMENT OVERSTATED THE MECHANISM, which is corrected in source. For a
+  // PERSISTENT failure the escalation this value triggers dies one line later in
+  // killRemoteSession, so the 1 never matters. It matters only for a TRANSIENT failure
+  // that clears between the two probes — which is exactly what this test scripts.
+  function seedCodexCrossUid() {
+    orch.store.createAgent({
+      id: "fondant", display_name: "Fondant", runtime: "codex",
+      screen_name: "wire-fondant", screen_pid: 1,
+      spawn_manifest: JSON.stringify({ run_as_uid: "_ephemeral", env: {}, project_dir: "/opt/x", display_name: "F", runtime: "codex" }),
+    });
+  }
+
+  test("a TRANSIENT probe failure during terminate reports a survivor, not a clean term", async () => {
+    seedCodexCrossUid();
+    // Exactly one failure: consumed by terminateRemoteSessionTree. The hard reap that
+    // follows observes normally, so the run completes and the return value is visible.
+    screenState.remoteProbeFailuresRemaining = 1;
+    screenState.remoteSessionPidResult = null;
+    screenState.killSessionSurvivors = 0;
+
+    const r = await orch.closeAgent("fondant", undefined, 250);
+    // ⇒ fallbackUsed is `survivorsAfterTerm > 0`. With the catch returning 1 this is
+    //   true; with the mutant returning 0 it is false and a clean term is certified.
+    expect(r.fallbackUsed).toBe(true);
+  });
+
+  test("CONTROL: an OBSERVED zero-survivor terminate does report a clean term", async () => {
+    // Without this the assertion above passes for a closeAgent that always escalates.
+    seedCodexCrossUid();
+    screenState.remoteProbeFailuresRemaining = 0;
+    screenState.terminateSessionSurvivors = 0;
+    screenState.remoteSessionPidResult = null;
+    screenState.killSessionSurvivors = 0;
+
+    const r = await orch.closeAgent("fondant", undefined, 250);
+    expect(r.fallbackUsed).toBe(false);
+  });
+});
+
+describe("P2 · the grace loop stops on an unobservable probe", () => {
+  test("a permanently failed probe is polled ONCE, not for the whole window", async () => {
+    // ⛔ "A probe that cannot look does not become true by repetition" was already
+    // written in pollRemoteSessionPid and not carried here: the loop spent the full
+    // window issuing ~40 sudo probes and ~40 identical log lines before throwing in
+    // killAgentSession anyway. Timing is not asserted — the OBSERVABLE is that the
+    // close still fails closed, and it now does so promptly.
+    orch.store.createAgent({
+      id: "fondant", display_name: "Fondant", runtime: "claude-code",
+      screen_name: "wire-fondant", screen_pid: 1,
+      spawn_manifest: JSON.stringify({ run_as_uid: "_ephemeral", env: {}, project_dir: "/opt/x", display_name: "F", runtime: "claude-code" }),
+    });
+    screenState.remoteProbeFailure = "sudo refused for uid '_ephemeral'";
+    const started = Date.now();
+    await expect(orch.closeAgent("fondant", undefined, 10_000)).rejects.toThrow(/screen probe unavailable/);
+    // A 10s window that returns in well under it is the behavioural signature of the
+    // early break. Generous bound so this cannot flake on a loaded machine.
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+});
+
+test("R4 GUARD: resetScreenState RESTORES every declared field to its pristine value", () => {
+  // ⛔ FOURTH VERSION. The first three were each defeated, and the shape repeated:
+  //   v1  evidence = "the identifier appears somewhere" ....... 5 of 6 shapes evaded
+  //   v2  evidence = "an assignment is written" .............. declaration-side shapes
+  //                                                            still evaded; and `\s*=`
+  //                                                            matched the first `=` of
+  //                                                            `===`, so a COMPARISON
+  //                                                            satisfied the assignment
+  //                                                            requirement
+  //   v3  evidence = "a sentinel was overwritten" ............ proves the reset is
+  //                                                            STABLE, not that it
+  //                                                            RESTORES. Verified:
+  //                                                            making the reset assign
+  //                                                            `isAliveResult = true`
+  //                                                            passed 138/0.
+  //
+  // ⇒ Each fix closed the probed instance while the CLASS survived, because each new
+  //   evidence was still a proxy. v4 compares against values captured at MODULE SCOPE,
+  //   before any beforeEach ran — so the assertion is "the field is back to what it was",
+  //   which is the property itself rather than a stand-in for it.
+  const SENTINEL = "__R4_SENTINEL__";
+  const bag = screenState as unknown as Record<string, unknown>;
+  const keys = Object.keys(bag);
+  expect(keys.length).toBeGreaterThan(10);
+
+  for (const k of keys) {
+    const v = bag[k];
+    if (Array.isArray(v)) v.push(SENTINEL);
+    else if (v && typeof v === "object") (v as Record<string, unknown>)[SENTINEL] = 1;
+    else bag[k] = SENTINEL;
+  }
+
+  resetScreenState();
+
+  const same = (a: unknown, b: unknown): boolean => {
+    if (Array.isArray(a) || Array.isArray(b)) {
+      return Array.isArray(a) && Array.isArray(b) && a.length === b.length &&
+        a.every((x, n) => x === b[n]);
+    }
+    if (a && b && typeof a === "object" && typeof b === "object") {
+      const ka = Object.keys(a as object), kb = Object.keys(b as object);
+      return ka.length === kb.length &&
+        ka.every((n) => (a as Record<string, unknown>)[n] === (b as Record<string, unknown>)[n]);
+    }
+    return Object.is(a, b);
+  };
+
+  const notRestored = keys.filter((k) => !same(bag[k], PRISTINE_SCREEN_STATE[k]));
+  expect({ notRestored, checked: keys.length }).toEqual({ notRestored: [], checked: keys.length });
 });

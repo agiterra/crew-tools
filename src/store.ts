@@ -653,6 +653,14 @@ export class CrewStore {
     this.db.prepare("UPDATE agents SET screen_pid = ?, last_seen = ? WHERE id = ?").run(pid, Date.now(), id);
   }
 
+  updateAgentRuntime(id: string, runtime: string): void {
+    this.db.prepare("UPDATE agents SET runtime = ?, cc_session_id = CASE WHEN ? = 'claude-code' THEN cc_session_id ELSE NULL END, last_seen = ? WHERE id = ?").run(runtime, runtime, Date.now(), id);
+  }
+
+  updateAgentManifest(id: string, manifest: string): void {
+    this.db.prepare("UPDATE agents SET spawn_manifest = ?, last_seen = ? WHERE id = ?").run(manifest, Date.now(), id);
+  }
+
   updateAgentPane(id: string, pane: string | null): void {
     this.db.prepare("UPDATE agents SET pane = ?, last_seen = ? WHERE id = ?").run(pane, Date.now(), id);
   }

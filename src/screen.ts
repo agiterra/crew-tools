@@ -128,14 +128,22 @@ function remoteScreen(t: RemoteTarget): string {
  *  `sshHost: "local"` executes through a local `/bin/zsh -lc` — identical shell
  *  semantics to the ssh path (login shell), minus the network hop. */
 export async function sshRun(t: RemoteTarget, remoteCommand: string): Promise<string> {
-  if (t.sshHost === LOCAL_SUDO_HOST) {
-    const r = await $`/bin/zsh -lc ${remoteCommand}`.quiet().nothrow();
-    return r.stdout.toString();
-  }
-  const r = await $`ssh -o BatchMode=yes -o ConnectTimeout=15 ${t.sshHost} ${remoteCommand}`
-    .quiet()
-    .nothrow();
-  return r.stdout.toString();
+  return (await sshRunStatus(t, remoteCommand)).stdout;
+}
+
+/** What `sshRun` throws away. A command that FAILED and one that succeeded with no
+ *  output both return "" from sshRun, so a caller deciding presence/absence on stdout
+ *  alone cannot tell "nothing there" from "could not look". */
+export type SshRunResult = { stdout: string; stderr: string; exitCode: number };
+
+/** `sshRun`, retaining exit status and stderr. `sshRun` delegates here, so existing
+ *  callers are unaffected; use this one wherever empty output would otherwise be read
+ *  as a fact about the subject. */
+export async function sshRunStatus(t: RemoteTarget, remoteCommand: string): Promise<SshRunResult> {
+  const r = t.sshHost === LOCAL_SUDO_HOST
+    ? await $`/bin/zsh -lc ${remoteCommand}`.quiet().nothrow()
+    : await $`ssh -o BatchMode=yes -o ConnectTimeout=15 ${t.sshHost} ${remoteCommand}`.quiet().nothrow();
+  return { stdout: r.stdout.toString(), stderr: r.stderr.toString(), exitCode: r.exitCode };
 }
 
 /** Create a detached screen session on a remote host, owned by `runAsUid`. */
@@ -173,7 +181,17 @@ export async function createRemoteSession(
 
 /** Target-aware isAlive — a session under another UID (and/or another host). */
 export async function isRemoteAlive(name: string, t: RemoteTarget): Promise<boolean> {
-  return (await getRemoteSessionPid(name, t)) !== null;
+  // ⛔ FAIL CLOSED. A probe that could not look must never read as "dead" — that is
+  // the misdiagnosis that lets a caller delete a live row. UNKNOWN reports ALIVE here;
+  // callers that need to distinguish must use isRemoteAliveChecked and handle ok:false.
+  return aliveFromProbe(await getRemoteSessionPidChecked(name, t), name);
+}
+
+/** `isRemoteAlive`, propagating UNKNOWN instead of folding it to a boolean. Any
+ *  caller whose next step DELETES a row or SPAWNS a process must use this one. */
+export async function isRemoteAliveChecked(name: string, t: RemoteTarget): Promise<{ ok: true; alive: boolean } | { ok: false; reason: string }> {
+  const probe = await getRemoteSessionPidChecked(name, t);
+  return probe.ok ? { ok: true, alive: probe.pid !== null } : probe;
 }
 
 /**
@@ -250,7 +268,9 @@ async function terminateTree(
  * then quits the screen wrapper. Returns surviving-process count (0 = clean).
  */
 export async function killRemoteSession(name: string, t: RemoteTarget): Promise<number> {
-  const pid = await getRemoteSessionPid(name, t);
+  // A failed probe must not certify ZERO SURVIVORS. There is no number that means
+  // "I could not look", so this throws and the caller escalates (fail closed).
+  const pid = requireObserved(await getRemoteSessionPidChecked(name, t));
   let survivors = 0;
   if (pid) {
     survivors = await reapTree(pid, `sudo -n -u ${t.runAsUid}`, (cmd) => sshRun(t, cmd));
@@ -269,12 +289,22 @@ export async function terminateRemoteSessionTree(
   t: RemoteTarget,
   timeoutMs = 10_000,
 ): Promise<number> {
-  const pid = await getRemoteSessionPid(name, t);
+  // Same rule: a failed probe must not be reported as "nothing to terminate".
+  const pid = requireObserved(await getRemoteSessionPidChecked(name, t));
   if (!pid) return 0;
   return terminateTree(pid, `sudo -n -u ${t.runAsUid}`, timeoutMs, (cmd) => sshRun(t, cmd));
 }
 
-/** PID of a named screen session on a remote host, or null. */
+/**
+ * PID of a named screen session on a remote host, or null.
+ *
+ * @deprecated ⛔ RETURNS `null` FOR BOTH "no such session" AND "I could not look".
+ * That conflation is the defect `getRemoteSessionPidChecked` exists to eliminate — a
+ * failed probe reported as absence is what lets a caller delete a live row. No
+ * production code in this repo calls this any more, but it remains exported through
+ * `index.ts`, so an out-of-repo consumer can still reach it, and it sits next to a
+ * longer-named function that is the correct one. Use `getRemoteSessionPidChecked`.
+ */
 export async function getRemoteSessionPid(name: string, t: RemoteTarget): Promise<number | null> {
   const out = await sshRun(t, `${remoteScreen(t)} -ls`);
   for (const line of out.split("\n")) {
@@ -282,6 +312,94 @@ export async function getRemoteSessionPid(name: string, t: RemoteTarget): Promis
     if (match && match[2] === name) return parseInt(match[1]);
   }
   return null;
+}
+
+/** Outcome of a remote screen-list probe. `ok:false` means UNKNOWN — the caller
+ *  must not report absence, zero survivors, or success. */
+export type RemotePidProbe = { ok: true; pid: number | null } | { ok: false; reason: string };
+
+/** Raised where a numeric return cannot express "I could not look". Callers must
+ *  treat it as fail-closed (escalate / abort), never as a clean result. */
+export class ScreenProbeUnavailable extends Error {
+  constructor(public readonly reason: string) {
+    super(`screen probe unavailable: ${reason}`);
+    this.name = "ScreenProbeUnavailable";
+  }
+}
+
+/**
+ * Decide, from a completed `screen -ls` run, whether we OBSERVED the namespace.
+ *
+ * ⛔ Extracted as a PURE function precisely so it can be tested. Its previous form
+ * lived inline inside the probe and had no test of its own: replacing the
+ * discriminator with `true` passed the entire 354-test suite, which is to say the
+ * repository could not tell the difference between this heuristic working and not
+ * existing. It is a heuristic over ANOTHER PROGRAM'S OUTPUT — wording, stream and
+ * locale — which is exactly what drifts between screen versions while a regex
+ * quietly stops matching. Mirrors the shape `parseScreenList` already uses here.
+ *
+ * ⓘ Exit status is NOT the discriminator: `screen -ls` exits 1 for a legitimately
+ * EMPTY list and prints `No Sockets found …` to STDOUT (observed on 4.00.03 and
+ * 5.0.1). So "rc != 0" would classify every empty namespace as unreadable.
+ *
+ * ⚠️ KNOWN GAP, MEASURED: a NONEXISTENT SCREENDIR also prints `No Sockets found …` to
+ * stdout, so a directory screen could not read classifies as ABSENT, not unobservable —
+ * the exact conflation this exists to prevent, arriving through a door the fixtures do
+ * not model. It is bounded: the ok/not-ok decision reads STDOUT ONLY, so the synthetic
+ * stderr fixtures pin the category STRING, not the classification.
+ *
+ * ⚠️ PRECONDITION: this assumes ENGLISH screen output. The locale that guarantees it
+ * (`LANG`/`LC_ALL=en_US.UTF-8`) is pinned by `remoteScreen`, i.e. by the CALLER — not
+ * here. A caller that builds its own command without that env breaks this silently.
+ */
+export function classifyRemotePidProbe(r: SshRunResult, name: string, runAsUid: string): RemotePidProbe {
+  const looksLikeScreenOutput = /No Sockets found|Sockets? in |^\t\d+\./m.test(r.stdout);
+  if (!looksLikeScreenOutput) {
+    const err = r.stderr.trim().split("\n")[0] ?? "";
+    // Categorise; never echo an arbitrary stderr line back to a caller that may log it.
+    const reason = /sudo|password|not permitted|not allowed/i.test(err)
+      ? `sudo refused for uid '${runAsUid}'`
+      : /screendir|permission denied|cannot open/i.test(err)
+        ? `SCREENDIR unreadable for uid '${runAsUid}'`
+        : `no parseable screen output, exit ${r.exitCode}`;
+    return { ok: false, reason };
+  }
+  for (const line of r.stdout.split("\n")) {
+    const match = line.match(/^\t(\d+)\.(\S+)\t/);
+    if (match && match[2] === name) return { ok: true, pid: parseInt(match[1]) };
+  }
+  return { ok: true, pid: null };
+}
+
+/**
+ * UNKNOWN ⇒ ALIVE. The fail-closed mapping, extracted so it is testable.
+ *
+ * ⛔ Flipping this to `false` is the original defect: a probe that could not look
+ * reports "not running", and the caller prunes a live row. Callers that must
+ * distinguish use the checked probe directly; this is for those that cannot.
+ */
+export function aliveFromProbe(probe: RemotePidProbe, name: string): boolean {
+  if (!probe.ok) {
+    console.error(`[crew] isRemoteAlive: ${probe.reason} — reporting '${name}' ALIVE because liveness is UNKNOWN, not disproved`);
+    return true;
+  }
+  return probe.pid !== null;
+}
+
+/**
+ * Unwrap a probe where the return type is a NUMBER and therefore cannot express
+ * "I could not look". Throws rather than letting a failed observation be counted
+ * as zero survivors, nothing to terminate, or a session that has not appeared yet.
+ */
+export function requireObserved(probe: RemotePidProbe): number | null {
+  if (!probe.ok) throw new ScreenProbeUnavailable(probe.reason);
+  return probe.pid;
+}
+
+/** A remote-pid lookup that can report ITS OWN failure. Thin wrapper: run, then
+ *  classify. The decision lives in `classifyRemotePidProbe`, which is tested. */
+export async function getRemoteSessionPidChecked(name: string, t: RemoteTarget): Promise<RemotePidProbe> {
+  return classifyRemotePidProbe(await sshRunStatus(t, `${remoteScreen(t)} -ls`), name, t.runAsUid);
 }
 
 /**
@@ -295,7 +413,9 @@ export async function pollRemoteSessionPid(
 ): Promise<number | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const pid = await getRemoteSessionPid(name, t);
+    // A probe that cannot look does not become true by repetition — stop, do not
+    // spend the whole window turning one unreadable namespace into "not there yet".
+    const pid = requireObserved(await getRemoteSessionPidChecked(name, t));
     if (pid !== null) return pid;
     if (Date.now() >= deadline) return null;
     await new Promise((r) => setTimeout(r, 400));
