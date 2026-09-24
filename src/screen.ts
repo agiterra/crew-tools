@@ -543,12 +543,34 @@ export function parseScreenList(output: string): ScreenSession[] {
 }
 
 /**
- * Get PID of a named screen session, or null if not running.
+ * Every LIVE session named EXACTLY `name`: state not "dead", pid alive (EPERM counts — another uid's process).
+ *
+ * ⛔ 2026-09-24 (Brioche's kx sidecar ran twice for days): screen keeps "(Remote or dead)" sockets under the SAME
+ * name as the live session. getSessionPid used `find()` — the FIRST name match — so whenever a dead socket sorted
+ * first the answer was a corpse's pid, and every caller built on it (isAlive, killSession, stopAgent) acted on the
+ * wrong session. A question about a NAME has to look at every session carrying it. Pure, for tests.
+ */
+export function liveSessions(
+  sessions: ScreenSession[],
+  name: string,
+  alive: (pid: number) => boolean = pidLooksAlive,
+): ScreenSession[] {
+  return sessions.filter(
+    (s) =>
+      s.name === name &&
+      !(s.state && /dead/i.test(s.state)) &&
+      Number.isFinite(s.pid) &&
+      s.pid > 0 &&
+      alive(s.pid),
+  );
+}
+
+/**
+ * Get PID of a LIVE session with exactly this name, or null if none is live. With duplicates (two live sessions
+ * sharing a name) the first live one is returned: "is it running" must answer YES, or a caller launches a third.
  */
 export async function getSessionPid(name: string): Promise<number | null> {
-  const sessions = await listSessions();
-  const session = sessions.find((s) => s.name === name);
-  return session?.pid ?? null;
+  return liveSessions(await listSessions(), name)[0]?.pid ?? null;
 }
 
 /**
@@ -730,15 +752,18 @@ export async function readOutput(name: string): Promise<string> {
  * Screen's quit only sends SIGHUP which some processes ignore (e.g. Codex).
  */
 export async function killSession(name: string): Promise<number> {
-  const pid = await getSessionPid(name);
+  // ⛔ EXACT pid.name ONLY. A bare `screen -S <name> -X quit` PREFIX-selects the unique session whose name STARTS with
+  // <name> when none is named exactly <name> — on 2026-09-23 that killed the live successor lane
+  // wire-eng-3927-oracle-api-2 during the reap of wire-eng-3927-oracle-api. With no live exact-name session there is
+  // nothing to quit, so nothing is sent. Duplicates (same name, two live sessions) are ALL this agent's: quit each.
   let survivors = 0;
-  if (pid) {
-    survivors = await reapTree(pid, "", async (cmd) => {
+  for (const s of liveSessions(await listSessions(), name)) {
+    survivors += await reapTree(s.pid, "", async (cmd) => {
       const r = await $`/bin/sh -c ${cmd}`.quiet().nothrow();
       return r.stdout.toString();
     });
+    await $`${SCREEN} -S ${`${s.pid}.${name}`} -X quit`.quiet().nothrow();
   }
-  await $`${SCREEN} -S ${name} -X quit`.quiet().nothrow();
   return survivors;
 }
 

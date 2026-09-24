@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { parseScreenList, pidLooksAlive, classifyRemotePidProbe, aliveFromProbe, requireObserved, ScreenProbeUnavailable } from "./screen";
+import { parseScreenList, liveSessions, pidLooksAlive, classifyRemotePidProbe, aliveFromProbe, requireObserved, ScreenProbeUnavailable } from "./screen";
 
 // Regression tests for 24f3d06: screen_alive reported dead sockets as alive.
 // A socket is not a session — the parser used to DISCARD the state field, and
@@ -210,4 +210,33 @@ test("N4 wiring: all three numeric-return consumers route through requireObserve
   const checked = bodyOf("export async function getRemoteSessionPidChecked");
   expect(checked).toContain("classifyRemotePidProbe");
   expect(checked).toContain("sshRunStatus");
+});
+
+// 2026-09-24: a name question must look at EVERY session carrying the name (dead same-named sockets sort first),
+// and never at a session whose name merely STARTS with it.
+describe("liveSessions", () => {
+  const live = new Set([501, 502]);
+  const alive = (pid: number) => live.has(pid);
+  const ls = [
+    { name: "wire-kx-1", pid: 101, state: "Remote or dead" },
+    { name: "wire-kx-1", pid: 102 },                 // dead pid, no state column
+    { name: "wire-kx-1", pid: 501, state: "Detached" },
+    { name: "wire-kx-1-2", pid: 502, state: "Detached" },
+  ];
+  test("dead same-named sockets FIRST -> the live one is found", () => {
+    expect(liveSessions(ls, "wire-kx-1", alive).map((s) => s.pid)).toEqual([501]);
+  });
+  test("a live session whose name only STARTS with the name is not a match", () => {
+    expect(liveSessions(ls.slice(0, 2), "wire-kx-1", alive)).toEqual([]);
+    expect(liveSessions(ls, "wire-kx-1-2", alive).map((s) => s.pid)).toEqual([502]);
+  });
+  test("state 'dead' excludes even a pid that looks alive (pid reuse)", () => {
+    expect(liveSessions([{ name: "x", pid: 501, state: "Remote or dead" }], "x", alive)).toEqual([]);
+  });
+  test("two live duplicates are both returned (both belong to the agent)", () => {
+    expect(liveSessions([{ name: "x", pid: 501 }, { name: "x", pid: 502 }], "x", alive).length).toBe(2);
+  });
+  test("control: the old first-match find() returns the corpse on the same list", () => {
+    expect(ls.find((s) => s.name === "wire-kx-1")?.pid).toBe(101);
+  });
 });
