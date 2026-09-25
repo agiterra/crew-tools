@@ -422,16 +422,50 @@ export async function pollRemoteSessionPid(
   }
 }
 
-/** Read the screen buffer of a remote session (hardcopy + cat in one round-trip). */
+// Exit codes the remote read uses to say WHICH step failed (distinct from ssh's 255 and a shell's 1/2/126/127).
+export const REMOTE_HC_FAILED = 73;
+export const REMOTE_CAT_FAILED = 74;
+
+export type RemoteRead = { ok: true; text: string } | { ok: false; reason: string };
+
+/**
+ * Decide what a remote hardcopy+cat run means. Pure, so it is tested.
+ *
+ * ⛔ WHY (Baguette 632402, 2026-09-25): the old read was `hardcopy; sudo -n cat 2>/dev/null` and returned stdout.
+ * For a caller WITHOUT the `(<uid>) NOPASSWD: screen` grant, sudo refused the hardcopy, no file was written, the cat
+ * failed silently, and agent_read returned "" — byte-identical to a blank screen. An unreadable screen must never
+ * come back as an empty one. Like classifyRemotePidProbe, stderr is CATEGORISED, never echoed to the caller.
+ */
+export function classifyRemoteRead(r: SshRunResult, name: string, runAsUid: string): RemoteRead {
+  if (r.exitCode === 0) return { ok: true, text: r.stdout.trimEnd() };
+  const err = r.stderr;
+  if (r.exitCode === REMOTE_HC_FAILED) {
+    if (/password is required|not allowed|not permitted|may not run sudo/i.test(err)) {
+      return { ok: false, reason: `this uid has no passwordless sudo to run screen as '${runAsUid}' (the "(${runAsUid}) NOPASSWD: screen" grant). ` +
+        `Read cross-uid screens through crew-service instead: the crew-fleet MCP's crew_agent_read.` };
+    }
+    if (/No screen session found/i.test(err)) return { ok: false, reason: `no screen session '${name}' under uid '${runAsUid}'` };
+    return { ok: false, reason: `screen hardcopy as '${runAsUid}' failed` };
+  }
+  if (r.exitCode === REMOTE_CAT_FAILED) return { ok: false, reason: `the hardcopy of '${name}' could not be read back (neither cat nor sudo -n cat)` };
+  if (r.exitCode === 255) return { ok: false, reason: `ssh to the target failed` };
+  return { ok: false, reason: `remote read exited ${r.exitCode}` };
+}
+
+/** Read the screen buffer of a remote session (hardcopy + cat in one round-trip). Throws when it could not look. */
 export async function readRemoteOutput(name: string, t: RemoteTarget): Promise<string> {
   const tmp = `/tmp/screen-hc-${name}-${Date.now()}`;
-  // hardcopy runs as the ephemeral UID (writes $tmp owned by it); `sudo cat`
-  // (as the SSH user, broad NOPASSWD) reads it regardless of mode.
-  const out = await sshRun(
+  // hardcopy runs as the target UID and writes $tmp 0644 under its umask, so a plain `cat` reads it (measured
+  // 2026-09-25); `sudo -n cat` stays as the fallback for a stricter umask. Each step reports its own failure.
+  const r = await sshRunStatus(
     t,
-    `${remoteScreen(t)} -S ${name} -X hardcopy ${tmp}; sleep 0.3; sudo -n cat ${tmp} 2>/dev/null; rm -f ${tmp}`,
+    `hc=$(${remoteScreen(t)} -S ${name} -X hardcopy ${tmp} 2>&1) || { printf '%s\\n' "$hc" >&2; exit ${REMOTE_HC_FAILED}; }; ` +
+      `sleep 0.3; { cat ${tmp} 2>/dev/null || sudo -n cat ${tmp} 2>/dev/null; } || { rm -f ${tmp} 2>/dev/null; exit ${REMOTE_CAT_FAILED}; }; ` +
+      `rm -f ${tmp} 2>/dev/null; exit 0`,
   );
-  return out.trimEnd();
+  const read = classifyRemoteRead(r, name, t.runAsUid);
+  if (!read.ok) throw new Error(`cannot read screen '${name}': ${read.reason}`);
+  return read.text;
 }
 
 /**
@@ -506,10 +540,15 @@ export async function sendRemoteKeys(name: string, text: string, t: RemoteTarget
   // (Brioche 595941). STUFF_CHUNK (256) is well under the cap; a short settle keeps order.
   for (let i = 0; i < text.length; i += STUFF_CHUNK) {
     const b64 = Buffer.from(text.slice(i, i + STUFF_CHUNK)).toString("base64");
-    await sshRun(
+    // Same silent-failure class as the old read: a refused sudo typed NOTHING and returned normally. Say so.
+    const r = await sshRunStatus(
       t,
-      `${remoteScreen(t)} -S ${name} -X stuff "$(printf %s ${b64} | base64 -d)"`,
+      `hc=$(${remoteScreen(t)} -S ${name} -X stuff "$(printf %s ${b64} | base64 -d)" 2>&1) || { printf '%s\\n' "$hc" >&2; exit ${REMOTE_HC_FAILED}; }`,
     );
+    if (r.exitCode !== 0) {
+      const read = classifyRemoteRead(r, name, t.runAsUid);
+      throw new Error(`cannot send to screen '${name}': ${read.ok ? `exit ${r.exitCode}` : read.reason.replace("screen hardcopy", "screen stuff")}`);
+    }
     if (i + STUFF_CHUNK < text.length) await new Promise((r) => setTimeout(r, 30));
   }
 }

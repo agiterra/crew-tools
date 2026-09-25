@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { parseScreenList, liveSessions, pidLooksAlive, classifyRemotePidProbe, aliveFromProbe, requireObserved, ScreenProbeUnavailable } from "./screen";
+import { parseScreenList, liveSessions, pidLooksAlive, classifyRemotePidProbe, aliveFromProbe, requireObserved, ScreenProbeUnavailable, classifyRemoteRead, REMOTE_HC_FAILED, REMOTE_CAT_FAILED } from "./screen";
 
 // Regression tests for 24f3d06: screen_alive reported dead sockets as alive.
 // A socket is not a session — the parser used to DISCARD the state field, and
@@ -238,5 +238,56 @@ describe("liveSessions", () => {
   });
   test("control: the old first-match find() returns the corpse on the same list", () => {
     expect(ls.find((s) => s.name === "wire-kx-1")?.pid).toBe(101);
+  });
+});
+
+// ⛔ Baguette 632402 (2026-09-25): agent_read returned "" for a caller without the screen grant — the same bytes
+// as a blank screen. Both directions: every failure is an error, AND a genuinely blank screen still reads blank.
+describe("classifyRemoteRead — an unreadable screen is never a blank one", () => {
+  const c = (exitCode: number, stdout = "", stderr = "") => classifyRemoteRead({ stdout, stderr, exitCode }, "wire-x", "_ephemeral");
+  test("exit 0 with text -> the text", () => expect(c(0, "hello\n\n")).toEqual({ ok: true, text: "hello" }));
+  test("exit 0 with NOTHING -> a blank screen, still ok", () => expect(c(0, "")).toEqual({ ok: true, text: "" }));
+  test("sudo refused -> names the missing grant and the crew-fleet route", () => {
+    const r = c(REMOTE_HC_FAILED, "", "sudo: a password is required\n");
+    expect(r.ok).toBe(false);
+    if (!r.ok) { expect(r.reason).toContain('"(_ephemeral) NOPASSWD: screen" grant'); expect(r.reason).toContain("crew_agent_read"); }
+  });
+  test("missing session -> says so", () => {
+    const r = c(REMOTE_HC_FAILED, "", "No screen session found.\n");
+    expect(r).toEqual({ ok: false, reason: "no screen session 'wire-x' under uid '_ephemeral'" });
+  });
+  test("readback failed -> error, not blank", () => expect(c(REMOTE_CAT_FAILED).ok).toBe(false));
+  test("ssh failure -> error", () => expect(c(255, "", "ssh: connect to host x port 22: Connection refused")).toEqual({ ok: false, reason: "ssh to the target failed" }));
+  test("unknown non-zero -> error, never text", () => expect(c(1, "partial").ok).toBe(false));
+  test("stderr is categorised, never echoed", () => {
+    const r = c(REMOTE_HC_FAILED, "", "some-secret-looking-line AKIAXXXXXXXX");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).not.toContain("AKIA");
+  });
+});
+
+// Real sudo, same host: proves the SHELL half — that each failing step actually reaches its exit code. Runs in a CHILD
+// bun process: orchestrator.test.ts mocks readRemoteOutput/sendRemoteKeys process-wide, and in the ORDER control
+// (mock-isolation.test.ts) an in-process call would hit the fake. Skips (and says so) where this uid cannot sudo.
+describe("readRemoteOutput / sendRemoteKeys through real sudo (local, child process)", () => {
+  const canSudo = Bun.spawnSync(["sudo", "-n", "true"]).exitCode === 0;
+  // screen -ls exits 1 with no sockets even WITH the grant; only a sudo refusal says "password".
+  const hasEphemeralGrant = !/password/i.test(Bun.spawnSync(["sudo", "-n", "-u", "_ephemeral", "/opt/homebrew/bin/screen", "-ls"]).stderr.toString());
+  const real = (fn: "readRemoteOutput" | "sendRemoteKeys", name: string, uid: string): string => {
+    const code = `import { ${fn} } from ${JSON.stringify(import.meta.dir + "/screen.ts")};
+      try { const r = await ${fn}(${JSON.stringify(name)}, ${fn === "sendRemoteKeys" ? '"x", ' : ""}{ sshHost: "local", runAsUid: ${JSON.stringify(uid)} });
+            console.log("RETURNED:" + JSON.stringify(r ?? null)); }
+      catch (e) { console.log("THREW:" + (e as Error).message); }`;
+    return Bun.spawnSync(["bun", "-e", code]).stdout.toString().trim();
+  };
+  // 'nobody' has no home, so its screen fails whatever this uid's sudo allows: the read must THROW, never return "".
+  test.skipIf(!canSudo)("a screen that cannot be read -> read throws (the old code returned \"\")", () => {
+    expect(real("readRemoteOutput", "wire-none", "nobody")).toMatch(/^THREW:cannot read screen 'wire-none'/);
+  });
+  test.skipIf(!canSudo)("same failure on send -> throws instead of typing nothing silently", () => {
+    expect(real("sendRemoteKeys", "wire-none", "nobody")).toMatch(/^THREW:cannot send to screen 'wire-none'/);
+  });
+  test.skipIf(!canSudo || !hasEphemeralGrant)("a missing session under a granted uid -> throws 'no screen session'", () => {
+    expect(real("readRemoteOutput", "wire-no-such-session-zz", "_ephemeral")).toMatch(/^THREW:cannot read screen .*no screen session 'wire-no-such-session-zz'/);
   });
 });
