@@ -496,6 +496,23 @@ export async function startServer(): Promise<void> {
       },
     },
     {
+      name: "agent_recycle",
+      description:
+        "Recycle an idle Claude _ephemeral lane in place: /clear, verify a NEW session opened by the clear, then send kickoff_text. " +
+        "Refuses (verbatim reasons) with 'not claude-code', 'not _ephemeral', 'mid-turn' (turn open, a transcript event <20 s ago, or a spinner/dialog on screen), " +
+        "or 'no new session' (after /clear; the kickoff is then NOT sent). Returns {old_session, new_session, context_before, context_after|null, " +
+        "cleared_at, kickoff_at, kickoff_landed, first_answer_at|null}; context_after is null with note 'no answer yet' if no answer within answer_wait_s.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          id: { type: "string", description: "Agent ID of the lane" },
+          kickoff_text: { type: "string", description: "First prompt for the fresh session (submitted for you; no trailing newline needed)" },
+          answer_wait_s: { type: "number", description: "Seconds to wait for the first answer's context reading. Default 90, max 600." },
+        },
+        required: ["id", "kickoff_text"],
+      },
+    },
+    {
       name: "agent_read",
       description: "Read an agent's current screen output. Works whether the agent is attached to a pane or running headless.",
       inputSchema: {
@@ -807,6 +824,16 @@ export async function startServer(): Promise<void> {
             cc_session_id: a.cc_session_id,
           });
           break;
+        case "agent_recycle": {
+          const wait = typeof a.answer_wait_s === "number" ? a.answer_wait_s : 90;
+          // /clear wait (≤20 s) + answer wait + send/probe slack.
+          result = await crewRpc(
+            "crew.agent_recycle",
+            { id: a.id, kickoff_text: a.kickoff_text, answer_wait_s: a.answer_wait_s },
+            (Math.min(Math.max(wait, 0), 600) + 60) * 1000,
+          );
+          break;
+        }
         case "agent_close":
           result = await crewRpc("crew.agent_close", { id: a.id, cc_session_id: a.cc_session_id }, 120_000);
           break;
