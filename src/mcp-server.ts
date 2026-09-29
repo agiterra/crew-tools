@@ -1043,6 +1043,17 @@ export async function startServer(): Promise<void> {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGHUP", () => void shutdown("SIGHUP"));
+  // The client is gone when stdin ends: exit rather than outlive it (2026-09-29, fondant). With only
+  // signal handlers, every CC session that ended without signalling its children — `claude -p` runs,
+  // crashed sessions — left this server alive under launchd, holding Wire SSE sessions as the caller:
+  // 16 orphans across one uid, broker sessions 19 → 3 once they were killed. The wire plugin already
+  // exits on these paths (wire-tools mcp-server.ts); this is the same pattern.
+  process.stdin.on("end", () => void shutdown("stdin_end"));
+  process.stdin.on("close", () => void shutdown("stdin_close"));
+  const parentPid = process.ppid;
+  setInterval(() => {
+    if (process.ppid !== parentPid) void shutdown(`orphaned (ppid ${parentPid} -> ${process.ppid})`);
+  }, 5000).unref();
 
   const reconcileResult = await crewRpc("crew.reconcile", {});
   const report = typeof reconcileResult === "object" && reconcileResult !== null && "report" in reconcileResult
