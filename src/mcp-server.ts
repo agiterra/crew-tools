@@ -501,7 +501,9 @@ export async function startServer(): Promise<void> {
         "Recycle an idle Claude _ephemeral lane in place: /clear, verify a NEW session opened by the clear, then send kickoff_text. " +
         "Refuses (verbatim reasons) with 'not claude-code', 'not _ephemeral', 'mid-turn' (turn open, a transcript event <20 s ago, or a spinner/dialog on screen), " +
         "or 'no new session' (after /clear; the kickoff is then NOT sent). Returns {old_session, new_session, context_before, context_after|null, " +
-        "cleared_at, kickoff_at, kickoff_landed, first_answer_at|null}; context_after is null with note 'no answer yet' if no answer within answer_wait_s.",
+        "cleared_at, kickoff_at, clear_landed, kickoff_landed, first_answer_at|null, send_heuristic}; context_after is null with note 'no answer yet' if no answer within answer_wait_s. " +
+        "clear_landed/kickoff_landed are EVIDENCE (a new session opened by /clear; new-session usage after the kickoff — null = no answer yet, not 'failed'). " +
+        "send_heuristic {clear, kickoff} holds the raw keystroke verdicts: advisory only, since Claude Code echoes the submitted line and they read false.",
       inputSchema: {
         type: "object" as const,
         properties: {

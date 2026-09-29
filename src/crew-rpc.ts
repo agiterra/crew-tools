@@ -105,6 +105,9 @@ export async function createCrewRpcWriter(opts: CrewRpcWriterOptions = {}): Prom
     agentName: agentId,
     keyPair: { publicKey, privateKey },
     ccSessionId: `crew-tools-rpc-${process.pid}`,
+    // Helper stream under the agent's identity: the broker (wire >= 1.19.0) starts it at head and
+    // never lets its acks advance the agent's replay cursor, so it cannot eat the agent's backlog.
+    auxiliary: true,
     deliver: async ({ raw }) => {
       client.handleEvent(raw);
     },
