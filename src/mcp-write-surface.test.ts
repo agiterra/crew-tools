@@ -61,7 +61,7 @@ describe("MCP server write surface", () => {
     // Tools that mutate crew state. Reads are excluded by design.
     const MUTATING = [
       "agent_launch", "agent_resume", "agent_register", "agent_badge",
-      "agent_interrupt", "agent_close", "agent_stop", "agent_attach",
+      "agent_interrupt", "agent_recycle", "agent_close", "agent_stop", "agent_attach",
       "agent_detach", "agent_move", "agent_swap", "agent_send",
       "tab_register", "tab_create", "tab_destroy",
       "pane_register", "pane_create", "pane_send", "pane_badge",
