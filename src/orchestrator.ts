@@ -428,7 +428,7 @@ export async function autoConfirmDevChannel(
 
 /**
  * Extract what a launch command ASKS for (AGI-78 asked-vs-got). Resolves
- * shell-default tokens (`${CLAUDE_MODEL:-claude-opus-4-8}`) against the spawn
+ * shell-default tokens (`${CLAUDE_MODEL:-claude-sonnet-5}`) against the spawn
  * env exactly the way the shell will, so the expectation derives from the ONE
  * source (the runtime command) instead of a duplicated constant that drifts.
  *

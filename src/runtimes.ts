@@ -46,8 +46,8 @@ export type RuntimeConfig = {
 
 const DEFAULTS: Record<string, RuntimeConfig> = {
   "claude-code": {
-    command: "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions --model ${CLAUDE_MODEL:-claude-opus-4-8} --effort ${CLAUDE_EFFORT:-high}",
-    description: "Claude Code with Wire channel (SSE push). MCP plugins (wire-ipc, personai, crew) load from installed_plugins.json per project scope. Model honours env CLAUDE_MODEL, defaulting to Opus (Tim 2026-07-06: no Fable engineers). A MISSING pin FAILS SAFE to the policy model rather than to Fable. WARNING: do NOT restore a hardcoded --model here: a command-line flag beats an exported env var, so the pin arrives and is never read. And the previous text advertised a per-machine ~/.wire/runtimes.json override that does NOT exist for shared-topology personae, whose runtimes are resolved by crew-service under a different HOME.",
+    command: "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions --model ${CLAUDE_MODEL:-claude-sonnet-5} --effort ${CLAUDE_EFFORT:-high}",
+    description: "Claude Code with Wire channel (SSE push). MCP plugins (wire-ipc, personai, crew) load from installed_plugins.json per project scope. Model honours env CLAUDE_MODEL, defaulting to Sonnet (Brioche ruling 2026-10-02 21:22Z: the cheap model is the default; an expensive model must be explicit in the spawn. Earlier: Tim 2026-07-06, no Fable engineers). A MISSING pin FAILS SAFE to the policy model rather than to Fable. WARNING: do NOT restore a hardcoded --model here: a command-line flag beats an exported env var, so the pin arrives and is never read. And the previous text advertised a per-machine ~/.wire/runtimes.json override that does NOT exist for shared-topology personae, whose runtimes are resolved by crew-service under a different HOME.",
   },
   "codex": {
     command: "codex",
