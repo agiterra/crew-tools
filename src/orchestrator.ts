@@ -466,6 +466,29 @@ export function askedFromCommand(
 }
 
 /**
+ * What an argv VECTOR got, element by element: `--flag value` or `--flag=value`, last occurrence wins (the CLI's
+ * rule). Never a regex over a joined line: a prompt or --append-system-prompt value is ONE element, so prose inside
+ * it ("your own argv --model/--effort read,") can never read as a flag (eng60-4570, 2026-10-02: effort 'read,').
+ */
+export function flagsFromArgv(argv: string[]): { model?: string; effort?: string; channels: boolean } {
+  const last = (flag: string): string | undefined => {
+    let v: string | undefined;
+    for (let i = 0; i < argv.length; i++) {
+      const a = argv[i]!;
+      if (a === flag && i + 1 < argv.length) v = argv[++i];
+      else if (a.startsWith(`${flag}=`)) v = a.slice(flag.length + 1);
+    }
+    return v;
+  };
+  const ch = "--dangerously-load-development-channels";
+  return {
+    model: last("--model"),
+    effort: last("--effort"),
+    channels: argv.some((a) => a === ch || a.startsWith(`${ch}=`)),
+  };
+}
+
+/**
  * Post-spawn asked-vs-got read-back (AGI-78): compare the ask against the argv
  * the process ACTUALLY got — never against a re-read of the source config,
  * which certifies itself. Four durable outcomes:
@@ -486,8 +509,8 @@ export async function verifySpawnArgv(
     store?: CrewStore;
     agentId?: string;
     remote?: screen.RemoteTarget;
-    /** Injectable argv source (tests). Default: screen.sessionClaudeArgv. */
-    argvReader?: () => Promise<string | null>;
+    /** Injectable argv source (tests). Default: screen.sessionClaudeArgv. One element per argument. */
+    argvReader?: () => Promise<string[] | null>;
     appearMs?: number;
   } = {},
 ): Promise<void> {
@@ -495,7 +518,7 @@ export async function verifySpawnArgv(
   const read = opts.argvReader ?? (() => screen.sessionClaudeArgv(screenName, opts.remote));
   const appearMs = opts.appearMs ?? 30_000;
   const deadline = Date.now() + appearMs;
-  let argv: string | null = null;
+  let argv: string[] | null = null;
   let threw = 0;
   for (;;) {
     try {
@@ -519,12 +542,7 @@ export async function verifySpawnArgv(
     return;
   }
 
-  const lastTok = (flag: string) => [...argv!.matchAll(new RegExp(`${flag}[= ](\\S+)`, "g"))].at(-1)?.[1];
-  const got = {
-    model: lastTok("--model"),
-    effort: lastTok("--effort"),
-    channels: argv.includes("--dangerously-load-development-channels"),
-  };
+  const got = flagsFromArgv(argv);
 
   const mismatches: string[] = [];
   if (asked.model !== undefined && got.model !== asked.model) {

@@ -32,7 +32,7 @@ const screenState = {
   terminateSessionSurvivors: 0,
   // Scriptable ACTING argv for the post-spawn read-back chain. null = the probe
   // saw nothing (the argv-unreadable path).
-  argvResult: null as string | null,
+  argvResult: null as string[] | null,
   sshRunCalls: [] as Array<{ target: unknown; command: string }>,
   // Cross-uid registration (coupled registration patch): the runAsUid path
   // resolves liveness through getRemoteSessionPid + pidLooksAlive instead of
@@ -189,7 +189,7 @@ mock.module("./screen", () => ({
   sessionClaudeArgv: async () => screenState.argvResult,
 }));
 
-const { Orchestrator, SOURCE_NEAREST_ENV, WIPE_CLAUDE_SETTINGS_LOCAL, autoConfirmDevChannel, askedFromCommand, verifySpawnArgv, verifyWireInbound } = await import("./orchestrator");
+const { Orchestrator, SOURCE_NEAREST_ENV, WIPE_CLAUDE_SETTINGS_LOCAL, autoConfirmDevChannel, askedFromCommand, verifySpawnArgv, flagsFromArgv, verifyWireInbound } = await import("./orchestrator");
 
 function makeTerminal(): TerminalBackend {
   return {
@@ -1280,8 +1280,10 @@ describe("askedFromCommand — the ask derives from the command, not a duplicate
 });
 
 describe("verifySpawnArgv — asked-vs-got against the ACTING argv", () => {
-  const ARGV_FULL =
-    "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions --model claude-opus-5 --effort medium You are a lane";
+  const ARGV_FULL = [
+    "claude", "--dangerously-load-development-channels", "plugin:wire@agiterra", "--permission-mode", "bypassPermissions",
+    "--model", "claude-opus-5", "--effort", "medium", "You are a lane",
+  ];
 
   test("match over boot-gate-ok appends 'argv verified' to the healthy status", async () => {
     await orch.launchAgent({ env: { AGENT_ID: "avok" } });
@@ -1315,7 +1317,7 @@ describe("verifySpawnArgv — asked-vs-got against the ACTING argv", () => {
 
     await verifySpawnArgv("dvc", "avch", { channels: true }, {
       store: orch.store, agentId: "avch",
-      argvReader: async () => "claude --permission-mode bypassPermissions --model claude-opus-5",
+      argvReader: async () => ["claude", "--permission-mode", "bypassPermissions", "--model", "claude-opus-5"],
     });
 
     const row = orch.store.getAgent("avch");
@@ -1362,13 +1364,39 @@ describe("verifySpawnArgv — asked-vs-got against the ACTING argv", () => {
     expect(row?.status_desc).toBe("no banner, no process");
   });
 
+  test("prose INSIDE an argument is never a flag (eng60-4570: prompt said '--model/--effort read,')", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "avprose" } });
+    orch.store.updateAgentStatus("avprose", "boot-gate-ok", "dialogs confirmed: 1");
+    await verifySpawnArgv("dvp", "avprose", { model: "claude-sonnet-5", effort: "high", channels: true }, {
+      store: orch.store, agentId: "avprose",
+      argvReader: async () => [
+        "claude", "--dangerously-load-development-channels", "server:plugin_wire_wire",
+        "--append-system-prompt", "Other channel sources are context. Never pass --effort low or --model x yourself.",
+        "--permission-mode", "bypassPermissions", "--model", "claude-sonnet-5", "--effort", "high", "--session-id", "u1",
+        "Your first IPC to baguette: brief sha match, your own argv --model/--effort read, the worktree --effort read,",
+      ],
+    });
+    const row = orch.store.getAgent("avprose");
+    expect(row?.status_name).toBe("boot-gate-ok");
+    expect(row?.status_desc).toContain("argv verified: model=claude-sonnet-5 effort=high channels=present");
+  });
+
+  test("flagsFromArgv: --flag value and --flag=value, last wins (extraFlags after the prompt), empty arg keeps its slot", () => {
+    expect(flagsFromArgv(["claude", "--effort", "high", "a prompt --effort low", "--effort=medium"]))
+      .toEqual({ model: undefined, effort: "medium", channels: false });
+    expect(flagsFromArgv(["claude", "--model", "", "--effort", "high"]).model).toBe("");
+    expect(flagsFromArgv(["claude", "--model", "claude-opus-5", "--model"]).model).toBe("claude-opus-5");
+    expect(flagsFromArgv(["claude", "run with --dangerously-load-development-channels please"]).channels).toBe(false);
+    expect(flagsFromArgv(["claude", "--dangerously-load-development-channels=plugin:wire@agiterra"]).channels).toBe(true);
+  });
+
   test("a field the spawn never asked for is not asserted", async () => {
     await orch.launchAgent({ env: { AGENT_ID: "avnone" } });
     orch.store.updateAgentStatus("avnone", "boot-gate-ok", "dialogs confirmed: 0");
 
     await verifySpawnArgv("dvc", "avnone", { channels: true }, {
       store: orch.store, agentId: "avnone",
-      argvReader: async () => "claude --dangerously-load-development-channels plugin:wire@agiterra --resume abc",
+      argvReader: async () => ["claude", "--dangerously-load-development-channels", "plugin:wire@agiterra", "--resume", "abc"],
     });
 
     const row = orch.store.getAgent("avnone");
@@ -1530,7 +1558,7 @@ describe("verifyWireInbound — the BROKER's view of the inbound connection", ()
         fallback: "Channels (experimental)\n? for shortcuts",
       };
       screenState.argvResult =
-        "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions --model claude-opus-4-8 --effort high";
+        "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions --model claude-opus-4-8 --effort high".split(" ");
       // The broker never sees it: no MCP server started, so nothing registered.
       wireState.roster = [{ id: "brioche", connection_status: "connected" }];
 

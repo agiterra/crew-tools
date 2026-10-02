@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { parseScreenList, liveSessions, pidLooksAlive, classifyRemotePidProbe, aliveFromProbe, requireObserved, ScreenProbeUnavailable, classifyRemoteRead, REMOTE_HC_FAILED, REMOTE_CAT_FAILED } from "./screen";
+import { parseScreenList, liveSessions, pidLooksAlive, classifyRemotePidProbe, aliveFromProbe, requireObserved, ScreenProbeUnavailable, classifyRemoteRead, REMOTE_HC_FAILED, REMOTE_CAT_FAILED, decodeArgvLines } from "./screen";
 
 // Regression tests for 24f3d06: screen_alive reported dead sockets as alive.
 // A socket is not a session — the parser used to DISCARD the state field, and
@@ -289,5 +289,21 @@ describe("readRemoteOutput / sendRemoteKeys through real sudo (local, child proc
   });
   test.skipIf(!canSudo || !hasEphemeralGrant)("a missing session under a granted uid -> throws 'no screen session'", () => {
     expect(real("readRemoteOutput", "wire-no-such-session-zz", "_ephemeral")).toMatch(/^THREW:cannot read screen .*no screen session 'wire-no-such-session-zz'/);
+  });
+});
+
+describe("decodeArgvLines — the argv VECTOR read-back (one base64 line per argument)", () => {
+  const enc = (...a: string[]) => a.map((x) => Buffer.from(x).toString("base64")).join("\n") + "\n";
+  test("each argument decodes whole: prose with spaces and '--effort' stays ONE element", () => {
+    expect(decodeArgvLines(enc("claude", "--effort", "high", "your own argv --model/--effort read,")))
+      .toEqual(["claude", "--effort", "high", "your own argv --model/--effort read,"]);
+  });
+  test("an empty argument keeps its slot (dropping it would shift every later value)", () => {
+    expect(decodeArgvLines(enc("claude", "--append-system-prompt", "", "--effort", "high"))).toEqual(["claude", "--append-system-prompt", "", "--effort", "high"]);
+  });
+  test("no output, or anything that is not base64 lines, is unreadable (null), never a guess", () => {
+    expect(decodeArgvLines("")).toBeNull();
+    expect(decodeArgvLines("claude --effort high\n")).toBeNull();
+    expect(decodeArgvLines("Traceback (most recent call last):\n")).toBeNull();
   });
 });

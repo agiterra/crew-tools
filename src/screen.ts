@@ -505,13 +505,47 @@ export async function channelPluginAlive(name: string, t?: RemoteTarget): Promis
 }
 
 /**
+ * KERN_PROCARGS2 reader: prints each argv element of pid $1 base64-encoded, one per line. The real VECTOR, not ps's
+ * space-joined line: `ps -o args` flattens argv, so a prompt or --append-system-prompt value that CONTAINS
+ * "--effort read," became a flag (eng60-4570 2026-10-02: effort 'read,' from prose at byte 2075, real flag at 927).
+ * Non-root sysctl reads only same-uid processes (ps is setuid root), so the script runs it as the process's own uid.
+ */
+const PROCARGS_PY = [
+  "import base64,ctypes,ctypes.util,struct,sys",
+  "libc=ctypes.CDLL(ctypes.util.find_library('c'),use_errno=True)",
+  "mib=(ctypes.c_int*3)(1,49,int(sys.argv[1]))",
+  "n=ctypes.c_size_t(0)",
+  "assert libc.sysctl(mib,3,None,ctypes.byref(n),None,0)==0",
+  "b=ctypes.create_string_buffer(n.value)",
+  "assert libc.sysctl(mib,3,b,ctypes.byref(n),None,0)==0",
+  "r=b.raw[:n.value];argc=struct.unpack('i',r[:4])[0];r=r[4:]",
+  "r=r[r.index(b'\\0'):].lstrip(b'\\0')",
+  "a=r.split(b'\\0')[:argc]",
+  "assert len(a)==argc",
+  "print('\\n'.join(base64.b64encode(x).decode() for x in a))",
+].join("\n");
+
+/** Decode PROCARGS_PY's output. Pure (tests). */
+export function decodeArgvLines(out: string): string[] | null {
+  // An empty argument is an empty line and keeps its slot: dropping it would shift every later value by one.
+  const body = out.replace(/\r/g, "").replace(/\n$/, "");
+  if (body === "") return null;
+  const lines = body.split("\n");
+  if (!lines.every((l) => /^[A-Za-z0-9+/]*={0,2}$/.test(l))) return null;
+  return lines.map((l) => Buffer.from(l, "base64").toString("utf8"));
+}
+
+/**
  * Read the ACTING argv of the claude process inside a screen session — the
  * asked-vs-got read-back's "got" side (AGI-78). Same tty-anchored discovery as
- * channelPluginAlive; returns the full argv line of the claude process on the
- * session's tty, or null when no such process is visible (which is a fact about
- * the PROBE or timing, never evidence the process is absent).
+ * channelPluginAlive; returns the argv VECTOR of the claude process on the
+ * session's tty (one element per argument, so free text inside an argument can
+ * never read as a flag), or null when no such process is visible or its argv
+ * cannot be read (a fact about the PROBE or timing, never evidence the process
+ * is absent).
  */
-export async function sessionClaudeArgv(name: string, t?: RemoteTarget): Promise<string | null> {
+export async function sessionClaudeArgv(name: string, t?: RemoteTarget): Promise<string[] | null> {
+  const py = Buffer.from(PROCARGS_PY).toString("base64");
   const script = [
     `spid=$(pgrep -f "SCREEN.*-dmS ${name} " | head -1)`,
     `[ -n "$spid" ] || exit 1`,
@@ -519,16 +553,25 @@ export async function sessionClaudeArgv(name: string, t?: RemoteTarget): Promise
     `[ -n "$c" ] || exit 1`,
     `tty=$(ps -o tty= -p "$c" | tr -d " ")`,
     `[ -n "$tty" ] && [ "$tty" != "??" ] || exit 1`,
-    `ps -Ao tty=,args= | awk -v t="$tty" '$1==t' | sed -E 's/^[^ ]+[[:space:]]+//' | grep -E '^(/[^ ]*/)?claude( |$)' | head -1`,
+    `pid=$(ps -Ao pid=,tty=,args= | awk -v t="$tty" '$2==t { p=$1; $1=""; $2=""; sub(/^ +/, ""); if ($0 ~ /^(\\/[^ ]*\\/)?claude( |$)/) { print p; exit } }')`,
+    `[ -n "$pid" ] || exit 1`,
+    `u=$(ps -o uid= -p "$pid" | tr -d " ")`,
+    `[ -n "$u" ] || exit 1`,
+    `code=$(printf %s ${py} | base64 -d)`,
+    // Same uid: read directly. Else as that uid (non-interactive sudo; a refusal is exit != 0 -> null, never a guess).
+    `if [ "$u" = "$(id -u)" ]; then /usr/bin/python3 -c "$code" "$pid"; else sudo -n -u "#$u" /usr/bin/python3 -c "$code" "$pid"; fi`,
   ].join("; ");
   let out: string;
   if (t) {
-    out = await sshRun(t, script);
+    const r = await sshRunStatus(t, script);
+    if (r.exitCode !== 0) return null;
+    out = r.stdout;
   } else {
-    out = (await $`/bin/sh -c ${script}`.quiet().nothrow()).stdout.toString();
+    const r = await $`/bin/sh -c ${script}`.quiet().nothrow();
+    if (r.exitCode !== 0) return null;
+    out = r.stdout.toString();
   }
-  const line = out.trim();
-  return line === "" ? null : line;
+  return decodeArgvLines(out);
 }
 
 /** Send keystrokes to a remote session (e.g. the dev-channel confirm CR). */
