@@ -2319,14 +2319,22 @@ export class Orchestrator {
   async interruptAgent(agentId: string, background = false, ccSessionId?: string): Promise<{ method: string; output: string }> {
     const agent = this.resolveAgent(agentId, ccSessionId);
 
+    // Target-aware, as sendToAgent: crew-service runs as tim, and a run_as_uid lane's screen lives under THAT
+    // uid. A same-uid `screen -X stuff` there fails "No screen session found" (Baguette 652570, 2026-10-02).
+    const target = this.targetFor(agent);
+    const send = (t: string) =>
+      target ? screen.sendRemoteKeys(agent.screen_name, t, target) : screen.sendKeys(agent.screen_name, t);
+
     if (background) {
-      await screen.sendKeys(agent.screen_name, "\x02\x02"); // Ctrl-B Ctrl-B
+      await send("\x02\x02"); // Ctrl-B Ctrl-B
     } else {
-      await screen.sendKeys(agent.screen_name, "\x1b"); // Escape
+      await send("\x1b"); // Escape
     }
 
     await new Promise((r) => setTimeout(r, 500));
-    const output = await screen.readOutput(agent.screen_name);
+    const output = target
+      ? await screen.readRemoteOutput(agent.screen_name, target)
+      : await screen.readOutput(agent.screen_name);
     return { method: background ? "background" : "escape", output };
   }
 

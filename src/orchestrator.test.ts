@@ -20,6 +20,8 @@ const screenState = {
   screens: {} as Record<string, { queue: string[]; fallback: string }>,
   sendKeysLog: [] as Array<{ name: string; keys: string }>,
   sendKeysHook: null as ((name: string, keys: string) => void) | null,
+  /** Cross-uid screen calls, with the uid they targeted — distinguishes a remote send from a same-uid one. */
+  remoteCalls: [] as Array<{ op: "send" | "read"; name: string; uid: string | undefined }>,
   // When set, readOutput/readRemoteOutput call this first — lets a test make
   // reads THROW (distinct from reads returning empty; the confirm counts them
   // separately since the 2026-08-04 RCA).
@@ -129,11 +131,13 @@ mock.module("./screen", () => ({
   // these mirror the local mocks; a test exercising a run_as_uid agent keys the
   // same screenState by screen name.
   LOCAL_SUDO_HOST: "local",
-  sendRemoteKeys: async (name: string, keys: string) => {
+  sendRemoteKeys: async (name: string, keys: string, target?: { runAsUid?: string }) => {
+    screenState.remoteCalls.push({ op: "send", name, uid: target?.runAsUid });
     screenState.sendKeysLog.push({ name, keys });
     screenState.sendKeysHook?.(name, keys);
   },
-  readRemoteOutput: async (name: string) => {
+  readRemoteOutput: async (name: string, target?: { runAsUid?: string }) => {
+    screenState.remoteCalls.push({ op: "read", name, uid: target?.runAsUid });
     screenState.readOutputHook?.();
     const s = screenState.screens[name];
     if (!s) return "";
@@ -253,6 +257,7 @@ function resetScreenState(): void {
   screenState.screens = {};
   screenState.sendKeysLog.length = 0;
   screenState.sendKeysHook = null;
+  screenState.remoteCalls.length = 0;
   screenState.readOutputHook = undefined;
   screenState.killSessionCalls.length = 0;
   screenState.killSessionSurvivors = 0;
@@ -2598,4 +2603,39 @@ test("R4 GUARD: resetScreenState RESTORES every declared field to its pristine v
 
   const notRestored = keys.filter((k) => !same(bag[k], PRISTINE_SCREEN_STATE[k]));
   expect({ notRestored, checked: keys.length }).toEqual({ notRestored: [], checked: keys.length });
+});
+
+describe("interruptAgent — a run_as_uid lane goes through the cross-uid path (Baguette 652570)", () => {
+  const lane = (id: string, manifest: object | null) =>
+    orch.store.createAgent({
+      id, display_name: id, runtime: "claude-code", screen_name: `wire-${id}`, screen_pid: 1,
+      spawn_manifest: manifest ? JSON.stringify(manifest) : null,
+    });
+
+  test("Escape and the read-back target the lane's uid", async () => {
+    lane("rv-lane", { runtime: "claude-code", run_as_uid: "_ephemeral" });
+    screenState.screens["wire-rv-lane"] = { queue: [], fallback: "Interrupted" };
+    const r = await orch.interruptAgent("rv-lane");
+    expect(r).toEqual({ method: "escape", output: "Interrupted" });
+    expect(screenState.remoteCalls).toEqual([
+      { op: "send", name: "wire-rv-lane", uid: "_ephemeral" },
+      { op: "read", name: "wire-rv-lane", uid: "_ephemeral" },
+    ]);
+    expect(screenState.sendKeysLog).toEqual([{ name: "wire-rv-lane", keys: "\x1b" }]);
+  });
+
+  test("background mode sends Ctrl-B Ctrl-B cross-uid", async () => {
+    lane("rv-bg", { runtime: "claude-code", run_as_uid: "_ephemeral" });
+    const r = await orch.interruptAgent("rv-bg", true);
+    expect(r.method).toBe("background");
+    expect(screenState.remoteCalls[0]).toEqual({ op: "send", name: "wire-rv-bg", uid: "_ephemeral" });
+    expect(screenState.sendKeysLog).toEqual([{ name: "wire-rv-bg", keys: "\x02\x02" }]);
+  });
+
+  test("a same-uid agent keeps the local path", async () => {
+    lane("local-a", { runtime: "claude-code" });
+    await orch.interruptAgent("local-a");
+    expect(screenState.remoteCalls).toEqual([]);
+    expect(screenState.sendKeysLog).toEqual([{ name: "wire-local-a", keys: "\x1b" }]);
+  });
 });
