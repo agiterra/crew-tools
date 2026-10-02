@@ -50,7 +50,7 @@ describe("claude-code DEFAULT model pin (asserted against the source literal)", 
   test("a MISSING pin fails safe to the policy model, not to Fable", () => {
     const m = claudeCmd!.match(/\$\{CLAUDE_MODEL:-([^}]+)\}/);
     expect(m).not.toBeNull();
-    expect(m![1]).toBe("claude-opus-4-8");
+    expect(m![1]).toBe("claude-sonnet-5"); // Brioche 2026-10-02: cheap default, expensive must be explicit
   });
 
   // LOAD-BEARING: expandCommand does replaceAll("${KEY}", value), matching only the
@@ -59,7 +59,7 @@ describe("claude-code DEFAULT model pin (asserted against the source literal)", 
   // string that screen runs under zsh, so ${VAR:-default} resolves there.
   test("expandCommand leaves ${VAR:-default} INTACT — the shell expands it, not us", () => {
     const out = expandCommand(claudeCmd!, { CLAUDE_MODEL: "claude-opus-5" });
-    expect(out).toContain("${CLAUDE_MODEL:-claude-opus-4-8}");
+    expect(out).toContain("${CLAUDE_MODEL:-claude-sonnet-5}");
     expect(out).not.toContain("claude-opus-5");
   });
 
