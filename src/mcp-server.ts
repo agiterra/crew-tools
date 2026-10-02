@@ -63,99 +63,104 @@ export async function startServer(): Promise<void> {
     }
   }
 
-  // Self-stamp: if we can identify the current agent (via STY) and we have a
-  // session ID, update the agent's cc_session_id immediately. Without this,
-  // existing agent records keep null cc_session_id forever — agent_register
-  // is never automatically called on restart.
-  const sty = process.env.STY;
-  const screenName = sty ? sty.split(".").slice(1).join(".") : undefined;
-  const myAgent = screenName ? orchestrator.store.getAgentByScreen(screenName) : null;
+  // Self-stamp runs AFTER mcp.connect (see the call below), never before it. It awaits the crew RPC writer
+  // (Wire) and an osascript TTY lookup; right after a host reboot those took > 30 s, Claude Code gave up on the
+  // handshake (CONNECT_TIMEOUT) and the session had NO crew tools at all (fondant, 2026-10-02 ASK-60 reboot).
+  async function selfStamp(): Promise<void> {
+    // Self-stamp: if we can identify the current agent (via STY) and we have a
+    // session ID, update the agent's cc_session_id immediately. Without this,
+    // existing agent records keep null cc_session_id forever — agent_register
+    // is never automatically called on restart.
+    const sty = process.env.STY;
+    const screenName = sty ? sty.split(".").slice(1).join(".") : undefined;
+    const myAgent = screenName ? orchestrator.store.getAgentByScreen(screenName) : null;
 
-  if (ccSessionId && myAgent) {
-    if (await tryCrewRpc("crew.agent_register", {
-      id: myAgent.id,
-      name: myAgent.display_name,
-      runtime: myAgent.runtime,
-      caller_session_id: await callerContext(),
-      cc_session_id: ccSessionId,
-    }, `self-stamp ${myAgent.id} cc_session_id`)) {
-      console.error(`[crew] self-stamped ${myAgent.id} cc_session_id=${ccSessionId.slice(0, 8)}\u2026`);
+    if (ccSessionId && myAgent) {
+      if (await tryCrewRpc("crew.agent_register", {
+        id: myAgent.id,
+        name: myAgent.display_name,
+        runtime: myAgent.runtime,
+        caller_session_id: await callerContext(),
+        cc_session_id: ccSessionId,
+      }, `self-stamp ${myAgent.id} cc_session_id`)) {
+        console.error(`[crew] self-stamped ${myAgent.id} cc_session_id=${ccSessionId.slice(0, 8)}\u2026`);
+      }
     }
-  }
 
-  // Self-stamp pane.iterm_id and agent.pane. The MCP server inherits the
-  // terminal session ID of the agent's pane via env (ITERM_SESSION_ID's UUID
-  // suffix on iTerm2, CMUX_SURFACE_ID on cmux). Without this, panes keep null
-  // iterm_id forever and reconcile's live theme heal is inert because it only
-  // touches panes WITH iterm_id. Same class of fix as cc_session_id self-stamp.
-  if (myAgent) {
-    const itermSession = process.env.ITERM_SESSION_ID?.split(":").pop();
-    const cmuxSurface = process.env.CMUX_SURFACE_ID;
-    const sessionId = cmuxSurface ?? itermSession;
+    // Self-stamp pane.iterm_id and agent.pane. The MCP server inherits the
+    // terminal session ID of the agent's pane via env (ITERM_SESSION_ID's UUID
+    // suffix on iTerm2, CMUX_SURFACE_ID on cmux). Without this, panes keep null
+    // iterm_id forever and reconcile's live theme heal is inert because it only
+    // touches panes WITH iterm_id. Same class of fix as cc_session_id self-stamp.
+    if (myAgent) {
+      const itermSession = process.env.ITERM_SESSION_ID?.split(":").pop();
+      const cmuxSurface = process.env.CMUX_SURFACE_ID;
+      const sessionId = cmuxSurface ?? itermSession;
 
-    if (sessionId) {
-      // Find the pane this agent occupies. Prefer existing iterm_id match.
-      let myPane = orchestrator.store.listPanes().find((p) => p.iterm_id === sessionId);
+      if (sessionId) {
+        // Find the pane this agent occupies. Prefer existing iterm_id match.
+        let myPane = orchestrator.store.listPanes().find((p) => p.iterm_id === sessionId);
 
-      // Fallback A: agent.pane already assigned but missing iterm_id — stamp it.
-      if (!myPane && myAgent.pane) {
-        const named = orchestrator.store.getPane(myAgent.pane);
-        if (named && !named.iterm_id) {
-          await tryCrewRpc("crew.pane_register", {
-            tab: named.tab,
-            name: myAgent.pane,
-            iterm_session_id: sessionId,
-          }, `self-stamp pane '${myAgent.pane}' iterm_id`);
-          myPane = orchestrator.store.getPane(myAgent.pane) ?? undefined;
-          console.error(`[crew] self-stamped pane '${myAgent.pane}' iterm_id=${sessionId}`);
-        } else if (named) {
-          myPane = named;
-        }
-      }
-
-      // Fallback B: no agent.pane — try to find an unambiguous pane in the tab
-      // matching the agent's id (common convention: tab name == agent id).
-      if (!myPane && !myAgent.pane) {
-        const tabName = myAgent.id;
-        const candidates = orchestrator.store.listPanes(tabName).filter((p) => !p.iterm_id);
-        if (candidates.length === 1) {
-          await tryCrewRpc("crew.pane_register", {
-            tab: candidates[0].tab,
-            name: candidates[0].name,
-            iterm_session_id: sessionId,
-          }, `self-stamp pane '${candidates[0].name}' iterm_id`);
-          myPane = orchestrator.store.getPane(candidates[0].name) ?? undefined;
-          console.error(`[crew] self-stamped pane '${candidates[0].name}' iterm_id=${sessionId} (matched via tab='${tabName}')`);
-        } else if (candidates.length > 1) {
-          console.error(`[crew] cannot auto-bind: tab '${tabName}' has ${candidates.length} unbound panes — call agent_register with caller_session_id`);
-        }
-      }
-
-      // Bind agent to pane ONLY when it's still unset.
-      //
-      // agent_attach is authoritative for pane bindings — self-stamp may
-      // not override it. Classic race: agent is spawned via `screen -dmS`
-      // from a launcher shell, inheriting that shell's ITERM_SESSION_ID
-      // (which points at the LAUNCHER's pane, not where the agent ends up).
-      // Meanwhile the orchestrator agent_attach'es this agent to its real
-      // pane. The self-stamp's `myAgent` snapshot predates that write, so
-      // `myAgent.pane` looks null. Without this guard we'd write the env-
-      // derived guess and clobber the correct binding. Re-read RIGHT before
-      // writing so a racing agent_attach wins.
-      if (myPane) {
-        const fresh = orchestrator.store.getAgentByScreen(screenName!);
-        if (fresh && !fresh.pane) {
-          if (await tryCrewRpc("crew.agent_attach", {
-            id: fresh.id,
-            pane: myPane.name,
-          }, `self-stamp agent '${fresh.id}' pane`)) {
-            console.error(`[crew] self-stamped agent '${fresh.id}' pane='${myPane.name}'`);
+        // Fallback A: agent.pane already assigned but missing iterm_id — stamp it.
+        if (!myPane && myAgent.pane) {
+          const named = orchestrator.store.getPane(myAgent.pane);
+          if (named && !named.iterm_id) {
+            await tryCrewRpc("crew.pane_register", {
+              tab: named.tab,
+              name: myAgent.pane,
+              iterm_session_id: sessionId,
+            }, `self-stamp pane '${myAgent.pane}' iterm_id`);
+            myPane = orchestrator.store.getPane(myAgent.pane) ?? undefined;
+            console.error(`[crew] self-stamped pane '${myAgent.pane}' iterm_id=${sessionId}`);
+          } else if (named) {
+            myPane = named;
           }
-        } else if (fresh && fresh.pane !== myPane.name) {
-          console.error(
-            `[crew] self-stamp: env-derived pane '${myPane.name}' differs from DB pane '${fresh.pane}' for '${fresh.id}' — NOT overriding (agent_attach is authoritative). ` +
-            `This usually means ITERM_SESSION_ID was inherited from a launcher shell in a different pane.`,
-          );
+        }
+
+        // Fallback B: no agent.pane — try to find an unambiguous pane in the tab
+        // matching the agent's id (common convention: tab name == agent id).
+        if (!myPane && !myAgent.pane) {
+          const tabName = myAgent.id;
+          const candidates = orchestrator.store.listPanes(tabName).filter((p) => !p.iterm_id);
+          if (candidates.length === 1) {
+            await tryCrewRpc("crew.pane_register", {
+              tab: candidates[0].tab,
+              name: candidates[0].name,
+              iterm_session_id: sessionId,
+            }, `self-stamp pane '${candidates[0].name}' iterm_id`);
+            myPane = orchestrator.store.getPane(candidates[0].name) ?? undefined;
+            console.error(`[crew] self-stamped pane '${candidates[0].name}' iterm_id=${sessionId} (matched via tab='${tabName}')`);
+          } else if (candidates.length > 1) {
+            console.error(`[crew] cannot auto-bind: tab '${tabName}' has ${candidates.length} unbound panes — call agent_register with caller_session_id`);
+          }
+        }
+
+        // Bind agent to pane ONLY when it's still unset.
+        //
+        // agent_attach is authoritative for pane bindings — self-stamp may
+        // not override it. Classic race: agent is spawned via `screen -dmS`
+        // from a launcher shell, inheriting that shell's ITERM_SESSION_ID
+        // (which points at the LAUNCHER's pane, not where the agent ends up).
+        // Meanwhile the orchestrator agent_attach'es this agent to its real
+        // pane. The self-stamp's `myAgent` snapshot predates that write, so
+        // `myAgent.pane` looks null. Without this guard we'd write the env-
+        // derived guess and clobber the correct binding. Re-read RIGHT before
+        // writing so a racing agent_attach wins.
+        if (myPane) {
+          const fresh = orchestrator.store.getAgentByScreen(screenName!);
+          if (fresh && !fresh.pane) {
+            if (await tryCrewRpc("crew.agent_attach", {
+              id: fresh.id,
+              pane: myPane.name,
+            }, `self-stamp agent '${fresh.id}' pane`)) {
+              console.error(`[crew] self-stamped agent '${fresh.id}' pane='${myPane.name}'`);
+            }
+          } else if (fresh && fresh.pane !== myPane.name) {
+            console.error(
+              `[crew] self-stamp: env-derived pane '${myPane.name}' differs from DB pane '${fresh.pane}' for '${fresh.id}' — NOT overriding (agent_attach is authoritative). ` +
+              `This usually means ITERM_SESSION_ID was inherited from a launcher shell in a different pane.`,
+            );
+          }
         }
       }
     }
@@ -1044,6 +1049,9 @@ export async function startServer(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
+
+  // Fire-and-forget: the handshake must not wait on Wire or osascript. Every failure is logged, never swallowed.
+  selfStamp().catch((e) => console.error("[crew] self-stamp failed:", e));
 
   // Graceful shutdown on SIGTERM/SIGINT/SIGHUP: close the MCP transport so
   // the parent CC process sees a clean disconnect. Without this, kill-mcp.sh
