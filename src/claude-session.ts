@@ -46,3 +46,38 @@ export function getClaudeCodeSessionId(): string | null {
 
   return null;
 }
+
+/**
+ * AGI-157 (2026-10-03, Brioche 656703): `/clear` starts a new Claude Code session in the SAME
+ * process. CC rewrites sessions/<pid>.json, but the MCP server read the id once at startup, so
+ * the crews.db row (and every later agent_register fallback) kept the pre-clear id — a reader
+ * of the row then measured a dead transcript (432,464 tokens vs a live 202,240).
+ *
+ * The tracker holds the id last STAMPED into crews.db. `changed()` reports a newer live id;
+ * the caller stamps it and only then calls `commit()`, so a failed stamp is retried next poll.
+ */
+export class SessionIdTracker {
+  private stamped: string | null;
+
+  constructor(
+    private readonly read: () => string | null = getClaudeCodeSessionId,
+    initial: string | null = read(),
+  ) {
+    this.stamped = initial;
+  }
+
+  /** The live id, or the last stamped one when the live read fails. */
+  current(): string | null {
+    return this.read() ?? this.stamped;
+  }
+
+  /** A live id that differs from the stamped one, else null. A failed read is never a change. */
+  changed(): string | null {
+    const live = this.read();
+    return live && live !== this.stamped ? live : null;
+  }
+
+  commit(id: string): void {
+    this.stamped = id;
+  }
+}
