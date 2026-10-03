@@ -15,9 +15,11 @@ import {
 import { Orchestrator } from "./orchestrator.js";
 import { createBackend } from "./terminal.js";
 import { listThemes, loadTheme, resolveThemeDir } from "./themes.js";
-import { getClaudeCodeSessionId } from "./claude-session.js";
+import { SessionIdTracker } from "./claude-session.js";
 import { createCrewRpcWriter, type CrewRpcWriter } from "./crew-rpc.js";
 import { execSync } from "child_process";
+
+const SESSION_POLL_MS = 30_000;
 
 /**
  * Start the crew MCP server. Blocks until the transport disconnects.
@@ -28,7 +30,8 @@ export async function startServer(): Promise<void> {
   const terminalName = terminal.name;
   const CALLER_AGENT_ID =
     process.env.AGENT_ID ?? "unknown";
-  const ccSessionId = getClaudeCodeSessionId();
+  const sessionIds = new SessionIdTracker();
+  const ccSessionId = sessionIds.current();
   let rpcWriter: CrewRpcWriter | null = null;
   const rpcWriterReady = createCrewRpcWriter()
     .then((writer) => {
@@ -75,16 +78,31 @@ export async function startServer(): Promise<void> {
     const screenName = sty ? sty.split(".").slice(1).join(".") : undefined;
     const myAgent = screenName ? orchestrator.store.getAgentByScreen(screenName) : null;
 
-    if (ccSessionId && myAgent) {
+    const stampSession = async (id: string): Promise<boolean> => {
+      if (!myAgent) return false;
       if (await tryCrewRpc("crew.agent_register", {
         id: myAgent.id,
         name: myAgent.display_name,
         runtime: myAgent.runtime,
         caller_session_id: await callerContext(),
-        cc_session_id: ccSessionId,
+        cc_session_id: id,
       }, `self-stamp ${myAgent.id} cc_session_id`)) {
-        console.error(`[crew] self-stamped ${myAgent.id} cc_session_id=${ccSessionId.slice(0, 8)}\u2026`);
+        console.error(`[crew] self-stamped ${myAgent.id} cc_session_id=${id.slice(0, 8)}\u2026`);
+        return true;
       }
+      return false;
+    };
+    if (ccSessionId && myAgent) await stampSession(ccSessionId);
+
+    // AGI-157: /clear starts a new CC session in this same process. Re-stamp when the live id moves;
+    // commit only after a successful stamp, so a failed one retries on the next poll.
+    if (myAgent) {
+      setInterval(async () => {
+        const id = sessionIds.changed();
+        if (!id) return;
+        console.error(`[crew] cc session changed (clear/resume) for ${myAgent.id}: ${id.slice(0, 8)}\u2026`);
+        if (await stampSession(id)) sessionIds.commit(id);
+      }, SESSION_POLL_MS).unref();
     }
 
     // Self-stamp pane.iterm_id and agent.pane. The MCP server inherits the
@@ -817,7 +835,7 @@ export async function startServer(): Promise<void> {
             name: a.name as string,
             runtime: a.runtime as string | undefined,
             caller_session_id: await callerContext(),
-            cc_session_id: (a.cc_session_id as string | undefined) ?? ccSessionId ?? undefined,
+            cc_session_id: (a.cc_session_id as string | undefined) ?? sessionIds.current() ?? undefined,
           });
           break;
         case "agent_badge": {

@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { getClaudeCodeSessionId } from "./claude-session";
+import { getClaudeCodeSessionId, SessionIdTracker } from "./claude-session";
 import { mkdtempSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -94,5 +94,49 @@ describe("claude-session", () => {
     } finally {
       process.env.HOME = origHome;
     }
+  });
+});
+
+// AGI-157: /clear changes the session id inside one process; the crews.db row must follow it.
+describe("SessionIdTracker", () => {
+  const reader = (vals: Array<string | null>) => {
+    let i = 0;
+    return () => vals[Math.min(i++, vals.length - 1)];
+  };
+
+  test("no change while the live id equals the stamped one", () => {
+    const t = new SessionIdTracker(() => "aaa");
+    expect(t.changed()).toBeNull();
+  });
+
+  test("a /clear (new live id) is reported until it is committed", () => {
+    let live = "aaa";
+    const t = new SessionIdTracker(() => live);
+    live = "bbb";
+    expect(t.changed()).toBe("bbb");
+    // stamp failed -> not committed -> still reported on the next poll
+    expect(t.changed()).toBe("bbb");
+    t.commit("bbb");
+    expect(t.changed()).toBeNull();
+  });
+
+  test("a failed live read is never a change, and current() falls back to the stamped id", () => {
+    const t = new SessionIdTracker(reader(["aaa", null, null]));
+    expect(t.changed()).toBeNull();
+    expect(t.current()).toBe("aaa");
+  });
+
+  test("current() prefers the live id over the startup one (agent_register fallback)", () => {
+    let live = "aaa";
+    const t = new SessionIdTracker(() => live);
+    live = "bbb";
+    expect(t.current()).toBe("bbb");
+  });
+
+  test("an unknown startup id is filled by the first live read", () => {
+    let live: string | null = null;
+    const t = new SessionIdTracker(() => live);
+    live = "ccc";
+    expect(t.changed()).toBe("ccc");
   });
 });
