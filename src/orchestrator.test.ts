@@ -1075,6 +1075,40 @@ describe("autoConfirmDevChannel — verify-after-confirm", () => {
     expect(crs()).toBe(2); // one Enter per dialog
   });
 
+  test("folder-trust dialog defaults to 'No, exit' — sends Down before Enter, not a bare CR", async () => {
+    // Measured live 2026-10-14 (lean-boot trial, lane1-diag): a project_dir with
+    // no prior trust decision renders this dialog with "No, exit" HIGHLIGHTED,
+    // not "Yes, I trust this folder". A bare Enter takes that default and EXITS
+    // Claude Code instead of confirming — the agent dies in ~14s with 0 dialogs
+    // confirmed. This is NOT the same shape as the other two "Enter to confirm"
+    // dialogs (dev-channel consent, Fable credits), whose defaults ARE the sane
+    // unattended choice.
+    const TRUST_NO_DEFAULT =
+      "Quick safety check: Is this a project you trust?\n❯ No, exit\n  Yes, I trust this folder\n  Enter to confirm · Esc to cancel";
+    const TRUST_YES_DEFAULT =
+      "Quick safety check: Is this a project you trust?\n  No, exit\n❯ Yes, I trust this folder\n  Enter to confirm · Esc to cancel";
+    screenState.screens["dvc"] = { queue: [], fallback: TRUST_NO_DEFAULT };
+    screenState.sendKeysHook = (name, keys) => {
+      if (name !== "dvc") return;
+      const s = screenState.screens["dvc"]!;
+      if (keys === "\x1b[B") {
+        s.fallback = TRUST_YES_DEFAULT;
+      } else if ((keys === "\r" || keys === "\n") && s.fallback === TRUST_YES_DEFAULT) {
+        s.fallback = BOOTED_SCREEN;
+      }
+      // Enter/LF sent while still on TRUST_NO_DEFAULT does nothing here — the
+      // real dialog would exit the process instead of clearing, so a fix that
+      // never sends the Down arrow leaves this screen stuck forever and the
+      // test times out to ok===false.
+    };
+
+    const ok = await autoConfirmDevChannel("dvc", "trustdefault", { appearMs: 2_000, clearMs: 500 });
+
+    expect(ok).toBe(true);
+    const downs = screenState.sendKeysLog.filter((e) => e.name === "dvc" && e.keys === "\x1b[B").length;
+    expect(downs).toBeGreaterThan(0);
+  });
+
   test("booted WITH channel banner → boot-gate-ok status (outcome recorded, not just ceremony)", async () => {
     await orch.launchAgent({ env: { AGENT_ID: "bannered" } });
     const BOOTED_WITH_CHANNEL = "▎ Channels (experimental) messages from plugin:wire@agiterra inject directly\n❯ \n  ⏵⏵ bypass permissions on";

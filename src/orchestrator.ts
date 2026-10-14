@@ -348,6 +348,27 @@ export async function autoConfirmDevChannel(
       const bytes = ["\r", "\n", "\r"];
       let cleared = false;
       for (let attempt = 0; attempt < bytes.length && !cleared; attempt++) {
+        // The folder-trust dialog ("Quick safety check" / "Yes, I trust this
+        // folder") is one of the "Enter to confirm" family, but UNLIKE the
+        // other two it defaults its highlighted option to "No, exit" for a
+        // project_dir with no prior trust decision — Enter on that default
+        // EXITS Claude Code instead of confirming (measured live 2026-10-14,
+        // lean-boot trial: every lean project_dir died in ~14s with 0 dialogs
+        // confirmed). Re-check right before each submit byte, since an
+        // earlier attempt in this same loop may have already moved the
+        // cursor — and send one Down arrow to land on "Yes, I trust this
+        // folder" before confirming, rather than trusting the default.
+        try {
+          const pre = await read();
+          noteBanner(pre);
+          if (pre.includes("Yes, I trust this folder") && pre.includes("❯ No, exit")) {
+            await sendByte("\x1b[B");
+            await new Promise((r) => setTimeout(r, 200));
+          }
+        } catch {
+          // transient read failure — fall through and submit anyway; the
+          // clear-poll below will catch a dialog that's still stuck
+        }
         try {
           await sendByte(bytes[attempt]);
         } catch {
