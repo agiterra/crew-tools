@@ -697,7 +697,7 @@ describe("spec row 7 — stop then re-provision (Phase A: persistence, not conti
   // surrogate. The instrument had to be made REPRODUCIBLY AVAILABLE instead — so the real
   // program is vendored byte-for-byte with provenance and a hash, and the surrogate is deleted.
   const VENDORED_GEN = join(import.meta.dir, "..", "test", "e2e", "vendor", "gen-codex-home.sh");
-  const VENDORED_SHA = "a33c96149fcc866ebbdc26cdde4f263bcd693af2b445ecd9d5f18179816e79ee";
+  const VENDORED_SHA = "2eb70b6c8ece6aa69e56db91e3251e79165a2a2bbc04a0cf8a33f7efba17ffff";
   const UPSTREAM_GEN = process.env.GEN_CODEX_HOME
     ?? "/Users/tim/Projects/Agiterra/codex-wire/scripts/gen-codex-home.sh";
 

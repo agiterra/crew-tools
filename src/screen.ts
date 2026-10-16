@@ -454,14 +454,18 @@ export function classifyRemoteRead(r: SshRunResult, name: string, runAsUid: stri
 
 /** Read the screen buffer of a remote session (hardcopy + cat in one round-trip). Throws when it could not look. */
 export async function readRemoteOutput(name: string, t: RemoteTarget): Promise<string> {
-  const tmp = `/tmp/screen-hc-${name}-${Date.now()}`;
-  // hardcopy runs as the target UID and writes $tmp 0644 under its umask, so a plain `cat` reads it (measured
-  // 2026-09-25); `sudo -n cat` stays as the fallback for a stricter umask. Each step reports its own failure.
+  // The CALLER creates the file (mktemp) mode 0602 and screen, running as the target uid, writes into it. So the file
+  // stays the caller's: the caller reads it as owner and can delete it, and no third uid (nor the target) can read it.
+  // ⛔ WHY (Brioche 726755, 2026-10-16): screen used to CREATE the file as the target uid; the caller's `rm -f` then
+  // failed in sticky /tmp, silenced by 2>/dev/null, and 127 world-readable hardcopies piled up across 4 uids.
+  // A failed delete is reported on stderr, never silenced.
+  const tmpl = `/tmp/screen-hc-${name}.XXXXXX`;
   const r = await sshRunStatus(
     t,
-    `hc=$(${remoteScreen(t)} -S ${name} -X hardcopy ${tmp} 2>&1) || { printf '%s\\n' "$hc" >&2; exit ${REMOTE_HC_FAILED}; }; ` +
-      `sleep 0.3; { cat ${tmp} 2>/dev/null || sudo -n cat ${tmp} 2>/dev/null; } || { rm -f ${tmp} 2>/dev/null; exit ${REMOTE_CAT_FAILED}; }; ` +
-      `rm -f ${tmp} 2>/dev/null; exit 0`,
+    `tmp=$(mktemp ${tmpl}) && chmod 602 "$tmp" || exit ${REMOTE_CAT_FAILED}; ` +
+      `hc=$(${remoteScreen(t)} -S ${name} -X hardcopy "$tmp" 2>&1) || { printf '%s\\n' "$hc" >&2; rm -f "$tmp"; exit ${REMOTE_HC_FAILED}; }; ` +
+      `sleep 0.3; cat "$tmp" 2>/dev/null || { rm -f "$tmp"; exit ${REMOTE_CAT_FAILED}; }; ` +
+      `rm -f "$tmp" || printf 'screen-hc: could not delete %s\\n' "$tmp" >&2; exit 0`,
   );
   const read = classifyRemoteRead(r, name, t.runAsUid);
   if (!read.ok) throw new Error(`cannot read screen '${name}': ${read.reason}`);
