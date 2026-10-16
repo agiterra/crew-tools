@@ -189,7 +189,7 @@ mock.module("./screen", () => ({
   sessionClaudeArgv: async () => screenState.argvResult,
 }));
 
-const { Orchestrator, SOURCE_NEAREST_ENV, WIPE_CLAUDE_SETTINGS_LOCAL, autoConfirmDevChannel, askedFromCommand, verifySpawnArgv, flagsFromArgv, verifyWireInbound } = await import("./orchestrator");
+const { Orchestrator, SOURCE_NEAREST_ENV, WIPE_CLAUDE_SETTINGS_LOCAL, autoConfirmDevChannel, askedFromCommand, verifySpawnArgv, flagsFromArgv, verifyWireInbound, expectsWireInbound } = await import("./orchestrator");
 
 function makeTerminal(): TerminalBackend {
   return {
@@ -1619,6 +1619,34 @@ describe("verifyWireInbound — the BROKER's view of the inbound connection", ()
       delete process.env.CREW_WIRE_READBACK_WINDOW_MS;
     }
   }, 30_000);
+
+  test("ACCEPTANCE: a blanked-key spawn via launchAgent is NOT marked wire-inbound-absent", async () => {
+    process.env.CREW_WIRE_READBACK_WINDOW_MS = "150";
+    try {
+      screenState.screens["wire-kx-feed"] = { queue: [], fallback: "Channels (experimental)\n? for shortcuts" };
+      screenState.argvResult =
+        "claude --dangerously-load-development-channels plugin:wire@agiterra --permission-mode bypassPermissions --model haiku".split(" ");
+      wireState.roster = [{ id: "brioche", connection_status: "connected" }];
+      const warned: string[] = [];
+      const origWarn = console.warn;
+      console.warn = (...a: unknown[]) => { warned.push(a.map(String).join(" ")); };
+      try {
+        await orch.launchAgent({ env: { AGENT_ID: "kx-feed", AGENT_PRIVATE_KEY: "" }, projectDir: "/tmp" });
+        // Wait for the chain's own verdict: the skip line, or (the defect) an absent status.
+        const deadline = Date.now() + 15_000;
+        const settled = () =>
+          warned.some((w) => w.includes("read-back SKIPPED for 'kx-feed'")) ||
+          orch.store.getAgent("kx-feed")?.status_name === "wire-inbound-absent";
+        while (Date.now() < deadline && !settled()) await new Promise((r) => setTimeout(r, 50));
+      } finally {
+        console.warn = origWarn;
+      }
+      expect(orch.store.getAgent("kx-feed")?.status_name).not.toBe("wire-inbound-absent");
+      expect(warned.some((w) => w.includes("read-back SKIPPED for 'kx-feed'"))).toBe(true);
+    } finally {
+      delete process.env.CREW_WIRE_READBACK_WINDOW_MS;
+    }
+  }, 30_000);
 });
 
 describe("launchAgent id contract", () => {
@@ -2699,5 +2727,17 @@ describe("interruptAgent — a run_as_uid lane goes through the cross-uid path (
     await orch.interruptAgent("local-a");
     expect(screenState.remoteCalls).toEqual([]);
     expect(screenState.sendKeysLog).toEqual([{ name: "wire-local-a", keys: "\x1b" }]);
+  });
+});
+
+describe("expectsWireInbound — keyless spawns skip the broker read-back", () => {
+  test("a spawn that passes a key expects inbound Wire", () => {
+    expect(expectsWireInbound({ AGENT_ID: "lane", AGENT_PRIVATE_KEY: "k" })).toBe(true);
+  });
+  test("a spawn that blanks the key (kx sidecar) does not", () => {
+    expect(expectsWireInbound({ AGENT_ID: "kx-1", AGENT_PRIVATE_KEY: "" })).toBe(false);
+  });
+  test("a spawn with NO key entry still verifies (it may inherit one from its shell)", () => {
+    expect(expectsWireInbound({ AGENT_ID: "solo" })).toBe(true);
   });
 });

@@ -639,6 +639,19 @@ type WireRosterRow = { id?: unknown; connection_status?: unknown };
  *  - connected, healthy row  → "boot-gate-ok" detail gains "wire inbound verified: …"
  *  - connected, alarmed row  → alarm PRESERVED, verification logged only
  */
+/**
+ * Whether a spawn can be held to the broker read-back. Only an EXPLICIT blank
+ * opts out: a caller that sets AGENT_PRIVATE_KEY to "" (knowledge-indexer sidecars,
+ * Brioche 726977, 2026-10-16) runs keyless by design. Its wire MCP server exits at
+ * startup, so the roster can never show it, and the verdict would be a false
+ * WIRE INBOUND BLIND on every such spawn. A key that is merely ABSENT from env
+ * still verifies: the child can inherit one from its shell (~/.zshenv, .env), and
+ * an untrusted-cwd lane looks exactly like that — the case this gate exists for.
+ */
+export function expectsWireInbound(spawnEnv: Record<string, string | undefined>): boolean {
+  return !(Object.prototype.hasOwnProperty.call(spawnEnv, "AGENT_PRIVATE_KEY") && !spawnEnv.AGENT_PRIVATE_KEY);
+}
+
 export async function verifyWireInbound(
   screenName: string,
   label: string,
@@ -1097,7 +1110,9 @@ export class Orchestrator {
         // Last link: the flag can be present and the argv correct while the wire
         // MCP server never started (untrusted cwd). Only the broker can see that,
         // so this runs after the local gates and outranks their verdict.
-        .then(() => verifyWireInbound(screenName, id, { store: this.store, agentId: id, projectDir }))
+        .then(() => expectsWireInbound(spawnEnv)
+          ? verifyWireInbound(screenName, id, { store: this.store, agentId: id, projectDir })
+          : console.warn(`[crew] wire inbound read-back SKIPPED for '${id}': the caller blanked AGENT_PRIVATE_KEY, so the spawn runs without a Wire identity by design`))
         .catch((e) => console.warn(`[crew] post-spawn verify chain failed for '${id}': ${e}`));
     }
 
