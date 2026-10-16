@@ -272,6 +272,12 @@ export async function autoConfirmDevChannel(
     channelProbe?: () => Promise<boolean>;
     /** How long to poll the process witness after a banner miss. */
     channelProbeMs?: number;
+    /**
+     * false = the caller blanked AGENT_PRIVATE_KEY (see expectsWireInbound), so the wire
+     * channel server exits at startup by design and a banner miss is not wire-blindness.
+     * Default true.
+     */
+    expectWire?: boolean;
   } = {},
 ): Promise<boolean> {
   const marker = "Enter to confirm";
@@ -410,6 +416,10 @@ export async function autoConfirmDevChannel(
       // No store/agentId → the verdict has no consumer; skip the probe entirely
       // rather than spend up to 10s computing a status nobody records.
       if (!opts.store || !opts.agentId) return true;
+      if (opts.expectWire === false) {
+        console.warn(`[crew] boot-gate channel check SKIPPED for ${label}: the caller blanked AGENT_PRIVATE_KEY, so no wire channel is expected`);
+        return true;
+      }
       const probe = opts.channelProbe ?? (() => screen.channelPluginAlive(screenName, opts.remote));
       const probeDeadline = Date.now() + (opts.channelProbeMs ?? 10_000);
       let witnessed = false;
@@ -1105,12 +1115,13 @@ export class Orchestrator {
       // read-back's rules (mismatch outranks ok; never upgrade an alarm) only
       // hold if the gate's verdict lands first.
       const asked = askedFromCommand(`${baseCommand} ${opts.extraFlags ?? ""}`, spawnEnv);
-      void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id, remote: remoteTarget })
+      const expectWire = expectsWireInbound(spawnEnv);
+      void autoConfirmDevChannel(screenName, id, { store: this.store, agentId: id, remote: remoteTarget, expectWire })
         .then(() => verifySpawnArgv(screenName, id, asked, { store: this.store, agentId: id, remote: remoteTarget }))
         // Last link: the flag can be present and the argv correct while the wire
         // MCP server never started (untrusted cwd). Only the broker can see that,
         // so this runs after the local gates and outranks their verdict.
-        .then(() => expectsWireInbound(spawnEnv)
+        .then(() => expectWire
           ? verifyWireInbound(screenName, id, { store: this.store, agentId: id, projectDir })
           : console.warn(`[crew] wire inbound read-back SKIPPED for '${id}': the caller blanked AGENT_PRIVATE_KEY, so the spawn runs without a Wire identity by design`))
         .catch((e) => console.warn(`[crew] post-spawn verify chain failed for '${id}': ${e}`));

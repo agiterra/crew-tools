@@ -1177,6 +1177,19 @@ describe("autoConfirmDevChannel — verify-after-confirm", () => {
     expect(row?.status_desc).toContain("no wire channel plugin process");
   });
 
+  test("expectWire:false (blanked key) + no banner + no plugin process → NOT wire-channel-absent", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "keylessboot" } });
+    screenState.screens["dvc"] = { queue: [], fallback: BOOTED_SCREEN };
+
+    const ok = await autoConfirmDevChannel("dvc", "keylessboot", {
+      store: orch.store, agentId: "keylessboot", appearMs: 2_000,
+      channelProbe: async () => false, channelProbeMs: 0, expectWire: false,
+    });
+
+    expect(ok).toBe(true);
+    expect(orch.store.getAgent("keylessboot")?.status_name).not.toBe("wire-channel-absent");
+  });
+
   test("probe that THROWS is counted, not treated as a verdict → wire-channel-absent with probe count", async () => {
     await orch.launchAgent({ env: { AGENT_ID: "probefail" } });
     screenState.screens["dvc"] = { queue: [], fallback: BOOTED_SCREEN };
