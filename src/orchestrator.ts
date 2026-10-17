@@ -176,6 +176,14 @@ export const SOURCE_NEAREST_ENV =
 export const NEUTRALIZE_INHERITED_DB_OVERRIDES =
   ` && unset LOCAL_DATABASE_URL DB_CONN_STRING APP_CACHE_URL QUEUE_URL`;
 
+// Lane test-runner worker cap (Brioche 727420, 2026-10-17): N=2, one lane suite at a time on the host. A worker of the
+// soil jest / api node --test suites holds ~1.6 GB footprint (RSS ~0.5 GB hides the compressed rest), idle free memory
+// is p10 4.9 GB, so 4 workers page on a normal day (00:24Z/00:25Z bursts). jest has no env for maxWorkers and node
+// rejects --test-concurrency in NODE_OPTIONS, so this is only the VALUE: the suites read it (ENG-4985). A default, not a
+// pin: a value already in the env (a brief, the nearest .env) wins.
+export const LANE_TEST_DEFAULTS =
+  ` && export LANE_TEST_WORKERS="\${LANE_TEST_WORKERS:-2}"`;
+
 // Claude Code loads project_dir/.claude/settings.local.json and will disable
 // github/datadog/render MCP if a previous session wrote it. Gitignore only
 // stops commit. Codex/Grok ignore the file. Wipe on Claude spawn/resume only;
@@ -1062,7 +1070,7 @@ export class Orchestrator {
     const configDirSetup = runtime === "claude-code" ? ` && ${buildConfigDirSetup(id, projectDir)}` : "";
     const wipe = runtime === "claude-code" ? WIPE_CLAUDE_SETTINGS_LOCAL : "";
     const _mkTmp = spawnEnv.TMPDIR ? `mkdir -p ${shellEscape(spawnEnv.TMPDIR)} 2>/dev/null; chmod 700 ${shellEscape(spawnEnv.TMPDIR)} 2>/dev/null; ` : "";
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipe}${_mkTmp}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES}${configDirSetup} && ${command}`;
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipe}${_mkTmp}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES}${LANE_TEST_DEFAULTS}${configDirSetup} && ${command}`;
 
     // Create screen session — local, or on a remote host when opts.machine
     // names a non-local machine (cross-machine spawn: ssh + sudo -u <run_as_uid>).
@@ -1391,7 +1399,7 @@ export class Orchestrator {
     // pass env.CLAUDE_CONFIG_DIR=$HOME/.claude — the snippet's unset-guard
     // then no-ops.
     const _mkTmpR = mergedEnv.TMPDIR ? `mkdir -p ${shellEscape(mergedEnv.TMPDIR)} 2>/dev/null; chmod 700 ${shellEscape(mergedEnv.TMPDIR)} 2>/dev/null; ` : "";
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${WIPE_CLAUDE_SETTINGS_LOCAL}${_mkTmpR}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES} && ${buildConfigDirSetup(opts.id, projectDir)} && ${command}`;
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${WIPE_CLAUDE_SETTINGS_LOCAL}${_mkTmpR}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES}${LANE_TEST_DEFAULTS} && ${buildConfigDirSetup(opts.id, projectDir)} && ${command}`;
 
     // Resume is same-HOST only, but may cross UIDs: a crew-service
     // `_ephemeral` spawn resumes under its original account (tombstone
