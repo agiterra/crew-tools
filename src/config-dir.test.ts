@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { execSync } from "child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, lstatSync, readlinkSync, readFileSync, existsSync } from "fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, lstatSync, readlinkSync, readFileSync, existsSync, symlinkSync, realpathSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { buildConfigDirSetup, SHARED_CONFIG_ENTRIES } from "./config-dir";
@@ -63,6 +63,24 @@ describe("buildConfigDirSetup (executed against a fake home)", () => {
     expect(existsSync(join(dir, "policy-limits.json"))).toBe(false);
     expect(JSON.parse(readFileSync(join(dir, ".claude.json"), "utf-8")).bypassPermissionsModeAccepted).toBe(true);
     rmSync(home, { recursive: true, force: true });
+  });
+
+  test("seeds trust under the REAL path of a symlinked project dir, and heals a dir seeded before the move", () => {
+    const home = runInFakeHome("gateau");
+    const real = mkdtempSync(join(tmpdir(), "crew-proj-real-"));
+    const link = join(home, "proj-link");
+    symlinkSync(real, link);
+    const cfg = join(home, ".claude-agents", "gateau", ".claude.json");
+    // The dir already exists (seeded for /tmp/proj only) — the resume path.
+    execSync(buildConfigDirSetup("gateau", link), { shell: "/bin/sh", env: { HOME: home, PATH: process.env.PATH } });
+    const projects = JSON.parse(readFileSync(cfg, "utf-8")).projects;
+    expect(projects[realpathSync(real)]).toEqual({ hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true });
+    // A second launch leaves the file byte-identical.
+    const before = readFileSync(cfg, "utf-8");
+    execSync(buildConfigDirSetup("gateau", link), { shell: "/bin/sh", env: { HOME: home, PATH: process.env.PATH } });
+    expect(readFileSync(cfg, "utf-8")).toBe(before);
+    rmSync(home, { recursive: true, force: true });
+    rmSync(real, { recursive: true, force: true });
   });
 
   test("idempotent: second run leaves an existing dir intact", () => {

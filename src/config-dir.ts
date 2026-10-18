@@ -75,6 +75,7 @@ export function buildConfigDirSetup(agentId: string, projectDir: string): string
   // The seed JSON rides inside a single-quoted sh string; POSIX quoting for
   // any embedded single quote is '\'' (end, escaped quote, reopen).
   const seedJson = seedClaudeJson(projectDir).replaceAll("'", `'\\''`);
+  const projectDirSh = projectDir.replaceAll("'", `'\\''`);
   return (
     // Isolation requires a FILE credential: setting CLAUDE_CONFIG_DIR at all
     // makes CC ignore the macOS keychain (verified empirically on CC 2.1.198,
@@ -126,6 +127,14 @@ export function buildConfigDirSetup(agentId: string, projectDir: string): string
     // (fondant-configdir-gate dogfood, 2026-07-01). Copy it from the anchor.
     `if [ -f "$HOME/.claude.json" ]; then ` +
     `python3 -c 'import json,os; p=os.environ["CLAUDE_CONFIG_DIR"]+"/.claude.json"; h=json.load(open(os.path.expanduser("~/.claude.json"))); d=json.load(open(p)); d.update({k:h[k] for k in ["oauthAccount"] if k in h}); json.dump(d,open(p,"w"))' || exit 93; ` +
-    `fi; fi; fi`
+    `fi; fi; ` +
+    // Claude Code keys project trust by the REAL path of the project dir. When the
+    // project dir is a symlink (/opt/fabrica -> /Volumes/Larder/opt/fabrica since
+    // 2026-10-15), the seed above misses it: every lane boots into the folder-trust
+    // dialog, and a submit that lands on "No, exit" kills the lane before its first
+    // turn (sfv1373, 2026-10-18 09:59Z). Runs on every launch, so a resumed dir seeded
+    // before the move heals too; writes only when the entry is missing.
+    `python3 -c 'import json,os,sys; p=os.environ["CLAUDE_CONFIG_DIR"]+"/.claude.json"; d=json.load(open(p)); e=d.setdefault("projects",{}).setdefault(os.path.realpath(sys.argv[1]),{}); n=dict(e,hasTrustDialogAccepted=True,hasCompletedProjectOnboarding=True); n==e or (e.update(n),json.dump(d,open(p,"w")))' '${projectDirSh}' || exit 95; ` +
+    `fi`
   );
 }
