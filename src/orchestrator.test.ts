@@ -784,6 +784,52 @@ describe("resumeAgent", () => {
     expect(cmd).toContain("AGENT_PRIVATE_KEY='fresh-key'");
   });
 
+  test("an 8-hex cc_session_id expands to the full uuid from the agent's tombstones", async () => {
+    // 2026-10-22 eng-1849-3127-dyn2: `--resume edd628a5` sat in the picker on "No sessions match".
+    const full = "edd628a5-c02f-469e-8908-abd189ef91b6";
+    await orch.launchAgent({ env: { AGENT_ID: "prefixed" }, projectDir: "/tmp/prefixed" });
+    orch.store["db"].prepare("UPDATE agents SET cc_session_id = ? WHERE id = ?").run(full, "prefixed");
+    screenState.isAliveResult = true;
+    try { await orch.stopAgent("prefixed"); } finally { screenState.isAliveResult = false; }
+    createSessionCalls.length = 0;
+
+    const resumed = await orch.resumeAgent({ id: "prefixed", ccSessionId: "edd628a5" });
+
+    expect(createSessionCalls[0]!.command).toContain(`--resume '${full}'`);
+    expect(resumed.cc_session_id).toBe(full);
+  });
+
+  test("an 8-hex cc_session_id with no matching full uuid is refused and nothing starts", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "nomatch" }, projectDir: "/tmp/nomatch" });
+    orch.store["db"].prepare("UPDATE agents SET cc_session_id = ? WHERE id = ?")
+      .run("11111111-2222-4333-8444-555555555555", "nomatch");
+    screenState.isAliveResult = true;
+    try { await orch.stopAgent("nomatch"); } finally { screenState.isAliveResult = false; }
+    createSessionCalls.length = 0;
+
+    await expect(orch.resumeAgent({ id: "nomatch", ccSessionId: "edd628a5" }))
+      .rejects.toThrow(/uuid prefix, not a session id/);
+    expect(createSessionCalls).toHaveLength(0);
+  });
+
+  test("a prefix-only tombstone (the eng-1849 14:06Z row) still resolves from an older full-uuid tombstone", async () => {
+    const full = "edd628a5-c02f-469e-8908-abd189ef91b6";
+    await orch.launchAgent({ env: { AGENT_ID: "twotomb" }, projectDir: "/tmp/twotomb" });
+    orch.store["db"].prepare("UPDATE agents SET cc_session_id = ? WHERE id = ?").run(full, "twotomb");
+    screenState.isAliveResult = true;
+    try { await orch.stopAgent("twotomb"); } finally { screenState.isAliveResult = false; }
+    await new Promise((r) => setTimeout(r, 5));
+    orch.store["db"].prepare(
+      "INSERT INTO agent_tombstones (id, screen_name, display_name, runtime, cc_session_id, badge, spawn_manifest, stopped_at) " +
+      "SELECT id, screen_name, display_name, runtime, 'edd628a5', badge, spawn_manifest, ? FROM agent_tombstones WHERE id = 'twotomb'",
+    ).run(Date.now() + 1000);
+    createSessionCalls.length = 0;
+
+    await orch.resumeAgent({ id: "twotomb" });
+
+    expect(createSessionCalls[0]!.command).toContain(`--resume '${full}'`);
+  });
+
   test("throws when neither tombstone nor cc_session_id is available", async () => {
     await expect(
       orch.resumeAgent({ id: "never-existed" }),

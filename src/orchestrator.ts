@@ -40,6 +40,9 @@ export const AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 // Resolved lazily: resolveDefaultDb() can throw, and a module-level const
 // would make a misconfigured CREW_DB an import-time crash for every consumer.
 const SCREEN_PREFIX = "wire-";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** 8+ hex, optionally continuing in uuid shape, short of a full uuid: what a truncated display prints. */
+const UUID_PREFIX_RE = /^[0-9a-f]{8}(-[0-9a-f-]{0,27})?$/i;
 const BRIDGE_TERM_TIMEOUT_MS = 10_000;
 
 function titleCase(s: string): string {
@@ -1229,6 +1232,31 @@ export class Orchestrator {
   }
 
   /**
+   * A session id shaped like a uuid PREFIX (the 8-hex form logs and lists print) is not a session id:
+   * `claude --resume edd628a5` opens the picker on "No sessions match" and the lane sits there
+   * (2026-10-22, eng-1849-3127-dyn2). Expand it to the one full uuid among this agent's tombstones,
+   * or refuse. Ids not shaped like a uuid prefix pass through unchanged.
+   */
+  private expandSessionPrefix(id: string, sid: string | null): string | null {
+    if (!sid || UUID_RE.test(sid) || !UUID_PREFIX_RE.test(sid)) return sid;
+    const want = sid.toLowerCase();
+    const full = [...new Set(
+      this.store.listTombstones(id, 1000)
+        .map((t) => t.cc_session_id)
+        .filter((s): s is string => !!s && UUID_RE.test(s) && s.toLowerCase().startsWith(want)),
+    )];
+    if (full.length === 1) {
+      console.error(`[crew] resumeAgent: '${id}' cc_session_id '${sid}' is a prefix; expanded to ${full[0]} from its tombstones`);
+      return full[0]!;
+    }
+    throw new Error(
+      `resumeAgent: cc_session_id '${sid}' for '${id}' is a uuid prefix, not a session id, and ` +
+      `${full.length === 0 ? "no tombstone" : `${full.length} tombstones`} of '${id}' hold a full uuid starting with it. ` +
+      `Pass the full uuid (the session JSONL filename stem). Nothing was started.`,
+    );
+  }
+
+  /**
    * Resume a stopped agent whose Claude Code session JSONL still exists.
    *
    * Mirrors {@link launchAgent} but passes `--resume <ccSessionId>` to the
@@ -1323,7 +1351,7 @@ export class Orchestrator {
       }
     }
 
-    const ccSessionId = opts.ccSessionId ?? tomb?.cc_session_id ?? null;
+    const ccSessionId = this.expandSessionPrefix(opts.id, opts.ccSessionId ?? tomb?.cc_session_id ?? null);
     // cc_session_id is optional on resume: when the original agent never
     // booted a CC session (agent_stop'd before CC wrote a session JSONL, or
     // a prompt like "/exit" caused CC to bail), the tombstone exists with
