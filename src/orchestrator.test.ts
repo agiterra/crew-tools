@@ -2758,7 +2758,7 @@ describe("interruptAgent — a run_as_uid lane goes through the cross-uid path (
   const lane = (id: string, manifest: object | null) =>
     orch.store.createAgent({
       id, display_name: id, runtime: "claude-code", screen_name: `wire-${id}`, screen_pid: 1,
-      spawn_manifest: manifest ? JSON.stringify(manifest) : null,
+      spawn_manifest: manifest ? JSON.stringify(manifest) : undefined,
     });
 
   test("Escape and the read-back target the lane's uid", async () => {

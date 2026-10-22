@@ -271,8 +271,31 @@ describe("classifyRemoteRead — an unreadable screen is never a blank one", () 
 // (mock-isolation.test.ts) an in-process call would hit the fake. Skips (and says so) where this uid cannot sudo.
 describe("readRemoteOutput / sendRemoteKeys through real sudo (local, child process)", () => {
   const canSudo = Bun.spawnSync(["sudo", "-n", "true"]).exitCode === 0;
-  // screen -ls exits 1 with no sockets even WITH the grant; only a sudo refusal says "password".
-  const hasEphemeralGrant = !/password/i.test(Bun.spawnSync(["sudo", "-n", "-u", "_ephemeral", "/opt/homebrew/bin/screen", "-ls"]).stderr.toString());
+  // ⛔ POSITIVE PROBE (CI red on every PR 2026-10-02..22). The old probe was "stderr does not say 'password'" — so
+  // `sudo: unknown user _ephemeral`, `/opt/homebrew/bin/screen: command not found` and a missing /bin/zsh all read as
+  // "granted" on the Ubuntu runner, and the test then asserted a missing-SESSION verdict about a missing USER. A
+  // precondition is proved by the marker of success, not the absence of one failure's marker: screen -ls must have
+  // actually RUN as the target uid (it prints "No Sockets found" / "There is a screen on" — exit 1 with no sockets is
+  // normal), and it must run through the product's own string (remoteScreen + sshRunStatus's login zsh).
+  const probeEphemeral = (): { ok: boolean; why: string } => {
+    if (!canSudo) return { ok: false, why: "this uid has no passwordless sudo" };
+    const code = `import { remoteScreen, sshRunStatus } from ${JSON.stringify(import.meta.dir + "/screen.ts")};
+      const t = { sshHost: "local", runAsUid: "_ephemeral" } as const;
+      console.log(JSON.stringify(await sshRunStatus(t, remoteScreen(t) + " -ls")));`;
+    const p = Bun.spawnSync([process.execPath, "-e", code]);
+    const out = p.stdout.toString().trim();
+    try {
+      const r = JSON.parse(out) as { stdout: string; stderr: string; exitCode: number };
+      if (/No Sockets found|There (?:is|are) (?:a )?screens? on/i.test(r.stdout)) return { ok: true, why: "" };
+      return { ok: false, why: `screen -ls as _ephemeral did not run (exit ${r.exitCode}): ${(r.stderr || r.stdout).trim().split("\n")[0]}` };
+    } catch {
+      return { ok: false, why: `probe child produced no result (exit ${p.exitCode}): ${p.stderr.toString().trim().split("\n")[0]}` };
+    }
+  };
+  const ephemeral = probeEphemeral();
+  const hasEphemeralGrant = ephemeral.ok;
+  // A skip must say why, in the run log — a silent skip reads as a pass.
+  if (!hasEphemeralGrant) console.warn(`SKIP 'missing session under a granted uid': ${ephemeral.why}`);
   const real = (fn: "readRemoteOutput" | "sendRemoteKeys", name: string, uid: string): string => {
     const code = `import { ${fn} } from ${JSON.stringify(import.meta.dir + "/screen.ts")};
       try { const r = await ${fn}(${JSON.stringify(name)}, ${fn === "sendRemoteKeys" ? '"x", ' : ""}{ sshHost: "local", runAsUid: ${JSON.stringify(uid)} });

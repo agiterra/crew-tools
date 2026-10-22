@@ -115,7 +115,9 @@ export type RemoteTarget = { sshHost: string; runAsUid: string };
 export const LOCAL_SUDO_HOST = "local";
 
 /** `sudo -n -u <uid> env HOME=… SCREENDIR=… LANG/LC_ALL <screen>` — remote screen prefix. */
-function remoteScreen(t: RemoteTarget): string {
+// Exported for screen.test.ts's precondition probe: it must exercise the SAME sudo/env/binary string the product
+// runs, or the probe can answer for a different path than the one under test (it did: CI, 2026-10-02..22).
+export function remoteScreen(t: RemoteTarget): string {
   const home = `/Users/${t.runAsUid}`;
   // `sudo` strips the locale → screen runs in the C/POSIX locale and mangles
   // UTF-8 (box-drawing chars become â/Â). Force UTF-8 in the env so BOTH session

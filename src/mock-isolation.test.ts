@@ -71,7 +71,11 @@ describe("mock isolation — ./screen", () => {
       // test that greps another process's console is reading a display, not a result.
       expect({ order: f, symptom: out.includes("Export named 'parseScreenList' not found") })
         .toEqual({ order: f, symptom: false });
-      expect({ order: f, exitCode: p.exitCode }).toEqual({ order: f, exitCode: 0 });
+      // ⛔ NAME THE CHILD'S FAILURES. A bare "exitCode 1" hid, for three weeks, that this guard was red only because
+      // screen.test.ts had a real (environment-probe) failure of its own — nothing here said which test. The (fail)
+      // lines are a diagnostic carried alongside the exit code, which remains the verdict.
+      const fails = out.split("\n").filter((l) => l.startsWith("(fail)"));
+      expect({ order: f, exitCode: p.exitCode, fails }).toEqual({ order: f, exitCode: 0, fails: [] });
     }, 120_000);
   }
 });

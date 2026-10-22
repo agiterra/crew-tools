@@ -21,6 +21,17 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
+      # ⛔ PROVIDE WHAT THE REAL-SUDO TESTS NEED (red on every PR 2026-10-02..22). screen.test.ts drives
+      # readRemoteOutput through the product's own local path: a login /bin/zsh, `sudo -n -u _ephemeral`, HOME and
+      # SCREENDIR under /Users/<uid>, and GNU screen. The stock Ubuntu runner has none of zsh, screen or that uid, so
+      # the test either asserted against "unknown user" or (after the probe fix) would skip. Give it the real thing.
+      - name: Provision zsh, GNU screen and the _ephemeral uid
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zsh screen
+          sudo mkdir -p /Users
+          sudo useradd --create-home --home-dir /Users/_ephemeral --shell /bin/sh _ephemeral
+          sudo -n -u _ephemeral env HOME=/Users/_ephemeral SCREENDIR=/Users/_ephemeral/.screen screen -ls || true
       # ⛔ AGENT_ID SCRUBBED ON PURPOSE. Review finding F1: the remote-parity test was green
       # only because the author's shell exported AGENT_ID; the generated script runs `set -u`
       # and exits before its first loop iteration without it. Green locally, red in CI — which
