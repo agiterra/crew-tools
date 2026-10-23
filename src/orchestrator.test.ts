@@ -669,6 +669,64 @@ describe("setAgentBadge ambiguous-pane safeguard", () => {
   });
 });
 
+describe("resumeAgent — self-resuming runtimes (grok)", () => {
+  // grok is not a built-in runtime: it resolves only from <HOME>/.wire/runtimes.json.
+  let fakeHome: string;
+  let realHome: string | undefined;
+  beforeEach(() => {
+    realHome = process.env.HOME;
+    fakeHome = mkdtempSync(join(tmpdir(), "grok-home-"));
+    mkdirSync(join(fakeHome, ".wire"), { recursive: true });
+    writeFileSync(join(fakeHome, ".wire", "runtimes.json"),
+      JSON.stringify({ grok: { command: "/opt/x/grok-bridged-crew.sh" } }));
+    process.env.HOME = fakeHome;
+  });
+  afterEach(() => {
+    if (realHome === undefined) delete process.env.HOME;
+    else process.env.HOME = realHome;
+    try { rmSync(fakeHome, { recursive: true, force: true }); } catch {}
+  });
+
+  test("relaunches the grok template with the same id and no Claude-only steps", async () => {
+    await orch.resumeAgent({
+      id: "rv-grok", runtime: "grok", projectDir: "/tmp/rv-grok-wd",
+      ccSessionId: "must-not-appear", channels: ["plugin:wire@agiterra"],
+      env: { AGENT_PRIVATE_KEY: "k" },
+    });
+    expect(createSessionCalls).toHaveLength(1);
+    const cmd = createSessionCalls[0]!.command;
+    expect(cmd).toContain("/opt/x/grok-bridged-crew.sh");
+    expect(cmd).toContain("AGENT_ID='rv-grok'");
+    expect(cmd).toContain("AGENT_PRIVATE_KEY='k'");
+    expect(cmd).toContain("cd '/tmp/rv-grok-wd'");
+    expect(cmd).not.toContain("--resume");
+    expect(cmd).not.toContain("--dangerously-load-development-channels");
+    expect(cmd).not.toContain(WIPE_CLAUDE_SETTINGS_LOCAL);
+    expect(cmd).not.toContain("CLAUDE_CONFIG_DIR");
+    expect(orch.store.getAgent("rv-grok")!.runtime).toBe("grok");
+  });
+
+  test("single-arg resume of a stopped grok agent takes runtime + project_dir from the tombstone", async () => {
+    await orch.launchAgent({ env: { AGENT_ID: "rv-park" }, runtime: "grok", projectDir: "/tmp/rv-park-wd" });
+    screenState.isAliveResult = true;
+    try { await orch.stopAgent("rv-park"); } finally { screenState.isAliveResult = false; }
+    createSessionCalls.length = 0;
+
+    await orch.resumeAgent({ id: "rv-park" });
+    expect(createSessionCalls).toHaveLength(1);
+    const cmd = createSessionCalls[0]!.command;
+    expect(cmd).toContain("/opt/x/grok-bridged-crew.sh");
+    expect(cmd).toContain("cd '/tmp/rv-park-wd'");
+    expect(cmd).not.toContain("--resume");
+  });
+
+  test("a runtime that does not self-resume is still refused before any screen starts", async () => {
+    await expect(orch.resumeAgent({ id: "cx", runtime: "codex", projectDir: "/tmp/cx" }))
+      .rejects.toThrow(/resumeAgent supports claude-code and grok today \(got 'codex'\)/);
+    expect(createSessionCalls).toHaveLength(0);
+  });
+});
+
 describe("resumeAgent", () => {
   test("builds a claude --resume command with explicit channels list", async () => {
     await orch.resumeAgent({
