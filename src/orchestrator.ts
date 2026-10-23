@@ -40,6 +40,13 @@ export const AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 // Resolved lazily: resolveDefaultDb() can throw, and a module-level const
 // would make a misconfigured CREW_DB an import-time crash for every consumer.
 const SCREEN_PREFIX = "wire-";
+/**
+ * Runtimes whose launcher resumes its own session on relaunch, from state keyed by
+ * AGENT_ID: grok = wire-grok, which persists the ACP sessionId in
+ * $STATE_DIR/<id>.json and calls session/load at start (wire-grok src/grok-acp.ts
+ * ensureThread). resumeAgent relaunches these with no --resume argv.
+ */
+export const SELF_RESUMING_RUNTIMES: ReadonlySet<string> = new Set(["grok"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** 8+ hex, optionally continuing in uuid shape, short of a full uuid: what a truncated display prints. */
 const UUID_PREFIX_RE = /^[0-9a-f]{8}(-[0-9a-f-]{0,27})?$/i;
@@ -1375,8 +1382,15 @@ export class Orchestrator {
     }
 
     const runtime = opts.runtime ?? tomb?.runtime ?? manifest?.runtime ?? "claude-code";
-    if (runtime !== "claude-code") {
-      throw new Error(`resumeAgent only supports claude-code today (got '${runtime}')`);
+    // claude-code resumes by argv (--resume <cc_session_id>). A SELF-RESUMING runtime's
+    // launcher resumes its own session from per-agent state keyed by AGENT_ID, so resume
+    // = relaunch the same template with the same id (2026-10-23, Brioche 776718: a parked
+    // Grok reviewer could not resume and lost its context).
+    const isClaude = runtime === "claude-code";
+    if (!isClaude && !SELF_RESUMING_RUNTIMES.has(runtime)) {
+      throw new Error(
+        `resumeAgent supports claude-code and ${[...SELF_RESUMING_RUNTIMES].join(", ")} today (got '${runtime}')`,
+      );
     }
 
     // Merge env: manifest (sanitized, no private key) < opts.env < { AGENT_ID }
@@ -1409,13 +1423,13 @@ export class Orchestrator {
     // manifest channels list replaces the template's channel argument.
     if (!mergedEnv.TMPDIR) { const _t = `/tmp/agiterra-lane-${opts.id}`; mergedEnv.TMPDIR = _t; mergedEnv.TMP = _t; mergedEnv.TEMP = _t; }
     let command = getLaunchCommand(runtime, { ...mergedEnv, PROJECT_DIR: projectDir }, this.runtimePolicy);
-    if (opts.channels ?? manifest?.channels) {
+    if (isClaude && (opts.channels ?? manifest?.channels)) {
       const flag = `--dangerously-load-development-channels ${shellEscape(channels)}`;
       const re = /--dangerously-load-development-channels\s+(?:'[^']*'|"[^"]*"|\S+)/;
       // A template that is a launcher script carries no channels flag; append it then.
       command = re.test(command) ? command.replace(re, flag) : `${command} ${flag}`;
     }
-    if (ccSessionId) command += ` --resume ${shellEscape(ccSessionId)}`;
+    if (isClaude && ccSessionId) command += ` --resume ${shellEscape(ccSessionId)}`;
     if (extraFlags) command += ` ${extraFlags}`;
 
     const envExports = `export ${Object.entries(mergedEnv)
@@ -1427,7 +1441,10 @@ export class Orchestrator {
     // pass env.CLAUDE_CONFIG_DIR=$HOME/.claude — the snippet's unset-guard
     // then no-ops.
     const _mkTmpR = mergedEnv.TMPDIR ? `mkdir -p ${shellEscape(mergedEnv.TMPDIR)} 2>/dev/null; chmod 700 ${shellEscape(mergedEnv.TMPDIR)} 2>/dev/null; ` : "";
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${WIPE_CLAUDE_SETTINGS_LOCAL}${_mkTmpR}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES}${LANE_TEST_DEFAULTS} && ${buildConfigDirSetup(opts.id, projectDir)} && ${command}`;
+    // Claude-only steps stay Claude-only, exactly as in launchAgent.
+    const wipeR = isClaude ? WIPE_CLAUDE_SETTINGS_LOCAL : "";
+    const configDirSetupR = isClaude ? ` && ${buildConfigDirSetup(opts.id, projectDir)}` : "";
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipeR}${_mkTmpR}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES}${LANE_TEST_DEFAULTS}${configDirSetupR} && ${command}`;
 
     // Resume is same-HOST only, but may cross UIDs: a crew-service
     // `_ephemeral` spawn resumes under its original account (tombstone
@@ -1440,12 +1457,14 @@ export class Orchestrator {
     // Fail closed on a dead credential — same guard as launchAgent, in the
     // home the agent will actually run under.
     // A lane's account choice rides its manifest env (sticky in the lane dir too).
-    const resumeAccount = mergedEnv.CLAUDE_ACCOUNT || undefined;
-    await assertClaudeCredentialLive(
-      resumeTarget
-        ? { kind: "remote", target: resumeTarget, account: resumeAccount }
-        : { kind: "local", home: process.env.HOME ?? "", account: resumeAccount },
-    );
+    if (isClaude) {
+      const resumeAccount = mergedEnv.CLAUDE_ACCOUNT || undefined;
+      await assertClaudeCredentialLive(
+        resumeTarget
+          ? { kind: "remote", target: resumeTarget, account: resumeAccount }
+          : { kind: "local", home: process.env.HOME ?? "", account: resumeAccount },
+      );
+    }
 
     const session = resumeTarget
       ? await screen.createRemoteSession(screenName, fullCommand, resumeTarget)
@@ -1454,10 +1473,13 @@ export class Orchestrator {
     // Auto-confirm dev-channel prompt — same polling helper as launchAgent,
     // then the asked-vs-got read-back. The resume command now carries the
     // template's pins, so the read-back asserts exactly what launchAgent would.
-    const resumeAsked = askedFromCommand(command, mergedEnv);
-    void autoConfirmDevChannel(screenName, `resumed ${opts.id}`, { store: this.store, agentId: opts.id, remote: resumeTarget })
-      .then(() => verifySpawnArgv(screenName, `resumed ${opts.id}`, resumeAsked, { store: this.store, agentId: opts.id, remote: resumeTarget }))
-      .catch((e) => console.warn(`[crew] post-resume verify chain failed for '${opts.id}': ${e}`));
+    // claude-code ONLY, as in launchAgent: the helpers read Claude TUI output.
+    if (isClaude) {
+      const resumeAsked = askedFromCommand(command, mergedEnv);
+      void autoConfirmDevChannel(screenName, `resumed ${opts.id}`, { store: this.store, agentId: opts.id, remote: resumeTarget })
+        .then(() => verifySpawnArgv(screenName, `resumed ${opts.id}`, resumeAsked, { store: this.store, agentId: opts.id, remote: resumeTarget }))
+        .catch((e) => console.warn(`[crew] post-resume verify chain failed for '${opts.id}': ${e}`));
+    }
 
     // Write a fresh manifest for the resumed agent so it can be resumed
     // again later. Channels flow into the manifest only here (launchAgent
