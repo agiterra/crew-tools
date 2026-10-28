@@ -819,6 +819,12 @@ export async function startServer(): Promise<void> {
             cc_session_id: a.cc_session_id as string | undefined,
             project_dir: a.project_dir as string | undefined,
             env: a.env as Record<string, string> | undefined,
+            // The schema offers these and the service accepts them, but this case dropped them silently
+            // (2026-10-28: eng-2250 resumed with extra_flags "--mcp-config …fv-safari-mcp.json" came up with
+            // no safari server). cli.ts had the same bug (Brioche 599051). Forward every field the service takes.
+            extra_flags: a.extra_flags as string | undefined,
+            badge: a.badge as string | undefined,
+            channels: a.channels as string[] | undefined,
           }, 120_000);
           break;
         }
