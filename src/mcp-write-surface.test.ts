@@ -87,4 +87,19 @@ describe("MCP server write surface", () => {
     const offenders = STORE_WRITES.filter((w) => new RegExp(`\\.${w}\\s*\\(`).test(stamp));
     expect(offenders).toEqual([]);
   });
+
+  test("agent_resume forwards every schema field the service accepts (no silent drop)", () => {
+    // Fields the schema offers that crew.agent_resume does NOT take yet. Listed so a gap is a visible choice.
+    const NOT_FORWARDED = ["attach_to_pane", "display_name", "runtime"];
+    const toolStart = SRC.indexOf('name: "agent_resume"');
+    const props = SRC.slice(SRC.indexOf("properties: {", toolStart), SRC.indexOf("required:", toolStart));
+    const fields = [...props.matchAll(/^\s{10}(\w+): \{/gm)].map((m) => m[1]!);
+    expect(fields).toContain("extra_flags");
+    const body = dispatchBody();
+    const start = body.indexOf('case "agent_resume"');
+    const caseBody = body.slice(start, body.indexOf("break;", start));
+    const missing = fields.filter((f) => !NOT_FORWARDED.includes(f) && !new RegExp(`\\b${f}:`).test(caseBody));
+    expect(missing).toEqual([]);
+  });
 });
+
