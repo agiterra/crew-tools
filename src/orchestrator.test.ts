@@ -589,7 +589,7 @@ describe("spawn manifest + tombstones", () => {
       expect(result.fallbackUsed).toBe(true);
       expect(screenState.sendKeysLog).toEqual([
         { name: "wire-slow-close", keys: "/exit" },
-        { name: "wire-slow-close", keys: "\n" },
+        { name: "wire-slow-close", keys: "\r" },
       ]);
       expect(screenState.killSessionCalls).toEqual(["wire-slow-close"]);
       expect(orch.store.getAgent("slow-close")).toBeNull();
@@ -597,6 +597,51 @@ describe("spawn manifest + tombstones", () => {
       screenState.isAliveResult = false;
     }
   });
+
+  // TOOL GAP 13: CC 2.1.310 only submits "/exit" on CR. LF leaves it in the
+  // input box (probed live), and over the remote hop a lone LF is stripped by
+  // "$(… | base64 -d)". The fake runtime here exits ONLY on CR, like the real one.
+  for (const remote of [false, true]) {
+    test(`closeAgent submits /exit with CR and exits gracefully (${remote ? "remote" : "local"})`, async () => {
+      const id = remote ? "cr-close-remote" : "cr-close";
+      // Seed the row directly, not via launchAgent: a launched run_as_uid agent
+      // keeps a background auto-confirm loop polling readRemoteOutput, which
+      // would leak reads into later tests' remoteCalls.
+      orch.store.createAgent({
+        id, display_name: id, runtime: "claude-code", screen_name: `wire-${id}`, screen_pid: 1,
+        spawn_manifest: JSON.stringify(
+          remote ? { runtime: "claude-code", run_as_uid: "_ephemeral" } : { runtime: "claude-code" },
+        ),
+      });
+      screenState.isAliveResult = true;
+      screenState.sendKeysHook = (name, keys) => {
+        if (name === `wire-${id}` && keys === "\r") screenState.isAliveResult = false;
+      };
+      try {
+        const result = await orch.closeAgent(id, undefined, 1_000);
+
+        expect(result.fallbackUsed).toBe(false);
+        expect(screenState.sendKeysLog).toEqual([
+          { name: `wire-${id}`, keys: "/exit" },
+          { name: `wire-${id}`, keys: "\r" },
+        ]);
+        // Both keystrokes went down the branch under test: two remote sends
+        // under the agent's uid, or none at all for a same-UID agent.
+        const sends = screenState.remoteCalls.filter((c) => c.op === "send");
+        expect(sends).toEqual(
+          remote
+            ? [
+                { op: "send", name: `wire-${id}`, uid: "_ephemeral" },
+                { op: "send", name: `wire-${id}`, uid: "_ephemeral" },
+              ]
+            : [],
+        );
+        expect(orch.store.getAgent(id)).toBeNull();
+      } finally {
+        screenState.isAliveResult = false;
+      }
+    });
+  }
 
   test("stopAgent terminates codex bridge runtimes before the final hard reap", async () => {
     await orch.launchAgent({

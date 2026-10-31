@@ -51,6 +51,9 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 /** 8+ hex, optionally continuing in uuid shape, short of a full uuid: what a truncated display prints. */
 const UUID_PREFIX_RE = /^[0-9a-f]{8}(-[0-9a-f-]{0,27})?$/i;
 const BRIDGE_TERM_TIMEOUT_MS = 10_000;
+// The Enter key Claude Code's TUI submits on. LF (Ctrl+J) does not submit a
+// slash command (see closeAgent); keep this CR.
+const CC_SUBMIT_KEY = "\r";
 
 function titleCase(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
@@ -1745,19 +1748,27 @@ export class Orchestrator {
 
     const target = this.targetFor(agent);
     let fallbackUsed = false;
+    const closeStart = Date.now();
     if (this.runtimeUsesSlashExit(agent.runtime)) {
       // Two sendKeys: type the slash command first, then press Enter. Splitting
       // the keystrokes mirrors what a human types and avoids any runtime that
-      // might buffer-and-discard before the newline arrives.
+      // might buffer-and-discard before the Enter arrives.
+      //
+      // Enter MUST be CR ("\r"), never LF. Probed on CC 2.1.310 (TOOL GAP 13,
+      // 2026-10-31): "/exit"+"\n" leaves "/exit" sitting in the input box and the
+      // process alive at 15 s, even with a 1.5 s settle; "/exit"+"\r" exits rc 0
+      // in ~0.9 s with no confirm dialog. LF also never reaches a remote screen:
+      // sendRemoteKeys decodes through "$(… | base64 -d)", which strips trailing
+      // newlines, so a lone "\n" stuffs nothing. Every close fell back to kill.
       try {
         if (target) {
           await screen.sendRemoteKeys(agent.screen_name, "/exit", target);
           await new Promise((r) => setTimeout(r, 100));
-          await screen.sendRemoteKeys(agent.screen_name, "\n", target);
+          await screen.sendRemoteKeys(agent.screen_name, CC_SUBMIT_KEY, target);
         } else {
           await screen.sendKeys(agent.screen_name, "/exit");
           await new Promise((r) => setTimeout(r, 100));
-          await screen.sendKeys(agent.screen_name, "\n");
+          await screen.sendKeys(agent.screen_name, CC_SUBMIT_KEY);
         }
       } catch (e) {
         // Screen session may already be gone — fall through to cleanup.
@@ -1795,6 +1806,10 @@ export class Orchestrator {
         aliveAfterGrace = await graceProbe();
       }
       fallbackUsed = aliveAfterGrace;
+      console.error(
+        `[crew] closeAgent: '${agent.id}' slash-exit ${fallbackUsed ? "timed out -> hard kill" : "exited gracefully"} ` +
+          `after ${Date.now() - closeStart} ms (${target ? "remote" : "local"})`,
+      );
     } else {
       // Codex bridge stacks do not consume Claude's `/exit` command. Their
       // clean path is SIGTERM to the screen child's process group; the bridge
