@@ -10,13 +10,19 @@ function run(snippet: string, env: Record<string, string>): { code: number; out:
 }
 
 describe("buildLaneOutSetup", () => {
-  test("exports $HOME/lanes/<id>/out and creates it mode 700", () => {
+  // A group the test uid is in, so chgrp succeeds on any host (Patisserie: agiterra).
+  const grp = Bun.spawnSync(["id", "-gn"]).stdout.toString().trim();
+  const gid = Bun.spawnSync(["id", "-g"]).stdout.toString().trim();
+
+  test("exports $HOME/lanes/<id>/out, group LANE_OUT_GROUP, mode 2770", () => {
     const home = mkdtempSync(join(tmpdir(), "laneout-"));
     try {
-      const r = run(buildLaneOutSetup("eng-1-2-x"), { HOME: home, PATH: "/usr/bin:/bin" });
+      const r = run(buildLaneOutSetup("eng-1-2-x"), { HOME: home, LANE_OUT_GROUP: grp, PATH: "/usr/bin:/bin" });
       expect(r.code).toBe(0);
       expect(r.out).toBe(`${home}/lanes/eng-1-2-x/out`);
-      expect(statSync(r.out).mode & 0o777).toBe(0o700);
+      const st = statSync(r.out);
+      expect(st.mode & 0o7777).toBe(0o2770);
+      expect(String(st.gid)).toBe(gid);
     } finally { rmSync(home, { recursive: true, force: true }); }
   });
 
@@ -26,6 +32,16 @@ describe("buildLaneOutSetup", () => {
       const a = run(buildLaneOutSetup("lane-a"), { HOME: home, PATH: "/usr/bin:/bin" }).out;
       const b = run(buildLaneOutSetup("lane-b"), { HOME: home, PATH: "/usr/bin:/bin" }).out;
       expect(a).not.toBe(b);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test("a failed chgrp warns but the spawn goes on", () => {
+    const home = mkdtempSync(join(tmpdir(), "laneout-"));
+    try {
+      const r = run(buildLaneOutSetup("lane-a"), { HOME: home, LANE_OUT_GROUP: "no-such-group-xyz", PATH: "/usr/bin:/bin" });
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("chgrp no-such-group-xyz failed");
+      expect(statSync(`${home}/lanes/lane-a/out`).mode & 0o7777).toBe(0o700);
     } finally { rmSync(home, { recursive: true, force: true }); }
   });
 
