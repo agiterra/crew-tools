@@ -24,6 +24,7 @@ import { pickName, backgroundImagePath, loadTheme, updateTheme, listThemes } fro
 import { getClaudeCodeSessionId } from "./claude-session.js";
 import { assertClaudeCredentialLive } from "./credentials.js";
 import { buildConfigDirSetup } from "./config-dir.js";
+import { buildLaneOutSetup } from "./lane-out.js";
 import { removeCodexSpawnHome, SAFE_UID, type CodexSpawnTeardownResult } from "./codex-spawn.js";
 
 /** The agent/lane id contract, enforced by launchAgent. Mirrored by wallet-browser-register.sh and lane-reap.sh. */
@@ -1083,7 +1084,7 @@ export class Orchestrator {
     const configDirSetup = runtime === "claude-code" ? ` && ${buildConfigDirSetup(id, projectDir)}` : "";
     const wipe = runtime === "claude-code" ? WIPE_CLAUDE_SETTINGS_LOCAL : "";
     const _mkTmp = spawnEnv.TMPDIR ? `mkdir -p ${shellEscape(spawnEnv.TMPDIR)} 2>/dev/null; chmod 700 ${shellEscape(spawnEnv.TMPDIR)} 2>/dev/null; ` : "";
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipe}${_mkTmp}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES}${LANE_TEST_DEFAULTS}${configDirSetup} && ${command}`;
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipe}${_mkTmp}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES}${LANE_TEST_DEFAULTS} && ${buildLaneOutSetup(id)}${configDirSetup} && ${command}`;
 
     // Create screen session — local, or on a remote host when opts.machine
     // names a non-local machine (cross-machine spawn: ssh + sudo -u <run_as_uid>).
@@ -1447,7 +1448,7 @@ export class Orchestrator {
     // Claude-only steps stay Claude-only, exactly as in launchAgent.
     const wipeR = isClaude ? WIPE_CLAUDE_SETTINGS_LOCAL : "";
     const configDirSetupR = isClaude ? ` && ${buildConfigDirSetup(opts.id, projectDir)}` : "";
-    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipeR}${_mkTmpR}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES}${LANE_TEST_DEFAULTS}${configDirSetupR} && ${command}`;
+    const fullCommand = `cd ${shellEscape(projectDir)} && ${wipeR}${_mkTmpR}${envExports} && ${SOURCE_NEAREST_ENV}${NEUTRALIZE_INHERITED_DB_OVERRIDES}${LANE_TEST_DEFAULTS} && ${buildLaneOutSetup(opts.id)}${configDirSetupR} && ${command}`;
 
     // Resume is same-HOST only, but may cross UIDs: a crew-service
     // `_ephemeral` spawn resumes under its original account (tombstone
