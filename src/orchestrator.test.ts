@@ -309,6 +309,9 @@ describe("launchAgent env forwarding", () => {
     expect(cmd).toContain("AGENT_ID='test-agent'");
     expect(cmd).toContain("TMPDIR='/tmp/agiterra-lane-test-agent'"); // per-lane TMPDIR at spawn (pasticciotti)
     expect(cmd).toContain("mkdir -p '/tmp/agiterra-lane-test-agent'");
+    // Per-lane LANE_OUT (Baguette 892838): exported after the .env is sourced, before the runtime starts.
+    expect(cmd).toContain('export LANE_OUT="$HOME/lanes/test-agent/out"');
+    expect(cmd.indexOf("set +a")).toBeLessThan(cmd.indexOf("LANE_OUT"));
     expect(cmd).toContain("AGENT_NAME='Test Agent'");
     // ENG-3719: shared-DB endpoints inherited from the nearest .env are cleared AFTER it is sourced,
     // so a lane's isolated stack (config/local.json) wins and cannot be silently bypassed.
